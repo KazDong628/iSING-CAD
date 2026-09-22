@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Contour / 主轮廓工作台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/workflow.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Contour 主轮廓工作台"><span class="brand-mark" aria-hidden="true">C<span>°</span></span><span>CONTOUR<small>图像识别 · 主轮廓工作台</small></span></a>
+    <nav class="global-nav" aria-label="工作区"><span class="nav-current">绘图工作台</span><a class="nav-button" href="/agent">对话 Agent</a><button id="history-open" class="nav-button">任务记录</button><button id="evaluation-open" class="nav-button">评估报告 <span class="nav-arrow">↗</span></button><a class="nav-button" href="/segmentation-review">查看训练标签</a><a class="nav-button" href="/segmentation-results">GT 实测结果</a></nav>
+    <div class="provider-state"><span class="state-dot" id="provider-dot"></span><span id="provider-label">连接本地服务…</span></div>
+  </header>
+
+  <div id="connection-error" class="connection-error" role="alert" hidden></div>
+  <main class="workspace">
+    <aside class="dataset-pane" aria-label="图纸数据集">
+      <div class="pane-heading"><span class="eyebrow">SOURCE LIBRARY</span><h1>图纸数据集 <span id="dataset-count">—</span></h1></div>
+      <label class="search-field"><span aria-hidden="true">⌕</span><input id="case-search" type="search" placeholder="搜索图纸编号" aria-label="搜索图纸编号"></label>
+      <div class="library-filter"><button class="active" id="filter-all">全部 <span id="all-count">—</span></button><button id="filter-supported">可运行 <span id="supported-count">—</span></button></div>
+      <section class="pilot-panel" aria-label="四张试验样本"><div class="pilot-heading"><strong>试验样本</strong><a href="/segmentation-pilot">查看实测 ↗</a></div><p>按已知效果选择，非全量通过。</p><p><a href="/dxf-comparison">DXF 与 GT 对比 · 优化前后 ↗</a></p><p><a href="/connectivity-results">连通性修复与参数化重建 ↗</a></p><div id="pilot-cases" class="pilot-cases"></div><button id="run-pilots" class="button secondary" disabled>分割并绘制这 4 张</button><p id="pilot-status" role="status">使用当前模型、参数求解与复核选项。</p></section>
+      <div class="case-list" id="case-list" aria-live="polite"><p class="muted empty-small">正在读取项目数据集…</p></div>
+      <div class="library-foot"><span class="calibration-dot"></span><div><strong>全部图纸可运行</strong><p>成功数以独立评估为准。<br>可运行范围不代表识别准确率。</p></div></div>
+      <button class="button secondary upload-trigger" id="upload-open"><span aria-hidden="true">＋</span> 上传配对图纸</button>
+    </aside>
+
+    <section class="drawing-pane" aria-label="绘图与任务进度">
+      <div class="drawing-heading"><div><span class="eyebrow">DRAWING / <span id="drawing-split">AUTONOMOUS</span></span><h2 id="drawing-title">正在载入图纸</h2><p id="drawing-subtitle">原图 + OCR → 轮廓识别 → 自动出图</p></div><span class="status-badge" id="job-status">待开始</span></div>
+      <div class="run-toolbar"><label class="api-toggle"><input id="use-api" type="checkbox" checked><span>在线标注绑定与复核</span></label><label class="api-toggle" title="本地 U-Net 模型；训练标签来源与准确率以当前模型评估记录为准"><input id="use-segmentation" type="checkbox" disabled><span>深度分割（试验）</span></label><span class="toolbar-spacer"></span><button id="cancel-job" class="button subtle" hidden>取消运行</button><button id="start-job" class="button primary" disabled><span aria-hidden="true">▷</span> 自动绘制主轮廓</button></div>
+      <ol class="pipeline" aria-label="处理阶段"><li data-stage="source"><span>01</span>读取图纸</li><li data-stage="extract"><span>02</span><b id="extract-stage-label">预测分割</b></li><li data-stage="review"><span>03</span>提取边界</li><li data-stage="solve"><span>04</span>构建 CAD</li></ol>
+      <div class="canvas-bar"><div class="view-tabs" role="tablist" aria-label="图纸视图"><button id="view-source" role="tab" aria-selected="true" class="active">原图</button><button id="view-segmentation" role="tab" aria-selected="false" hidden>分割预测</button><button id="view-contour" role="tab" aria-selected="false" hidden>提取边界</button><button id="view-topology" role="tab" aria-selected="false" hidden>图元连接</button><button id="view-overlay" role="tab" aria-selected="false" hidden>CAD 叠加</button><button id="view-vector" role="tab" aria-selected="false">CAD 矢量 <span id="vector-ready" hidden>●</span></button></div><div class="zoom-tools"><button id="zoom-out" aria-label="缩小图纸">−</button><output id="zoom-value">100%</output><button id="zoom-in" aria-label="放大图纸">＋</button><button id="zoom-fit" aria-label="适应画布">适应</button></div></div>
+      <div id="segmentation-view-options" class="segmentation-view-options" hidden><span>当前任务的模型预测</span><div role="group" aria-label="分割显示方式"><button id="segmentation-overlay-option" aria-pressed="true" class="active">原图叠加</button><button id="segmentation-mask-option" aria-pressed="false">二值 mask</button></div></div>
+      <div class="drawing-viewport" id="drawing-viewport"><div class="drawing-frame" id="drawing-frame"><img id="drawing-image" alt="当前工程图纸" hidden><div id="source-highlight" class="source-highlight" hidden><span id="highlight-label"></span></div></div><div class="canvas-empty" id="canvas-empty"><span class="empty-drawing" aria-hidden="true">⌑</span><strong>自动识别后生成轮廓</strong><p>从图像提取材料边界，结合标注求取比例，<br>自动导出可编辑 DXF 与原图叠加结果。</p></div></div>
+      <div class="canvas-caption"><span id="canvas-caption">原图保持原始坐标；点击识别证据可定位标注。</span><span id="source-size" class="mono"></span></div>
+      <div class="artifact-bar" id="artifact-bar" hidden><span class="valid-mark">✓ 数值几何有效</span><div id="artifact-links"></div></div>
+      <section class="event-panel"><div class="event-heading"><h3>运行记录 <span id="event-count">00</span></h3><span id="job-short-id" class="mono">尚未创建任务</span></div><div id="events" class="event-list" aria-live="polite"><p class="muted empty-small">轮廓提取、定标和导出自动执行；在线复核结果单独记录。</p></div></section>
+    </section>
+
+    <aside class="inspector-pane" aria-label="自动识别证据">
+      <div class="inspector-header"><span class="eyebrow">RECOGNITION EVIDENCE</span><div class="inspector-title"><h2 id="inspector-title">自动识别证据</h2><span id="parameter-count" class="mono">— / —</span></div><p id="inspector-subtitle">尺寸来源 · 比例估计 · 图像一致性</p></div>
+      <div class="inspector-scroll" id="inspector-scroll"><div id="review-notice" class="review-notice"><strong>选择图纸，一键自动绘制</strong><p>系统识别材料主边界，关联尺寸标注并导出轮廓。运行后在这里查看自动识别证据。</p></div><section id="workflow-evidence" class="workflow-evidence" aria-label="阶段产物"></section><div id="issues" class="issues" hidden></div><div id="parameter-toolbar" class="parameter-toolbar" hidden><span id="missing-count"></span><button class="text-button" id="fill-suggestions">填入缺项建议值</button></div><section id="automatic-evidence" class="automatic-evidence"></section><form id="parameter-form" novalidate><div id="parameters" class="parameter-list"></div><section id="assumptions-section" class="assumptions-section" hidden><div class="section-label"><span>适用范围确认</span><span id="assumptions-count">0 / 4</span></div><p class="muted scope-explanation">逐项核对下列假设后才能生成。不会默认勾选。</p><div id="assumptions"></div><label class="binding-confirm"><input type="checkbox" id="confirm-bindings"><span>已核对全部尺寸与原图标注的对应关系，并确认当前参数值。</span></label></section></form><section id="validation-panel" class="validation-panel" hidden></section></div>
+      <div class="inspector-footer"><button hidden type="submit" form="parameter-form" class="button confirm-button" id="confirm-solve" disabled>确认参数并重建 <span aria-hidden="true">→</span></button><p id="inspector-footnote">自动产物、图像一致性与尺寸验证分别记录。<br><strong>可编辑轮廓尚非制造认证结果</strong></p></div>
+    </aside>
+  </main>
+
+  <dialog id="upload-dialog"><form id="upload-form"><div class="dialog-heading"><div><span class="eyebrow">NEW SOURCE</span><h2>上传配对图纸</h2></div><button class="icon-button" type="button" data-close="upload-dialog" aria-label="关闭上传窗口">×</button></div><p class="dialog-intro">选择原始图像及对应 OCR JSON。上传后自动识别主轮廓，不需要选择模板。</p><label class="field-label">工程图原图<input id="upload-image" name="image" type="file" accept=".jpg,.jpeg,.png,.webp" required><small>JPG / PNG / WebP，最大 20 MB</small></label><label class="field-label">对应 OCR 文件<input id="upload-ocr" name="ocr" type="file" accept=".json,application/json" required><small>meta + records 格式，最大 5 MB；坐标必须对应原始图像</small></label><label class="api-toggle dialog-toggle"><input id="upload-api" type="checkbox" checked><span>在线标注绑定与复核</span></label><label class="api-toggle dialog-toggle"><input id="upload-segmentation" type="checkbox" disabled><span>使用深度分割（试验）</span></label><p id="upload-error" class="inline-error" role="alert" hidden></p><div class="dialog-actions"><button type="button" class="button secondary" data-close="upload-dialog">取消</button><button type="submit" id="upload-submit" class="button primary">上传并自动绘制 →</button></div></form></dialog>
+
+  <dialog id="history-dialog" class="wide-dialog"><div class="dialog-heading"><div><span class="eyebrow">PERSISTED RUNS</span><h2>任务记录</h2></div><button class="icon-button" data-close="history-dialog" aria-label="关闭任务记录">×</button></div><p class="dialog-intro">已完成阶段保存在本机。打开任务可查看识别证据与下载产物；旧模板任务单独标识。</p><div id="history-list" class="history-list"></div></dialog>
+
+  <dialog id="evaluation-dialog" class="wide-dialog"><div class="dialog-heading"><div><span class="eyebrow">EVALUATION / EVIDENCE</span><h2>评估报告</h2></div><button class="icon-button" data-close="evaluation-dialog" aria-label="关闭评估报告">×</button></div><p class="dialog-intro">可运行范围、自动产物完成率、图像一致性和参考准确率分别统计。全数据集可运行不代表每张轮廓均已验证正确。</p><div id="evaluation-overview" class="evaluation-overview"></div><div id="evaluation-reports"></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,29 @@
+.env
+.env.*
+!.env.example
+.venv/
+.venv-seg/
+vendor/
+
+# Local source/evaluation data and generated artifacts
+__dataset/
+__dataset.rar
+runtime/
+artifacts/
+output/
+outputs/
+.playwright-cli/
+
+# Trained weights are distributed separately from the source repository
+*.pt
+*.safetensors
+*.pth
+*.ckpt
+*.onnx
+
+# Python/test caches
+__pycache__/
+.pytest_cache/
+*.pyc
+.coverage
+htmlcov/

@@ -1,0 +1,16 @@
+# Run from the repository root after checking out the vendor revision documented
+# in docs/deep-segmentation.md. The base workbench dependencies are separate.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.1.2+cu121
+torchvision==0.16.2+cu121
+numpy==1.26.4
+timm==1.0.15
+huggingface-hub==0.24.7
+safetensors==0.4.2
+tqdm==4.66.5
+Pillow==11.0.0
+
+# Official SMP v0.5.0, commit 420ce84b0c2df0286fa9bb2bd1499eea625c9b33.
+# Editable install deliberately uses the audited local vendor checkout.
+-e ./vendor/segmentation_models.pytorch

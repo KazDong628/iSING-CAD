@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Contour Agent / 对话式主轮廓重建</title>
+  <link rel="stylesheet" href="/static/agent.css">
+  <script src="/static/agent.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/"><span class="brand-cube">◇</span><span><b>DXF TOPOLOGY</b><small>conversational contour agent</small></span></a>
+    <div class="header-context"><span class="pulse"></span><span id="connection-label">连接本地执行器…</span><i></i><span id="provider-label">—</span></div>
+    <a class="header-link" href="/connectivity-results">评估结果 ↗</a>
+  </header>
+
+  <main class="shell">
+    <aside class="sessions">
+      <div class="rail-label">CONVERSATIONS</div>
+      <button id="new-conversation" class="new-button"><span>＋</span> 新建主轮廓任务</button>
+      <div id="conversation-list" class="conversation-list"></div>
+      <div class="rail-foot"><span class="live-dot"></span><div><b>本地持久化在线</b><small>上下文、任务和产物保存在 runtime</small></div></div>
+    </aside>
+
+    <section class="conversation">
+      <div class="conversation-head">
+        <div><div class="rail-label">CONVERSATION</div><h1 id="conversation-title">新建主轮廓任务</h1></div>
+        <div class="memory-state"><span>⌘</span><b id="turn-count">0</b> 条上下文 <i></i><span>⛁</span><b id="job-count">0</b> 条长期记忆</div>
+      </div>
+
+      <div id="messages" class="messages" aria-live="polite">
+        <section class="welcome" id="welcome">
+          <div class="welcome-mark">◇</div>
+          <div class="rail-label">SOURCE-BOUND RECONSTRUCTION</div>
+          <h2>用对话完成主轮廓重建</h2>
+          <p>上传工程图与 OCR，Agent 会运行分割、局部拓扑编辑、本地几何执行、独立评估、约束绑定和 LINE/ARC 导出。对结果不满意时，截取局部并告诉它哪里需要修正。</p>
+          <div class="capabilities">
+            <div><span>01</span><b>拖拽输入</b><small>工程图 + OCR JSON</small></div>
+            <div><span>02</span><b>拓扑编辑闭环</b><small>Agent 提案 · 本地执行 · 独立评估</small></div>
+            <div><span>03</span><b>截图修正</b><small>基于当前上下文迭代</small></div>
+          </div>
+          <label class="case-picker"><span>也可以从数据集开始</span><select id="case-select"><option value="">选择图纸…</option></select></label>
+        </section>
+      </div>
+
+      <form id="composer" class="composer">
+        <div id="drop-zone" class="drop-zone">
+          <textarea id="prompt" rows="3" maxlength="2000" placeholder="描述任务，例如：提取主轮廓并生成 DXF；或指出截图中需要修正的区域…（空白时按 Tab 补全）"></textarea>
+          <div id="attachment-chips" class="attachment-chips"></div>
+          <div class="composer-tools">
+            <div>
+              <label class="tool-button" title="选择工程图和 OCR"><input id="source-files" type="file" accept=".jpg,.jpeg,.png,.webp,.json" multiple>▧ 图纸 / OCR</label>
+              <label class="tool-button" title="选择局部问题截图"><input id="feedback-file" type="file" accept=".jpg,.jpeg,.png,.webp">⌗ 反馈截图</label>
+              <span class="drop-hint">可拖入文件，或按 Ctrl+V 粘贴截图</span>
+            </div>
+              <div class="run-options"><label class="provider-picker">模型 <select id="provider-select" aria-label="在线模型"></select></label><label><input id="use-api" type="checkbox" checked> 在线 Agent</label><label><input id="use-segmentation" type="checkbox" checked> 深度分割</label><button id="stop-job" class="stop-job" type="button" hidden><span>■</span> 停止</button><button id="send" type="submit"><span class="send-label">运行</span><span class="send-arrow">➤</span><span class="send-spinner" aria-hidden="true"></span></button></div>
+          </div>
+        </div>
+        <p id="composer-status" class="composer-status">首次运行：1 张工程图 + 1 个 OCR；二次修改：1 张局部截图。</p>
+      </form>
+    </section>
+
+    <aside class="workbench">
+      <div class="workbench-head"><div><div class="rail-label">WORKBENCH</div><h2>验证与结果</h2></div><span id="job-badge" class="job-badge">NO JOB</span></div>
+      <div class="work-tabs" role="tablist">
+        <button data-panel="preview" class="active">▱ 预览</button>
+        <button data-panel="trace">⌁ 轨迹</button>
+        <button data-panel="evidence">◎ 证据</button>
+        <button data-panel="memory">▥ 记忆</button>
+      </div>
+      <div class="work-content">
+        <section id="panel-preview" class="work-panel active">
+          <div class="preview-switches"><button data-view="overlay" class="active">重建轮廓</button><button data-view="source">原始图纸</button><button data-view="segmentation">材料分割</button><button data-view="topology">拓扑</button><span id="preview-zoom-controls" class="zoom-hint">Ctrl + 滚轮 <output id="preview-zoom">100%</output></span><button id="preview-fit" type="button" class="zoom-fit">适合窗口</button></div>
+          <section id="segmentation-editor" class="segmentation-editor" hidden>
+            <div class="review-heading"><div><span>HUMAN SEGMENTATION GATE</span><b>先检查材料区域，再继续建模</b></div><small>绿色区域会进入主轮廓提取</small></div>
+            <div class="review-tools">
+              <button id="review-add" type="button" class="active">＋ 补全</button>
+              <button id="review-erase" type="button">－ 擦除</button>
+              <label>笔刷 <input id="review-brush" type="range" min="4" max="90" value="24"><output id="review-brush-value">24 px</output></label>
+              <button id="review-undo" type="button">撤销</button>
+              <button id="review-reset" type="button">恢复模型结果</button>
+              <span class="review-zoom-controls"><span class="zoom-hint">Ctrl + 滚轮 <output id="review-zoom">100%</output></span><button id="review-fit" type="button">适合窗口</button></span>
+            </div>
+            <div class="review-canvas-wrap"><canvas id="review-canvas" aria-label="可编辑材料分割掩膜"></canvas><div id="review-loading">正在载入分割图…</div></div>
+            <div class="review-confirm"><p id="review-status">绿色为材料。擦除标注线、剖面线和多余块，补全缺失区域。</p><button id="review-confirm" type="button">确认分割并继续 →</button></div>
+          </section>
+          <div class="preview-stage">
+            <img id="preview-image" alt="当前任务预览" hidden>
+            <div id="preview-empty" class="preview-empty"><span>◇</span><b>等待第一轮结果</b><p>生成的受验证 LINE/ARC 分段将在这里显示</p></div>
+          </div>
+          <div class="result-strip"><span>发布门禁</span><b id="publish-state">尚未运行</b><code id="job-id">NO RESULT</code></div>
+          <div id="artifact-links" class="artifact-links"></div>
+        </section>
+
+        <section id="panel-trace" class="work-panel">
+          <div class="trace-intro"><span>EXECUTION TRACE</span><p>展示可审计的观察、证据、决策与校验，不展示模型私有逐字思维。</p></div>
+          <div id="reason-cards" class="reason-cards"></div>
+          <div id="trace-list" class="trace-list"><p class="empty-copy">运行后显示阶段轨迹。</p></div>
+        </section>
+
+        <section id="panel-evidence" class="work-panel">
+          <div id="evidence-grid" class="evidence-grid"><p class="empty-copy">当前没有工程证据。</p></div>
+        </section>
+
+        <section id="panel-memory" class="work-panel">
+          <div class="memory-head"><span>CONTEXT MEMORY</span><b id="memory-summary">0 turns</b></div>
+          <div id="memory-list" class="memory-list"><p class="empty-copy">本对话尚未保存任务上下文。</p></div>
+        </section>
+      </div>
+      <div class="stage-footer"><span id="stage-dot" class="stage-dot"></span><div><b id="stage-title">等待任务</b><small id="stage-detail">拖入图纸或选择数据集样本开始</small></div><div id="stage-progress" class="stage-progress"><i></i><i></i><i></i><i></i></div></div>
+    </aside>
+  </main>
+  <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-dialog-title">
+    <div class="delete-dialog-mark">×</div>
+    <div><span class="rail-label">DELETE TASK HISTORY</span><h2 id="delete-dialog-title">删除任务历史？</h2></div>
+    <p>将删除该任务的对话、运行记录、上传副本和专属产物。此操作无法撤销。</p>
+    <strong id="delete-dialog-name"></strong>
+    <div class="delete-dialog-actions"><button id="delete-cancel" type="button">取消</button><button id="delete-confirm" type="button">确认删除</button></div>
+  </dialog>
+  <div id="toast" class="toast" hidden></div>
+</body>
+</html>
