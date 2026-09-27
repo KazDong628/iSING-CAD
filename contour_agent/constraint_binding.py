@@ -18,9 +18,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from .binding_provider import bounded_inventory, validate_selection
+from .binding_provider import validate_selection
 from .dimension_evidence import _axis_lines, _linear_witnesses
 from .ocr import canonical_records, parse_dimension
+from .structural_evidence import structural_evidence
 
 
 def _write(path, value):
@@ -143,7 +144,7 @@ def _label_ray_entry(point, away_from_target, low, high, maximum_gap):
     return enter
 
 
-def _arrowhead_evidence(gray, endpoint, direction, label_size, band):
+def _arrowhead_evidence(gray, endpoint, direction, label_size, band, target_points=None):
     """Verify a directed filled-arrow taper from the original source pixels.
 
     A line or a single crossing is insufficient: the tip region must be
@@ -171,6 +172,11 @@ def _arrowhead_evidence(gray, endpoint, direction, label_size, band):
     for length in sorted(set(max(7.,min(90.,label_size*f)) for f in (.10,.16,.24,.36,.52))):
         for shift in np.linspace(-.35*length,.65*length,7):
             tip=endpoint+direction*shift
+            # Filter before ranking: a stronger taper elsewhere on a crossing
+            # stroke must not hide a valid arrow at this contour target. This
+            # uses the same tip-to-arc band checked by the caller afterwards.
+            if target_points is not None and float(np.min(np.linalg.norm(target_points-tip,axis=1)))>max(10.,band*1.7):
+                continue
             widths=[width_at(tip-direction*length*f,max(5.,.6*length)) for f in (.12,.42,.72,1.20,1.55)]
             narrow,middle,body,shaft,tail=widths
             shaft=max(shaft,tail,1.)
@@ -196,7 +202,53 @@ def _arrowhead_evidence(gray, endpoint, direction, label_size, band):
     return best
 
 
-def _leader_evidence(box, arc, center, lines, band, gray=None):
+def _leader_contour_visibility(label_point, target_point, contours, band):
+    """Check the directed label-to-tip path against the current source contour.
+
+    A hatch stroke can pass the local arrow taper test at the opposite material
+    boundary. Such a stroke must not bind an arc beyond the first boundary it
+    crosses. The existing coarse target band allows adjacent primitives at the
+    same junction; it does not allow a separate intervening material boundary.
+    """
+    start, end = np.asarray(label_point, float), np.asarray(target_point, float)
+    ray = end-start
+    length = float(np.linalg.norm(ray))
+    target_band = max(10., band*1.7)
+    first = None
+    if length > 1e-8:
+        for contour in contours:
+            points = np.asarray(contour, float)
+            for a, b in zip(points[:-1], points[1:]):
+                edge = b-a
+                relative = a-start
+                denominator = ray[0]*edge[1]-ray[1]*edge[0]
+                if abs(denominator) > 1e-9:
+                    t = (relative[0]*edge[1]-relative[1]*edge[0])/denominator
+                    u = (relative[0]*ray[1]-relative[1]*ray[0])/denominator
+                    if not (-1e-9 <= t <= 1.+1e-9 and -1e-9 <= u <= 1.+1e-9):
+                        continue
+                elif abs(relative[0]*ray[1]-relative[1]*ray[0]) <= 1e-7:
+                    # A shaft following a boundary is also not a free path to a
+                    # distant radius. Include its earliest overlapping point.
+                    ta, tb = (float(np.dot(point-start, ray)/(length*length)) for point in (a,b))
+                    if max(ta,tb) < 0. or min(ta,tb) > 1.:
+                        continue
+                    t = max(0., min(ta,tb))
+                else:
+                    continue
+                t = float(np.clip(t,0.,1.))
+                if first is None or t < first:
+                    first = t
+    remaining = None if first is None else (1.-first)*length
+    return {"method":"first_source_contour_intersection",
+            "label_exit_px":start.tolist(), "target_tip_px":end.tolist(),
+            "first_intersection_px":None if first is None else (start+first*ray).tolist(),
+            "first_intersection_to_target_px":remaining,
+            "target_support_band_px":target_band,
+            "verified":remaining is None or remaining <= target_band}
+
+
+def _leader_evidence(box, arc, center, lines, band, gray=None, contours=None, rejections=None):
     lo, hi = box.min(axis=0), box.max(axis=0)
     size = max(12., float(np.linalg.norm(hi-lo)))
     best = None
@@ -220,19 +272,122 @@ def _leader_evidence(box, arc, center, lines, band, gray=None):
             radial_alignment = abs(float(np.dot(direction,radial)/denominator)) if denominator else 0.
             if radial_alignment < .88:
                 continue
-            arrow=_arrowhead_evidence(gray,target_end,unit,size,band)
+            arrow=_arrowhead_evidence(gray,target_end,unit,size,band,arc)
             if arrow is None:continue
             arrow_gap=float(np.min(np.linalg.norm(arc-np.asarray(arrow["tip_px"]),axis=1)))
             if arrow_gap>max(10.,band*1.7):continue
+            visibility = _leader_contour_visibility(label_end-unit*ray_gap,arrow["tip_px"],
+                                                     contours if contours is not None else [arc],band)
+            if not visibility["verified"]:
+                if rejections is not None and len(rejections)<3:
+                    rejections.append({"leader_id":f"line{index:03d}",
+                                       "reason":"earlier_source_contour_intersection",**visibility})
+                continue
             score = tip_gap + label_gap*.2 + (1-radial_alignment)*band*3
             item = {"method": "detected_source_leader_to_arc", "leader_id": f"line{index:03d}",
                     "segment_px": segment.tolist(), "label_gap_px": label_gap,
                     "arc_endpoint_gap_px": tip_gap, "radial_alignment": radial_alignment, "score": score,
                     "label_ray_intersection_gap_px":ray_gap,"arrowhead_verified":True,
-                    "arrow_tip_to_arc_gap_px":arrow_gap,"arrowhead":arrow}
+                    "arrow_tip_to_arc_gap_px":arrow_gap,"arrowhead":arrow,
+                    "contour_visibility":visibility}
             if best is None or score < best["score"]:
                 best = item
     return best
+
+
+def _annotation_leader_segments(graph, record_id):
+    """Reuse upstream source observations, never its candidate ID or verdict.
+
+    Candidate edits rotate/renumber entities. Re-test each observed segment
+    against the current graph and original pixels before it can bind a radius.
+    """
+    result = []
+    for row in graph.get("annotation_support", []):
+        if row.get("record_id") != record_id:
+            continue
+        segment = (row.get("source_evidence") or {}).get("segment_px")
+        try:
+            points = np.asarray(segment, float)
+            if points.shape == (2, 2) and np.isfinite(points).all():
+                result.append(points)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _annotation_issues(graph, records, candidates):
+    """Describe unresolved semantics separately from a successful graph edit."""
+    by_record = defaultdict(list)
+    for candidate in candidates:
+        by_record[candidate["record_id"]].append(candidate)
+    entities = {e["id"]: e for e in graph.get("entities", [])}
+    issues = []
+    for record in records:
+        if record.get("parsed", {}).get("kind") != "radius":
+            continue
+        record_id, nominal = record["id"], record["parsed"]["nominal"]
+        proposals = by_record[record_id]
+        reliable = [p for p in proposals if p.get("local_reliable")]
+        supports = [s for s in graph.get("annotation_support", []) if s.get("record_id") == record_id]
+        targets = []
+        for support in supports:
+            entity = entities.get(support.get("candidate_entity_id"))
+            if entity is None:
+                continue
+            target = {"entity_id": entity["id"], "entity_type": entity["type"],
+                      "association_verified": any(p["entities"] == [entity["id"]] for p in reliable)}
+            if entity["type"] == "ARC":
+                target.update(fitted_radius=entity["radius"],
+                              nominal_difference=float(entity["radius"]) - float(nominal),
+                              fixed_endpoints_radius_feasible=math.dist(entity["start"], entity["end"]) <= 2 * float(nominal) + 1e-8)
+            targets.append(target)
+        issues.append({"record_id": record_id, "kind": "radius", "nominal": nominal,
+                       "status": "binding_candidate_requires_solve" if reliable else "unresolved_source_association",
+                       "candidate_count": len(proposals), "upstream_target_hypotheses": targets,
+                       "geometry_edit_is_not_numeric_binding": True,
+                       "reason": ("radius_target_is_line_requires_topology_edit" if any(t["entity_type"] == "LINE" for t in targets)
+                                  else "radius_requires_joint_or_topology_edit" if any(t.get("fixed_endpoints_radius_feasible") is False for t in targets)
+                                  else None),
+                       "dimensions_verified": False})
+    return issues
+
+
+def _constructed_radius_priors(graph, records):
+    """Track exact local construction without accepting its binding assertions.
+
+    A geometry executor can construct the requested nominal before the source
+    arrow-to-entity association has passed this module's independent checks.
+    Keep that history visible, but never promote metadata to a solver equation.
+    """
+    by_id = {row["id"]: row for row in records}
+    result = []
+    def finite_number(value):
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+    for entity in graph.get("entities", []):
+        construction = entity.get("radius_binding")
+        if not isinstance(construction, dict):
+            continue
+        nominal = finite_number(construction.get("nominal"))
+        radius = finite_number(entity.get("radius"))
+        record_id = construction.get("record_id")
+        record = by_id.get(record_id, {}) if isinstance(record_id, str) else {}
+        parsed = record.get("parsed", {})
+        matches_ocr = bool(parsed.get("kind") == "radius" and nominal is not None and nominal > 0
+                           and parsed.get("nominal") == nominal)
+        exact = bool(entity.get("type") == "ARC" and nominal is not None and radius is not None
+                     and nominal > 0 and abs(radius - nominal) <= max(1e-7, nominal * 1e-9))
+        result.append({"entity_id": entity["id"], "stable_id": entity.get("stable_id"),
+                       "record_id": record_id if isinstance(record_id,str) else None,
+                       "nominal": nominal, "current_radius": radius,
+                       "construction_matches_source_ocr": matches_ocr,
+                       "exact_constructed_radius_preserved": exact,
+                       "status": "constructed_geometry_prior_unverified" if matches_ocr and exact
+                                 else "construction_metadata_requires_review",
+                       "source_binding_verified": False, "radius_constraint_pending_solve": False,
+                       "dimensions_verified": False,
+                       "upstream_dimension_bound_claim_ignored": entity.get("dimension_bound") is True,
+                       "scope": "Construction history only. Fresh source evidence and an accepted numerical radius constraint are required."})
+    return result
 
 
 def _stroke_interval(line):
@@ -413,6 +568,7 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
     candidates = _length_candidates(gray,eligible,graph,band,pixels_per_mm)
     arcs = [(entity,_samples(entity,transform),transform([entity["center"]])[0])
             for entity in graph.get("entities",[]) if entity.get("type")=="ARC"]
+    contours = [_samples(entity,transform) for entity in graph.get("entities",[])]
     leaders = _leaders(gray,eligible) if arcs else []
     for row in eligible:
         if row["parsed"]["kind"] != "radius":
@@ -423,16 +579,28 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
             distance = float(np.min(np.linalg.norm(points-box.mean(axis=0),axis=1)))
             if distance > max(gray.shape)*.3:
                 continue
-            leader = _leader_evidence(box,points,center,leaders,band,gray)
+            inherited = _annotation_leader_segments(graph, row["id"])
+            occluded = []
+            leader = _leader_evidence(box,points,center,leaders + inherited,band,gray,contours,occluded)
             evidence = {"method":"source_label_proximity", "label_to_arc_px":distance,
                         "coarse_proposal_band_px":band, "fitted_radius":entity["radius"],
                         "nominal_difference":float(entity["radius"])-row["parsed"]["nominal"],
-                        "leader":leader,"nominal_used_to_rank":False}
+                        "leader":leader,"nominal_used_to_rank":False,
+                        "occluded_leader_hypotheses":occluded,
+                        "upstream_leader_hypotheses_rechecked":len(inherited),
+                        "evidence_chain":["source_ocr_box","observed_leader","verified_directed_arrow","current_primitive"],
+                        "numeric_constraint_applied":False}
             score = leader["score"] if leader else 100000+distance
             options.append({"record_id":row["id"],"kind":"radius","entities":[entity["id"]],"nodes":[],
                             "value":row["parsed"]["nominal"],"evidence":evidence,"local_reliable":False,"_score":score})
         options.sort(key=lambda candidate:candidate["_score"])
         if options:
+            # Keep rejected paths visible even when their arc falls outside the
+            # three returned proximity candidates. A crossing can be a real but
+            # ambiguous engineering leader; it requires review, not automatic
+            # numeric admission.
+            review_paths=[{"entity_id":option["entities"][0],**path}
+                          for option in options for path in option["evidence"]["occluded_leader_hypotheses"]][:6]
             best = options[0]
             independent = best["evidence"]["leader"] is not None and (
                 len(options)==1 or options[1]["_score"]-best["_score"] > max(5.,band*.5))
@@ -440,6 +608,7 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
             for candidate in options[:3]:
                 candidate["evidence"]["uniquely_supported_leader"] = bool(independent and candidate is best)
                 candidate["evidence"]["alternative_arcs"] = len(options)
+                candidate["evidence"]["ambiguous_crossing_leaders_requiring_review"] = review_paths
                 candidates.append(candidate)
     # Stable ID order is independent of provider output. Keep the full inventory;
     # only the provider packet is capped. Never mistake truncation for uniqueness.
@@ -457,14 +626,7 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
         if reliable_counts[candidate["record_id"]]>1:
             candidate["local_reliable"]=False
             candidate["evidence"]["record_has_multiple_supported_bindings"]=True
-    relations=[]
-    entities={e["id"] for e in graph.get("entities",[])}
-    for index,relation in enumerate(graph.get("relations",[])):
-        if relation.get("type") not in {"horizontal","vertical","tangent"} or not all(e in entities for e in relation.get("entities",[])):
-            continue
-        relations.append({"id":relation.get("id",f"rel{index:03d}"),"type":relation["type"],
-                          "entities":relation.get("entities",[]),"nodes":relation.get("nodes",[]),
-                          "source":"geometry_hypothesis","required":False})
+    relations=structural_evidence(gray,records,graph,transform,_samples,band)
     # Prioritize supported records, then keep alternatives together in the packet.
     by_record=defaultdict(list)
     for candidate in candidates: by_record[candidate["record_id"]].append(candidate)
@@ -476,12 +638,16 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
         selected_records.append(row);selected_candidates.extend(group)
     topology=out/"binding-topology.png"
     _draw_topology(image_path,graph,model,topology)
-    inventory={"version":"source-constraint-binding-v1","units":graph.get("units") or (graph.get("coordinate_system") or {}).get("units"),
+    inventory={"version":"source-constraint-binding-v2","units":graph.get("units") or (graph.get("coordinate_system") or {}).get("units"),
                "records":selected_records,"candidates":selected_candidates,"relations":relations,
                "all_records":records,"all_candidates":candidates,"source_image_sha256":hashlib.sha256(image_path.read_bytes()).hexdigest(),
                "artifacts":{"topology":str(topology),"inventory":str(out/"binding-candidates.json")},
                "counts":{"ocr_records":len(records),"recognized_dimensions":len(eligible),"all_candidates":len(candidates),
-                         "input_records":len(selected_records),"input_candidates":len(selected_candidates)},
+                         "input_records":len(selected_records),"input_candidates":len(selected_candidates),
+                         "structural_candidates":len(relations),
+                         "source_verified_relations":sum(r["local_reliable"] for r in relations)},
+               "annotation_diagnostics":_annotation_issues(graph,eligible,candidates),
+               "constructed_radius_priors":_constructed_radius_priors(graph,records),
                "ground_truth_used":False,"issues":[],"proposal_tolerance_px":band}
     _write(out/"binding-candidates.json",inventory)
     return inventory
@@ -509,15 +675,32 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
                 receipt=provider.select(image_path,inventory["artifacts"]["topology"],inventory)
                 if receipt.get("schema_success"):
                     validate_selection(json.dumps({"bindings":receipt.get("bindings"),"relations":receipt.get("relations")},allow_nan=False))
+            except InterruptedError:
+                raise
             except Exception:
                 # Unknown exceptions are deliberately not serialized: they may
                 # include headers. Request count remains unknown, never fake zero.
                 receipt={**_disabled("failed"),"error_code":"binding_provider_error","network_requests":None,"http_success":None}
     elif use_api:
         receipt=_disabled("skipped","no_source_binding_candidates")
-    packet=bounded_inventory(inventory)
+    # Providers can send a smaller packet than the generic inventory cap (for
+    # example a Responses vision budget). Only the recorded transmitted IDs
+    # establish model abstention or authorize accepting a returned selection.
+    # Legacy/custom providers without this receipt retain local source fallback
+    # but cannot claim an API-confirmed binding or a model abstention.
+    sent_sets=[]
+    sent_inventory_verified=True
+    for key, rows in (("input_record_ids",inventory["records"]),
+                      ("input_candidate_ids",inventory["candidates"]),
+                      ("input_relation_ids",inventory["relations"])):
+        value=receipt.get(key)
+        valid=(isinstance(value,list) and all(isinstance(item,str) for item in value)
+               and len(value)==len(set(value)) and set(value)<={row["id"] for row in rows})
+        sent_inventory_verified=sent_inventory_verified and valid
+        sent_sets.append(set(value) if valid else set())
+    sent_records,allowed,allowed_relations=sent_sets if sent_inventory_verified else (set(),set(),set())
+    receipt={**receipt,"input_inventory_verified":sent_inventory_verified}
     candidates={c["id"]:c for c in inventory["all_candidates"]}
-    allowed={c["id"] for c in packet["candidates"]}
     records={r["id"]:r for r in inventory["all_records"]}
     graph_entities={e["id"]:e for e in graph.get("entities",[])}
     graph_nodes={n["id"]:n for n in graph.get("nodes",[])}
@@ -553,12 +736,13 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
                 if parsed.get("kind")!=original.get("kind") or parsed.get("nominal")!=original.get("nominal"):
                     error="source_observed_text_mismatch"
         error=error or ("candidate_not_sent" if selected["candidate_id"] in candidates and selected["candidate_id"] not in allowed else None)
+        error=error or ("record_not_sent" if selected["record_id"] not in sent_records else None)
         error=error or ("duplicate_record_selection" if repeats[selected["record_id"]]>1 else None)
         decision={**selected,"source":"ocr_api_binding","accepted":error is None,"reason":error}
         decisions.append(decision)
         if error is None:proposals.append((_constraint(candidate,"ocr_api_binding"),decision))
-    selected_records={row["record_id"] for row in selections}
-    provider_abstained={row["id"] for row in packet["records"]}-selected_records if use_api and receipt.get("schema_success") else set()
+    selected_records={row["record_id"] for row in selections if row["record_id"] in sent_records}
+    provider_abstained=sent_records-selected_records if use_api and receipt.get("schema_success") else set()
     for candidate in inventory["all_candidates"]:
         if candidate["record_id"] in selected_records:continue
         error=check(candidate,candidate["record_id"])
@@ -578,15 +762,23 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
         else:
             constraints.append(group[0][0])
             for _,decision in group[1:]:decision.update(accepted=False,reason="duplicate_equivalent_constraint")
-    relations={r["id"]:r for r in packet["relations"]}
+    relations={r["id"]:r for r in inventory["relations"]}
     relation_selections=receipt.get("relations",[]) if receipt.get("schema_success") else []
     relation_counts=Counter(r["relation_id"] for r in relation_selections)
+    selected_relation_ids=set(relation_counts)&allowed_relations
+    relation_rows=[(selected,"api_and_source") for selected in relation_selections]
+    for relation in inventory["relations"]:
+        if relation["id"] not in selected_relation_ids:
+            relation_rows.append(({"relation_id":relation["id"]},"local_source_fallback"))
     orientation=defaultdict(set)
-    for selected in relation_selections:
+    for selected,method in relation_rows:
         relation=relations.get(selected["relation_id"])
-        if relation and relation["type"] in {"horizontal","vertical"}:
+        if method=="api_and_source" and selected["relation_id"] not in allowed_relations:
+            continue
+        if relation and relation["type"] in {"horizontal","vertical"} and (method=="api_and_source" or relation.get("local_reliable")):
             for entity in relation["entities"]:orientation[entity].add(relation["type"])
-    for selected in relation_selections:
+    relation_proposals=[]
+    for selected,method in relation_rows:
         relation=relations.get(selected["relation_id"])
         reason="unknown_relation_id" if relation is None else "duplicate_relation_selection" if relation_counts[selected["relation_id"]]>1 else None
         if reason is None:
@@ -598,20 +790,55 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
                     reason="conflicting_relations"
             elif relation["type"]=="tangent" and (len(entity_ids)!=2 or len(set(entity_ids))!=2 or any(e not in graph_entities for e in entity_ids)):
                 reason="relation_entity_type_mismatch"
-        decisions.append({**selected,"source":"source_geometry","accepted":reason is None,"reason":reason})
+            elif relation["type"]=="tangent":
+                ends=[{graph_entities[e].get("start_node"),graph_entities[e].get("end_node")} for e in entity_ids]
+                shared=(ends[0]&ends[1])-{None}
+                if len(shared)!=1 or (relation["nodes"] and set(relation["nodes"])!=shared):
+                    reason="tangent_requires_unique_shared_node"
+        if reason is None and method=="api_and_source" and selected["relation_id"] not in allowed_relations:
+            reason="relation_not_sent"
+        if reason is None and not (relation.get("local_reliable") and (relation.get("evidence") or {}).get("verified")):
+            reason="insufficient_independent_source_relation_evidence"
+        if (reason is None and method=="local_source_fallback" and use_api and receipt.get("schema_success")
+                and selected["relation_id"] in allowed_relations):
+            reason="provider_abstained_from_sent_relation"
+        decision={**selected,"source":"source_geometry","admission_method":method,
+                  "accepted":reason is None,"reason":reason,"evidence":relation.get("evidence") if relation else None}
+        decisions.append(decision)
         if reason is None:
-            constraints.append({"id":"k"+relation["id"],"kind":relation["type"],"record_id":None,"entities":relation["entities"],
-                                "nodes":relation["nodes"],"value":None,"source":"source_geometry","required":False})
+            relation_proposals.append(({"id":"k"+relation["id"],"kind":relation["type"],"record_id":None,"entities":relation["entities"],
+                                        "nodes":relation["nodes"],"value":None,"source":"source_geometry","required":False,
+                                        "admission_method":method},decision))
+    seen_relations=set()
+    for constraint,decision in relation_proposals:
+        signature=(constraint["kind"],tuple(sorted(constraint["entities"])),tuple(sorted(constraint["nodes"])))
+        if signature in seen_relations:
+            decision.update(accepted=False,reason="duplicate_equivalent_relation")
+            continue
+        seen_relations.add(signature);constraints.append(constraint)
     bound={c["record_id"] for c in constraints if c["record_id"] is not None}
+    constructed_priors=inventory.get("constructed_radius_priors",[])
+    for prior in constructed_priors:
+        matched=next((c for c in constraints if c["kind"]=="radius" and
+                      c["entities"]==[prior["entity_id"]] and c["record_id"]==prior["record_id"]
+                      and c["value"]==prior["nominal"]),None)
+        if matched is not None:
+            prior.update(status="source_verified_constraint_pending_solve",source_binding_verified=True,
+                         radius_constraint_pending_solve=True,constraint_id=matched["id"])
     rejected=[row for row in decisions if not row["accepted"]]
     result={"status":"completed","constraints":constraints,"bindings":decisions,"provider":receipt,
             "counts":{**inventory["counts"],"api_selected":len(selections),
                       "api_accepted":sum(row["accepted"] and row["source"]=="ocr_api_binding" for row in decisions),
                       "local_accepted":sum(row["accepted"] and row["source"]=="ocr_local_binding" for row in decisions),
+                      "structural_accepted":sum(row["accepted"] and row["source"]=="source_geometry" for row in decisions),
+                      "structural_local_accepted":sum(row["accepted"] and row.get("admission_method")=="local_source_fallback" for row in decisions),
+                      "structural_api_accepted":sum(row["accepted"] and row.get("admission_method")=="api_and_source" for row in decisions),
                       "rejected":len(rejected),"bound_source_records":len(bound),
                       "unbound_dimensions":inventory["counts"]["recognized_dimensions"]-len(bound),"constraints":len(constraints)},
             "units":inventory["units"],"inventory_artifact":inventory["artifacts"]["inventory"],"topology_artifact":inventory["artifacts"]["topology"],
             "issues":sorted({row["reason"] for row in rejected}),"ground_truth_used":False,"dimensions_verified":False,
+            "annotation_diagnostics":inventory.get("annotation_diagnostics",[]),
+            "constructed_radius_priors":constructed_priors,
             "scope":"Only independently supported source bindings; unbound dimensions and global constraint completeness remain unverified."}
     _write(Path(output_dir)/"constraint-bindings.json",result)
     return result

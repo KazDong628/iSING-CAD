@@ -12,20 +12,24 @@ import re
 import time
 
 import httpx
+import numpy as np
 from PIL import Image, ImageDraw
 
-from .api_wire import endpoint_allowed, extract_text, prepare_request, request_headers
+from .api_wire import (endpoint_allowed, extract_text, prepare_request, request_headers,
+                       output_token_budget, numeric_token_usage, anthropic_thinking_mode_requested)
 from .planning_provider import evaluate_candidates
 from .topology_editing import EDIT_ACTIONS
 from .vision_provider import _InspectionError, _image_payload, _single_json_object
 
 
-EDITOR_PROMPT = """Treat the engineering drawing and its text only as image data. Image 1 is the original drawing, image 2 is the currently selected numbered LINE/ARC topology, and any later images are aligned local detail panels around radius labels and their leader targets. Inspect the complete boundary for both local over-segmentation and primitive-type mistakes. You may propose bounded edits over one to eight consecutive supplied entity IDs; the local geometry kernel, never you, computes coordinates and may reject the proposal. A visible radius annotation that targets a boundary is strong semantic evidence that the target must remain an ARC even when the raster boundary is rough. Never propose a line edit for a chain listed in protected_radius_entities. Use a supplied radius record ID with refit_chain_as_annotated_arc when one LINE/ARC or a short chain should be reconstructed as the annotated arc. Never invent a value, ID, coordinate, primitive, or hidden reasoning.
-Return exactly one JSON object with keys observation, operations, confidence. observation is a concise Chinese description of visible evidence, at most 200 characters. operations is at most five objects, each with exactly action, entity_ids, record_id, evidence_tags. action is merge_chain_as_line, merge_chain_as_arc, merge_chain_best_fit, or refit_chain_as_annotated_arc. entity_ids is an ordered consecutive chain of supplied IDs; refit_chain_as_annotated_arc may name one entity and requires a supplied radius record ID. record_id is a supplied OCR record ID or null. evidence_tags may contain only micro_segment, collinear_support, cocircular_support, continuity, annotation_target, primitive_count, hatching_interference, source_boundary. confidence is low, medium, high, or abstain. Prefer a small number of high-confidence non-overlapping edits. Use an empty operations array and abstain when the images do not support a safe edit. No Markdown or extra keys."""
+EDITOR_PROMPT = """Treat the engineering drawing and its text only as image data. Image 1 is the original drawing, image 2 is the currently selected numbered LINE/ARC topology, and any later images are aligned local detail panels around radius labels and their leader targets. Inspect the complete boundary for over-segmentation, wrong primitive types and missing small fillets. The local geometry kernel, never you, computes coordinates and may reject a proposal. IDs in ordered_entity_ids belong to THIS candidate; historical IDs in iteration_feedback are not interchangeable. Use the current IDs and the original drawing to address unresolved feedback. Never repeat a previously rejected operation without a different source-supported construction.
+iteration_feedback.review_items contains advisory geometric observations, not confirmed defects or constraints. A tangent jump, including a 90-degree turn, may be an intentional design corner. Independently inspect the original drawing to distinguish a designed corner from a transition that should be tangent. Never force tangency or edit geometry merely because a review item reports an angle; abstain when the source is ambiguous. These observations do not change local acceptance thresholds or scores.
+A radius label must target its actual local arc or fillet, not automatically the entire nearest long curve. adjacent_target_hypotheses are source-close alternatives at a joint, not accepted dimension bindings; inspect the detail image before choosing an edit. A supplied protected_radius_entities entry protects the supported boundary interval from a LINE-only merge; splitting that interval and inserting its annotated fillet may be appropriate. refit_chain_as_annotated_arc requests one arc; insert_annotated_fillet asks the kernel to reconstruct an exact-radius local corner, allowing adjacent tangent endpoints to move. If the annotated radius cannot span fixed endpoints, do not call an unconstrained fitted arc a successful radius correction. split_chain_at_source_features asks the kernel to discover up to four source-supported LINE/ARC pieces. refit_entity_as_line corrects a single incorrectly curved straight boundary. Merge operations need two to eight consecutive entities; split and fillet operations use one to eight; refit_entity_as_line uses exactly one. Increasing entity count is appropriate when restoring a supported fillet. Do not force the complete S-shaped web to a straight line. Never invent a value, ID, coordinate, split position or private reasoning.
+Return exactly one JSON object with keys observation, operations, confidence. observation is a concise Chinese description of visible evidence, at most 200 characters. operations is at most five objects, each with exactly action, entity_ids, record_id, evidence_tags. action is merge_chain_as_line, merge_chain_as_arc, merge_chain_best_fit, refit_chain_as_annotated_arc, refit_entity_as_line, split_chain_at_source_features, or insert_annotated_fillet. entity_ids is an ordered consecutive chain of supplied IDs. refit_chain_as_annotated_arc and insert_annotated_fillet require a supplied radius record ID. record_id is a supplied OCR record ID or null. evidence_tags may contain only micro_segment, collinear_support, cocircular_support, continuity, annotation_target, primitive_count, hatching_interference, source_boundary. confidence is low, medium, high, or abstain. Prefer a small number of high-confidence non-overlapping edits. Use an empty operations array and abstain when the images do not support a safe edit. No Markdown or extra keys."""
 
 
-EVALUATOR_PROMPT = """Act as an independent topology evaluator. Image 1 is the original engineering drawing. Candidate topology images and any later radius-detail panels are identified by the supplied image-order fields. Each detail panel stacks the original crop above the aligned candidate overlay. Some candidates were generated by a local geometry kernel from multimodal or deterministic annotation-conflict proposals. Select the candidate whose visible material boundary, continuity, annotation targets, and primitive count are best supported. A radius-labelled target must remain an ARC even when the raster boundary is rough. Never reward lower object count by itself. Never invent coordinates, dimensions, IDs, or geometry. Local admissibility is authoritative.
-Return exactly one JSON object with keys candidate_id, observation, decision, evidence_tags, confidence. candidate_id is one supplied ID or null. observation is concise Chinese visible evidence, at most 200 characters. decision is accept_edit, preserve_base, or abstain. evidence_tags may contain only source_boundary, continuity, primitive_count, annotation_support, local_residual, local_validity. confidence is low, medium, high, or abstain. candidate_id must be null when decision is abstain. No Markdown or extra keys."""
+EVALUATOR_PROMPT = """Act as an independent topology evaluator. Image 1 is the original engineering drawing. Candidate topology images and any later radius-detail panels are identified by the supplied image-order fields. Each detail panel stacks the original crop above the aligned candidate overlay. Some candidates were generated by a local geometry kernel from multimodal or deterministic annotation-conflict proposals. Select the candidate whose visible material boundary, continuity, annotation targets, and primitive count are best supported. A radius-labelled target must remain an ARC even when the raster boundary is rough. Verify that a small radius belongs to its local corner, not an adjacent long curve. A correct fillet may increase object count. A merely smooth arc does not prove that its annotated radius was satisfied: numeric binding, source fit and visual agreement are separate checks. Never reward lower object count by itself. Never invent coordinates, dimensions, IDs, or geometry. Local admissibility is authoritative.
+Return exactly one JSON object with keys candidate_id, observation, decision, evidence_tags, confidence. candidate_id is one supplied ID or null. observation is concise Chinese visible evidence, at most 200 characters. decision is accept_edit, preserve_base, or abstain. The decision and ID must agree: preserve_base requires candidate_id == base_candidate_id; accept_edit requires a supplied candidate_id DIFFERENT from base_candidate_id; abstain requires candidate_id == null and confidence == abstain. For either non-abstaining decision confidence must be low, medium, or high. Accepting the quality of the original candidate is preserve_base, never accept_edit. evidence_tags may contain only source_boundary, continuity, primitive_count, annotation_support, local_residual, local_validity. No Markdown or extra keys."""
 
 
 _EDITOR_TAGS = {"micro_segment", "collinear_support", "cocircular_support", "continuity",
@@ -119,6 +123,37 @@ def _rank_radius_detail_records(annotation_inventory, graph, *, limit=6):
             seen_entities.add(entity_id)
         if len(selected) >= limit:
             break
+    # If the image budget has room, expose distinct directed targets on the
+    # same coarse primitive. They may be different local fillets even though
+    # nearest-object assignment gave both labels one display ID.
+    for _, position, record, entity_id in ranked:
+        if len(selected) >= limit:
+            break
+        if not entity_id or entity_id not in seen_entities or any(row[1] is record for row in selected):
+            continue
+        support = support_by_record.get(record.get("record_id"), {})
+        if not support.get("arrowhead_verified"):
+            continue
+        target = (record.get("leader") or {}).get("target_source_px")
+        try:
+            target = np.asarray(target, float)
+        except (TypeError, ValueError):
+            continue
+        if target.shape != (2,) or not np.isfinite(target).all():
+            continue
+        grid = max(1., float(graph.get("source_grid_pitch_px") or 1.))
+        previous_targets = []
+        for row in selected:
+            if row[2] != entity_id:
+                continue
+            try:
+                previous_targets.append(np.asarray((row[1].get("leader") or {}).get("target_source_px"), float))
+            except (TypeError, ValueError):
+                previous_targets.append(np.asarray([], float))
+        if previous_targets and all(value.shape == (2,) and np.isfinite(value).all()
+                                    and float(np.linalg.norm(target - value)) > max(12., 4 * grid)
+                                    for value in previous_targets):
+            selected.append((position, record, entity_id))
     return selected
 
 
@@ -149,6 +184,75 @@ def _consecutive(entity_ids, graph):
     return entity_ids == [ids[(start + offset) % len(ids)] for offset in range(len(entity_ids))]
 
 
+def bounded_iteration_feedback(feedback, graph, record_ids):
+    """Send compact diagnostic evidence, never arbitrary prior output or coordinates."""
+    if not isinstance(feedback, dict):
+        return None
+    known_entities = {row.get("id") for row in graph.get("entities", []) if isinstance(row, dict)}
+    def identifier(value):
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,119}", value) else None
+    result = {"historical_ids_are_not_current_ids": True}
+    if type(feedback.get("round")) is int:
+        result["round"] = max(1, min(3, feedback["round"]))
+    for key in ("previous_candidate_id", "stop_reason"):
+        value = identifier(feedback.get(key))
+        if value:
+            result[key] = value
+    issues = feedback.get("issues", [])
+    result["issues"] = []
+    for issue in issues[:24] if isinstance(issues, list) else []:
+        if not isinstance(issue, dict) or not identifier(issue.get("code")):
+            continue
+        row = {"code": issue["code"]}
+        if isinstance(issue.get("entity_id"), str) and issue["entity_id"] in known_entities:
+            row["entity_id"] = issue["entity_id"]
+        ids = issue.get("entity_ids")
+        if isinstance(ids, list):
+            row["entity_ids"] = [item for item in ids[:8] if isinstance(item, str) and item in known_entities]
+        if isinstance(issue.get("record_id"), str) and issue["record_id"] in record_ids:
+            row["record_id"] = issue["record_id"]
+        result["issues"].append(row)
+    result["review_items"] = []
+    review_items = feedback.get("review_items", [])
+    stable_by_id = {row.get("id"): identifier(row.get("stable_id"))
+                    for row in graph.get("entities", []) if isinstance(row, dict)}
+    seen_review_pairs = set()
+    for item in review_items[:24] if isinstance(review_items, list) else []:
+        if not isinstance(item, dict) or item.get("code") != "tangent_jump_requires_source_review":
+            continue
+        ids, angle = item.get("entity_ids"), item.get("tangent_jump_deg")
+        if (not isinstance(ids, list) or len(ids) != 2 or
+                any(not isinstance(eid, str) or eid not in known_entities for eid in ids) or
+                len(set(ids)) != 2 or not _consecutive(ids, graph) or tuple(ids) in seen_review_pairs or
+                type(angle) not in (int, float) or not math.isfinite(angle) or not 5. < angle <= 180.):
+            continue
+        row = {"code": "tangent_jump_requires_source_review", "entity_ids": list(ids),
+               "tangent_jump_deg": round(float(angle), 6), "advisory_only": True,
+               "tangency_required": False}
+        # Stable identity comes from this graph, never arbitrary feedback text.
+        if all(stable_by_id.get(eid) for eid in ids):
+            row["stable_ids"] = [stable_by_id[eid] for eid in ids]
+        result["review_items"].append(row)
+        seen_review_pairs.add(tuple(ids))
+        if len(result["review_items"]) >= 12:
+            break
+    operations = feedback.get("previous_operations", feedback.get("rejected_operations", []))
+    result["previous_operations"] = []
+    for operation in operations[:10] if isinstance(operations, list) else []:
+        if not isinstance(operation, dict) or not isinstance(operation.get("action"), str) or operation["action"] not in EDIT_ACTIONS:
+            continue
+        row = {"action": operation["action"]}
+        for key in ("status", "reason", "record_id"):
+            value = identifier(operation.get(key))
+            if value:
+                row[key] = value
+        ids = operation.get("entity_ids")
+        if isinstance(ids, list):
+            row["entity_ids"] = [item for item in ids[:8] if identifier(item)]
+        result["previous_operations"].append(row)
+    return result
+
+
 def validate_edit_response(text, graph, record_ids):
     if not isinstance(text, str) or len(text) > 16000:
         raise _InspectionError("invalid_output")
@@ -169,17 +273,24 @@ def validate_edit_response(text, graph, record_ids):
     for operation in operations:
         if not isinstance(operation, dict) or set(operation) != {"action", "entity_ids", "record_id", "evidence_tags"}:
             raise _InspectionError("invalid_operations")
+        if not isinstance(operation["action"], str):
+            raise _InspectionError("invalid_operations")
         ids = operation["entity_ids"]
-        minimum = 1 if operation["action"] == "refit_chain_as_annotated_arc" else 2
-        if (operation["action"] not in EDIT_ACTIONS or not isinstance(ids, list) or not minimum <= len(ids) <= 8
+        single_allowed = {"refit_chain_as_annotated_arc", "refit_entity_as_line",
+                          "split_chain_at_source_features", "insert_annotated_fillet"}
+        minimum = 1 if operation["action"] in single_allowed else 2
+        maximum = 1 if operation["action"] == "refit_entity_as_line" else 8
+        if (operation["action"] not in EDIT_ACTIONS or not isinstance(ids, list) or not minimum <= len(ids) <= maximum
+                or any(not isinstance(item, str) for item in ids)
                 or len(set(ids)) != len(ids) or not set(ids).issubset(known_entities) or not _consecutive(ids, graph)):
             raise _InspectionError("invalid_operations")
-        if operation["record_id"] is not None and operation["record_id"] not in record_ids:
+        if operation["record_id"] is not None and (not isinstance(operation["record_id"], str)
+                                                      or operation["record_id"] not in record_ids):
             raise _InspectionError("unknown_record_id")
-        if operation["action"] == "refit_chain_as_annotated_arc" and operation["record_id"] is None:
+        if operation["action"] in {"refit_chain_as_annotated_arc", "insert_annotated_fillet"} and operation["record_id"] is None:
             raise _InspectionError("annotated_arc_requires_record_id")
         tags = operation["evidence_tags"]
-        if not isinstance(tags, list) or len(tags) > 8 or len(set(tags)) != len(tags) or not set(tags).issubset(_EDITOR_TAGS):
+        if not isinstance(tags, list) or len(tags) > 8 or any(not isinstance(tag, str) for tag in tags) or len(set(tags)) != len(tags) or not set(tags).issubset(_EDITOR_TAGS):
             raise _InspectionError("invalid_evidence_tags")
     if not operations and value["confidence"] != "abstain":
         raise _InspectionError("empty_operations_require_abstention")
@@ -223,18 +334,21 @@ class TopologyEditProvider:
     def __init__(self, settings):
         self.settings = settings
 
-    def propose(self, image_path, overlay_path, candidate, annotation_inventory):
-        return asyncio.run(self._propose(image_path, overlay_path, candidate, annotation_inventory))
+    def propose(self, image_path, overlay_path, candidate, annotation_inventory, *, feedback=None):
+        return asyncio.run(self._propose(image_path, overlay_path, candidate, annotation_inventory, feedback=feedback))
 
-    async def _propose(self, image_path, overlay_path, candidate, annotation_inventory):
+    async def _propose(self, image_path, overlay_path, candidate, annotation_inventory, *, feedback=None):
         settings, started = self.settings, time.monotonic()
         graph = candidate.get("graph") if isinstance(candidate, dict) else None
         graph = graph if isinstance(graph, dict) else {}
         record_ids = {row.get("record_id") for row in annotation_inventory if isinstance(row, dict) and row.get("record_id")}
-        receipt = {"status": "failed", "protocol": settings.wire_api+"-local-topology-edit-v1",
+        budget = min(600., max(.001, float(settings.api_timeout)))
+        receipt = {"status": "failed", "protocol": settings.wire_api+"-local-topology-edit-v2",
                    "model": settings.model, "network_requests": 0, "http_success": False,
                    "schema_success": False, "image_sent": False, "ground_truth_sent": False,
-                   "coordinates_sent": False, "operations": [], "observation": "", "confidence": "abstain"}
+                   "coordinates_sent": False, "operations": [], "observation": "", "confidence": "abstain",
+                   "anthropic_thinking_mode_requested": anthropic_thinking_mode_requested(settings),
+                   "total_timeout_seconds": budget, "candidate_id": candidate.get("id") if isinstance(candidate, dict) else None}
         def finish():
             receipt["elapsed_seconds"] = round(time.monotonic()-started, 3)
             return _safe_receipt(receipt, settings)
@@ -268,40 +382,64 @@ class TopologyEditProvider:
                        for row in annotation_inventory if isinstance(row, dict) and row.get("record_id")][:48]
             annotation_support = [{key: row.get(key) for key in ("record_id", "text", "kind", "nominal",
                                                                   "candidate_entity_id", "candidate_entity_type",
-                                                                  "target_gap_px", "arrowhead_verified", "status")}
+                                                                  "target_gap_px", "arrowhead_verified", "status",
+                                                                  "adjacent_target_hypotheses")}
                                   for row in graph.get("annotation_support", []) if isinstance(row, dict)]
             protected = sorted({row.get("candidate_entity_id") for row in annotation_support
                                 if row.get("kind") == "radius" and row.get("status") == "candidate_supported"
-                                and row.get("candidate_entity_id")})
+                                and row.get("candidate_entity_id")} |
+                               {option.get("entity_id") for row in annotation_support
+                                if row.get("kind") == "radius" and row.get("status") == "candidate_supported"
+                                and row.get("arrowhead_verified")
+                                for option in (row.get("adjacent_target_hypotheses") or [])
+                                if isinstance(option, dict) and option.get("entity_type") == "ARC"
+                                and option.get("entity_id") in entity_ids})
             packet = {"candidate_id": candidate.get("id"), "ordered_entity_ids": entity_ids,
                       "entity_types": {row.get("id"): row.get("type") for row in graph.get("entities", [])},
                       "annotation_records": records, "entity_annotation_support": annotation_support,
                       "protected_radius_entities": protected, "radius_detail_order": detail_order}
+            bounded_feedback = bounded_iteration_feedback(feedback, graph, record_ids)
+            if bounded_feedback is not None:
+                packet["iteration_feedback"] = bounded_feedback
+                receipt["feedback_issue_count"] = len(bounded_feedback["issues"])
+                receipt["feedback_review_item_count"] = len(bounded_feedback["review_items"])
             packet_text = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            payload = {"model": settings.model, "temperature": 0, "max_tokens": 1200,
+            payload = {"model": settings.model, "temperature": 0,
+                       "max_tokens": output_token_budget(settings, "editing", 1600),
                        "messages": [{"role": "system", "content": EDITOR_PROMPT},
                                     {"role": "user", "content": [{"type": "text", "text": packet_text}, *images]}]}
             endpoint, wire_payload = prepare_request(settings, payload)
-            budget = min(600., max(.001, float(settings.api_timeout)))
+            receipt["request_max_output_tokens"] = wire_payload.get("max_output_tokens", wire_payload.get("max_tokens"))
             async with httpx.AsyncClient(timeout=httpx.Timeout(budget, connect=min(10., budget)),
                                          trust_env=settings.trust_env, verify=True, follow_redirects=False) as client:
                 receipt["network_requests"] = 1
-                response = await client.post(endpoint, headers=request_headers(settings), json=wire_payload)
+                receipt["request_started"] = True
+                response = await asyncio.wait_for(
+                    client.post(endpoint, headers=request_headers(settings), json=wire_payload),
+                    timeout=max(.001, budget - (time.monotonic() - started)))
             receipt.update(http_status=response.status_code, http_success=response.status_code == 200,
                            image_sent=True, input_images=metadata)
             if response.status_code != 200:
                 receipt["error_code"] = "http_error"
                 return finish()
-            text, source, reason, _ = extract_text(settings, response)
+            text, source, reason, usage = extract_text(settings, response)
+            receipt.update(response_text_source=source, finish_reason=reason,
+                           usage=numeric_token_usage(usage), response_text_chars=len(text))
+            if reason not in (None, "stop"):
+                receipt["error_code"] = "truncated_output" if reason in {"length", "incomplete"} else "incomplete_response"
+                return finish()
             value = validate_edit_response(text, graph, record_ids)
             receipt.update(status="succeeded", schema_success=True, response_text_source=source,
                            finish_reason=reason, response_text_sha256=hashlib.sha256(text.encode()).hexdigest(),
                            response_excerpt=text[:1200], **value)
             return finish()
-        except (_InspectionError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        except (_InspectionError, ValueError, TypeError, KeyError, IndexError, AttributeError) as error:
             receipt["error_code"] = error.code if isinstance(error, _InspectionError) else "invalid_response"
             return finish()
-        except (httpx.TimeoutException, httpx.RequestError):
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            receipt["error_code"] = "timeout"
+            return finish()
+        except httpx.RequestError:
             receipt["error_code"] = "transport_error"
             return finish()
 
@@ -315,14 +453,30 @@ class TopologyEvaluationProvider:
 
     async def _select(self, image_path, candidates, base_id, annotation_inventory):
         settings, started = self.settings, time.monotonic()
+        budget = min(600., max(.001, float(settings.api_timeout)))
         local = evaluate_candidates(candidates, max_candidates=5)
+        # Reserving the admissible base makes preserve_base a real choice even
+        # when five smaller proposals rank ahead of it. The independent local
+        # ranking and rejection list are unchanged; the image budget stays five.
+        if base_id in local["admissible_candidate_ids"]:
+            bounded_ids = [base_id, *[candidate_id for candidate_id in local["ranked_candidate_ids"]
+                                     if candidate_id != base_id][:4]]
+            summaries = {row["candidate_id"]: row for row in local["bounded_candidates"]}
+            if base_id not in summaries:
+                base = next(row for row in candidates if row.get("id") == base_id)
+                base_evaluation = evaluate_candidates([base], max_candidates=1)
+                summaries[base_id] = base_evaluation["bounded_candidates"][0]
+            local.update(bounded_candidate_ids=bounded_ids,
+                         bounded_candidates=[summaries[candidate_id] for candidate_id in bounded_ids],
+                         admissible_base_reserved=True)
         allowed = set(local["bounded_candidate_ids"])
         receipt = {"status": "failed", "protocol": settings.wire_api+"-topology-edit-evaluation-v1",
                    "model": settings.model, "network_requests": 0, "http_success": False,
                    "schema_success": False, "image_sent": False, "ground_truth_sent": False,
                    "coordinates_sent": False, "selected_candidate_id": None, "observation": "",
+                   "anthropic_thinking_mode_requested": anthropic_thinking_mode_requested(settings),
                    "decision": "abstain", "evidence_tags": [], "confidence": "abstain",
-                   "local_evaluation": local}
+                   "local_evaluation": local, "total_timeout_seconds": budget}
         def finish():
             receipt["elapsed_seconds"] = round(time.monotonic()-started, 3)
             return _safe_receipt(receipt, settings)
@@ -365,30 +519,42 @@ class TopologyEvaluationProvider:
                       "radius_detail_order": radius_detail_order,
                       "candidates": local["bounded_candidates"]}
             packet_text = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            payload = {"model": settings.model, "temperature": 0, "max_tokens": 800,
+            payload = {"model": settings.model, "temperature": 0,
+                       "max_tokens": output_token_budget(settings, "evaluation", 1000),
                        "messages": [{"role": "system", "content": EVALUATOR_PROMPT},
                                     {"role": "user", "content": [{"type": "text", "text": packet_text}, *images]}]}
             endpoint, wire_payload = prepare_request(settings, payload)
-            budget = min(600., max(.001, float(settings.api_timeout)))
+            receipt["request_max_output_tokens"] = wire_payload.get("max_output_tokens", wire_payload.get("max_tokens"))
             async with httpx.AsyncClient(timeout=httpx.Timeout(budget, connect=min(10., budget)),
                                          trust_env=settings.trust_env, verify=True, follow_redirects=False) as client:
                 receipt["network_requests"] = 1
-                response = await client.post(endpoint, headers=request_headers(settings), json=wire_payload)
+                receipt["request_started"] = True
+                response = await asyncio.wait_for(
+                    client.post(endpoint, headers=request_headers(settings), json=wire_payload),
+                    timeout=max(.001, budget - (time.monotonic() - started)))
             receipt.update(http_status=response.status_code, http_success=response.status_code == 200,
                            image_sent=True, input_images=metadata)
             if response.status_code != 200:
                 receipt["error_code"] = "http_error"
                 return finish()
-            text, source, reason, _ = extract_text(settings, response)
+            text, source, reason, usage = extract_text(settings, response)
+            receipt.update(response_text_source=source, finish_reason=reason,
+                           usage=numeric_token_usage(usage), response_text_chars=len(text))
+            if reason not in (None, "stop"):
+                receipt["error_code"] = "truncated_output" if reason in {"length", "incomplete"} else "incomplete_response"
+                return finish()
             value = validate_evaluation_response(text, allowed, base_id)
             receipt.update(status="succeeded", schema_success=True,
                            selected_candidate_id=value["candidate_id"], response_text_source=source,
                            finish_reason=reason, response_text_sha256=hashlib.sha256(text.encode()).hexdigest(),
                            response_excerpt=text[:1200], **{key: value[key] for key in value if key != "candidate_id"})
             return finish()
-        except (_InspectionError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        except (_InspectionError, ValueError, TypeError, KeyError, IndexError, AttributeError) as error:
             receipt["error_code"] = error.code if isinstance(error, _InspectionError) else "invalid_response"
             return finish()
-        except (httpx.TimeoutException, httpx.RequestError):
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            receipt["error_code"] = "timeout"
+            return finish()
+        except httpx.RequestError:
             receipt["error_code"] = "transport_error"
             return finish()

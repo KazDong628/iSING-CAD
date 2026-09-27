@@ -221,12 +221,29 @@ def fit_polyline(polyline_px, *, tolerance_px=2.0, radius_records=(), pixels_per
     else:
         evidence={"method":"unmerged_source_seed","seed_entity_count":len(runs),
                   "merged_entity_count":len(runs),"source_points_moved":False}
+    # The ring's array seam is not a CAD feature. Raster stair steps can put
+    # the largest sampled turn in the middle of a physically straight side;
+    # the linear DP then cannot join its final and first runs. Test the whole
+    # wraparound source support at the SAME fit tolerance before retaining an
+    # extra primitive solely because of that arbitrary seam.
+    supported = [(pts[first:last+1], choice) for first, last, choice in runs]
+    seam_merges = 0
+    if optimize:
+        while len(supported) > 2:
+            joined = np.vstack([supported[-1][0], supported[0][0][1:]])
+            replacement = _line(joined, tolerance_px) or _arc(joined, tolerance_px)
+            if replacement is None:
+                break
+            supported = [(joined, replacement), *supported[1:-1]]
+            seam_merges += 1
+    evidence["cyclic_seam_merges"] = seam_merges
+    evidence["merged_entity_count"] = len(supported)
     entities=[];unbound=[]
-    for first,last,choice in runs:
+    for support,choice in supported:
         unbound.append(dict(choice))
-        choice = _bind_radius(choice,pts[first:last+1],pts,radius_records,pixels_per_mm,tolerance_px)
+        choice = _bind_radius(choice,support,pts,radius_records,pixels_per_mm,tolerance_px)
         choice["id"] = f"auto_{len(entities):03d}"
-        choice["source_support_vertex_count"] = last-first+1
+        choice["source_support_vertex_count"] = len(support)
         entities.append(choice)
     bindings={}
     for index,entity in enumerate(entities):

@@ -10,7 +10,8 @@ from pathlib import Path
 
 import httpx
 
-from .api_wire import extract_text, prepare_request, request_headers, endpoint_allowed
+from .api_wire import (extract_text, prepare_request, request_headers, endpoint_allowed,
+                       anthropic_thinking_mode_requested)
 from .planning_provider import _image_payload, evaluate_candidates
 
 
@@ -38,6 +39,7 @@ class FeedbackProvider:
             "evidence_tags": [], "operations": [], "rationale_code": "ambiguous_feedback", "confidence": "abstain",
             "current_candidate_id": current_candidate_id, "input_candidate_ids": local["bounded_candidate_ids"],
             "total_timeout_seconds": min(600.0, max(0.001, float(settings.api_timeout))),
+            "anthropic_thinking_mode_requested": anthropic_thinking_mode_requested(settings),
         }
 
         def finish():

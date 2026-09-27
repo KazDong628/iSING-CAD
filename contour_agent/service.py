@@ -752,6 +752,8 @@ class AgentService:
         names.update(topology="topology.json",topology_overlay="topology-overlay.png",
                      topology_candidates="topology-candidates.json",topology_plan="topology-plan.json",
                      topology_edit_proposals="topology-edit-proposals.json",
+                     topology_iterations="topology-iterations.json",
+                     reconstruction_feedback="reconstruction-feedback.json",
                      corrections="correction-evidence.json",constraint_bindings="constraint-bindings.json",
                      binding_candidates="binding-candidates.json",binding_overlay="binding-topology.png",
                      parametric_solution="parametric-solution.json",parameterization="parametric-stage.json",

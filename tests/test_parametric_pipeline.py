@@ -226,6 +226,72 @@ def supported_graph(image,baseline):
                                "proposal_stroke_support":{"edge_supported_fraction":.95,"p90_edge_distance_px":1.},"local_corrections":1}}
 
 
+@pytest.mark.parametrize("alternative_valid",[True,False])
+def test_source_gate_fallback_uses_ranked_valid_graph_then_exact_base(tmp_path,alternative_valid):
+    from contour_agent.parametric_pipeline import _source_valid_topology_choice
+    image,baseline=fixture_model(tmp_path)
+    base=supported_graph(image,baseline)
+    rejected=deepcopy(base)
+    rejected["source_evidence"]["proposal_stroke_support"]["edge_supported_fraction"]=.75
+    other=deepcopy(base if alternative_valid else rejected)
+    candidates=[{"id":"base","graph":base},{"id":"compact","graph":rejected},{"id":"other","graph":other}]
+    # The source publication gate is stricter than candidate ranking. A higher
+    # ranking never overrides that gate, including when all simplifications fail.
+    local={"evaluated":[{"candidate_id":"compact","score":.9,"admissible":True},
+                        {"candidate_id":"other","score":.8,"admissible":True},
+                        {"candidate_id":"base","score":.7,"admissible":True}]}
+    candidate,graph,receipt=_source_valid_topology_choice(image,baseline,candidates[1],rejected,candidates,local,base)
+    assert candidate["id"]==("other" if alternative_valid else "base")
+    assert graph is (other if alternative_valid else base)
+    assert receipt["status"]=="fallback_selected" and receipt["thresholds_unchanged"]
+    assert receipt["attempts"][0]["validation"]["reasons"]==["source_stroke_support_degraded"]
+    assert receipt["attempts"][-1]["validation"]["passed"]
+
+
+def test_source_gate_fallback_does_not_rescue_invalid_base_or_unranked_candidate(tmp_path):
+    from contour_agent.parametric_pipeline import _source_valid_topology_choice
+    image,baseline=fixture_model(tmp_path)
+    valid=supported_graph(image,baseline)
+    invalid=deepcopy(valid)
+    invalid["source_sha256"]="wrong"
+    candidates=[{"id":"base","graph":invalid},{"id":"unranked","graph":valid}]
+    local={"evaluated":[{"candidate_id":"unranked","score":1.,"admissible":False}]}
+    _,graph,receipt=_source_valid_topology_choice(image,baseline,candidates[0],invalid,candidates,local,invalid)
+    assert graph is invalid
+    assert receipt["status"]=="no_source_valid_topology"
+    assert all(row["validation"]["reasons"]==["source_hash_mismatch"] for row in receipt["attempts"])
+
+
+def test_source_gate_no_leader_edit_still_falls_back_to_exact_base(tmp_path):
+    from contour_agent.parametric_pipeline import _source_valid_topology_choice
+    image,baseline=fixture_model(tmp_path)
+    base=supported_graph(image,baseline)
+    edited=deepcopy(base)
+    edited["source_evidence"]["proposal_stroke_support"]["edge_supported_fraction"]=.75
+    alternate=deepcopy(base)
+    candidates=[{"id":"base","graph":base},{"id":"alternate","graph":alternate}]
+    local={"evaluated":[{"candidate_id":"alternate","score":1.,"admissible":True}]}
+    selected={"id":"online-edit","graph":edited}
+    candidate,graph,receipt=_source_valid_topology_choice(
+        image,baseline,selected,edited,candidates,local,base,allow_alternatives=False)
+    assert candidate is candidates[0] and graph is base
+    assert receipt["status"]=="fallback_selected"
+    assert [row["graph_source"] for row in receipt["attempts"]]==["selected_candidate","preserved_base_topology"]
+    assert [row["candidate_id"] for row in receipt["attempts"]]==["online-edit","base"]
+
+
+def test_source_gate_does_not_retry_identical_failed_base(tmp_path):
+    from contour_agent.parametric_pipeline import _source_valid_topology_choice
+    image,baseline=fixture_model(tmp_path)
+    base=supported_graph(image,baseline)
+    base["source_sha256"]="wrong"
+    candidate={"id":"base","graph":base}
+    _,_,receipt=_source_valid_topology_choice(
+        image,baseline,candidate,deepcopy(base),[candidate],{"evaluated":[]},base,allow_alternatives=False)
+    assert receipt["status"]=="no_source_valid_topology"
+    assert len(receipt["attempts"])==1
+
+
 @pytest.mark.parametrize("failure",["no_constraints","binding_failure","solver_failure"])
 def test_supported_topology_survives_missing_constraints_or_later_failure(tmp_path,monkeypatch,failure):
     image,baseline,output=prepared(tmp_path)

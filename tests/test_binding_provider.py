@@ -117,3 +117,65 @@ def test_source_detail_panels_are_bounded_and_audited(monkeypatch,image):
     assert all(len(p["input_image_sha256"])==64 and p["bytes"]<2_000_000 for p in receipt["detail_panels"])
     assert all(0<=p["source_box_px"][0]<p["source_box_px"][2]<=1600 for p in receipt["detail_panels"])
     assert sum(p["type"]=="image_url" for p in payloads[0]["messages"][1]["content"])==6
+
+
+def _large_inventory():
+    return {"units": "mm",
+            "records": [{"id": f"r{i:03d}", "text": "R40", "box": []} for i in range(30)],
+            "candidates": [{"id": f"c{i:03d}", "record_id": f"r{i//3:03d}",
+                            "kind": "radius", "entities": ["g000"], "nodes": [], "evidence": {}}
+                           for i in range(90)],
+            "relations": [{"id": f"rel{i:03d}", "type": "horizontal", "entities": ["g000"], "nodes": []}
+                          for i in range(30)]}
+
+
+def _wire_response(wire_api, selection):
+    content = json.dumps(selection)
+    if wire_api == "responses":
+        return httpx.Response(200, json={"status": "completed", "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": content}]}]})
+    return response(content)
+
+
+@pytest.mark.parametrize("wire_api,limits", [("responses", (16, 32, 16)), ("chat_completions", (24, 48, 24))])
+def test_receipt_ids_equal_actual_bounded_packet(monkeypatch, image, wire_api, limits):
+    packets = []
+
+    def handler(request):
+        wire = json.loads(request.content)
+        parts = wire["input"][0]["content"] if wire_api == "responses" else wire["messages"][1]["content"]
+        packet = json.loads(parts[0]["text"])
+        packets.append(packet)
+        return _wire_response(wire_api, {"bindings": [{"record_id": "r000", "candidate_id": "c000",
+                                                      "observed_text": "R40"}],
+                                         "relations": [{"relation_id": "rel000"}]})
+
+    patch(monkeypatch, handler)
+    result = BindingProvider(Settings(api_key="test", wire_api=wire_api)).select(image, image, _large_inventory())
+    assert len(packets) == result["network_requests"] == 1
+    assert result["schema_success"] and result["semantic_success"] and result["selection_payload_verified"]
+    for name, field, limit in zip(("records", "candidates", "relations"),
+                                  ("input_record_ids", "input_candidate_ids", "input_relation_ids"), limits):
+        assert result[field] == [row["id"] for row in packets[0][name]]
+        assert len(result[field]) == limit
+
+
+@pytest.mark.parametrize("selection,error", [
+    ({"bindings": [{"record_id": "r016", "candidate_id": "c048"}], "relations": []}, "record_not_sent"),
+    ({"bindings": [{"record_id": "r013", "candidate_id": "c039"}], "relations": []}, "candidate_not_sent"),
+    ({"bindings": [{"record_id": "r001", "candidate_id": "c000"}], "relations": []}, "record_candidate_mismatch"),
+    ({"bindings": [{"record_id": "r000", "candidate_id": "c000"},
+                   {"record_id": "r000", "candidate_id": "c001"}], "relations": []}, "duplicate_record_selection"),
+    ({"bindings": [], "relations": [{"relation_id": "rel016"}]}, "relation_not_sent"),
+    ({"bindings": [], "relations": [{"relation_id": "rel000"}, {"relation_id": "rel000"}]}, "duplicate_relation_selection"),
+])
+def test_semantic_validation_rejects_unsent_or_inconsistent_ids(monkeypatch, image, selection, error):
+    calls = []
+    patch(monkeypatch, lambda request: (calls.append(request) or _wire_response("responses", selection)))
+    result = BindingProvider(Settings(api_key="test", wire_api="responses")).select(image, image, _large_inventory())
+    assert len(calls) == result["network_requests"] == 1
+    assert result["http_success"] and result["error_code"] == error
+    assert not result["schema_success"] and not result["semantic_success"]
+    assert not result["selection_payload_verified"]
+    assert result["bindings"] == [] and result["relations"] == []
+    assert len(result["input_record_ids"]) == 16 and len(result["input_candidate_ids"]) == 32

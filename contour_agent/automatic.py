@@ -27,8 +27,10 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
                     segmentation_mask=None, segmentation_review=None):
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     emit = progress or (lambda stage,message: None)
+    oracle_mask = bool(segmentation_mask and (segmentation_review or {}).get("status") == "oracle_mask")
     if segmentation_mask:
-        emit("segment", "使用人工确认的材料掩膜继续构建；保留模型原始分割用于审计。")
+        emit("segment", "使用GT派生的材料掩膜开展条件性重建实验；不把它计为模型分割或人工复核。" if oracle_mask
+             else "使用人工确认的材料掩膜继续构建；保留模型原始分割用于审计。")
         from .mask_geometry import extract_mask_profile
         with Image.open(image_path) as source_image:
             original_size = source_image.size
@@ -41,9 +43,12 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
             model = previous.get("model") if isinstance(previous, dict) else {}
         except (OSError, ValueError, TypeError):
             model = {}
-        extraction.update(model=model or {"label_status": "unknown"}, learned_segmentation=True,
-                          reviewed_segmentation=True, review=segmentation_review or {})
-        extraction["issues"].append("材料掩膜已经人工检查；该确认仅针对像素分割，不证明尺寸或参考几何精度。")
+        extraction.update(model={"label_status": "registered_dxf_gt_oracle_input"} if oracle_mask else model or {"label_status": "unknown"},
+                          learned_segmentation=not oracle_mask, reviewed_segmentation=not oracle_mask,
+                          oracle_mask_conditioned=oracle_mask, review=segmentation_review or {})
+        extraction["issues"].append(
+            "输入为GT派生的二值掩膜；本实验只考察掩膜条件下的CAD重建，不能作为盲测、模型分割精度或独立参考精度证据。"
+            if oracle_mask else "材料掩膜已经人工检查；该确认仅针对像素分割，不证明尺寸或参考几何精度。")
         _write_json(out / "reviewed-evidence/segmentation.json", extraction)
     elif segmentation_checkpoint:
         emit("segment", "使用微调U-Net从原图预测零件材料区域，记录当前模型的训练标签来源。")
@@ -154,11 +159,14 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
                 "dimensions_verified":False,"reference_verified":False,"engineering_certified":False,
                 "radius_bindings":[e["radius_binding"] for e in entities if e.get("radius_binding")],"curve_fit":curve_fit,"issues":issues,
                 "meaning":"Connected CAD artifact validity only; dimensional constraints and reference accuracy are separate."}
-    learned_algorithm = ("human-reviewed-unet-mask-v1" if segmentation_mask else
+    learned_algorithm = ("oracle-gt-mask-conditioned-v1" if oracle_mask else "human-reviewed-unet-mask-v1" if segmentation_mask else
                          ("unet-resnet18-dxf-supervised" if extraction.get("model",{}).get("label_status")=="registered_dxf_gt_experimental" else "unet-resnet18-weak-v1"))
     result={"mode":"autonomous_image","algorithm_version":learned_algorithm if (segmentation_checkpoint or segmentation_mask) else "hatch-dimension-vector-v3","automatic_completion":geometry_valid and readback_ok and complete_material,
             "complete_material_exterior":complete_material,"completion_class":"automatic_source_draft" if complete_material else "incomplete_material_exterior_draft",
-            "manual_intervention":bool(segmentation_review),"template_used":False,"ground_truth_used":False,"extraction":extraction,"scale":scale,
+            "manual_intervention":bool(segmentation_review) and not oracle_mask,"template_used":False,
+            "ground_truth_used":oracle_mask,"oracle_mask_conditioned":oracle_mask,
+            "ground_truth_use":"raster_mask_input_only" if oracle_mask else "none",
+            "extraction":extraction,"scale":scale,
             "vectorization_algorithm":"source-supported-primitive-merge-dp-v2",
             "entities":entities,"validation":validation,"curve_fit":curve_fit,"bounds":{"min_x":x0,"min_y":y0,"max_x":x1,"max_y":y1},
             "coordinate_system":{"units":"mm" if scaled else "pixel","x":"image right","y":"image up",

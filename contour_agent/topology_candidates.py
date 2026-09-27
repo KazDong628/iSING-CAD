@@ -19,7 +19,8 @@ import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .constraint_binding import _arrowhead_evidence, _leaders
+from .constraint_binding import (_arrowhead_evidence, _label_ray_entry,
+                                 _leader_contour_visibility, _leaders)
 from .ocr import canonical_records
 from .topology import _StrokeEvidence, _primitive_distance, _relations
 from .vectorize import _closed_ring, _sample_entities, assess_fit_quality, fit_polyline
@@ -140,8 +141,24 @@ def _base_source_entities(graph, design_to_source, orientation_det):
             center = design_to_source(np.asarray([entity["center"]], float))[0]
             item.update(center=center.tolist(), radius=float(np.linalg.norm(start-center)),
                         clockwise=not bool(entity.get("clockwise")) if reflected else bool(entity.get("clockwise")))
+        # Display gNNN indices are scoped to one graph revision. Identity and
+        # lineage survive cycle rotation and replacement of neighboring objects.
+        for key in ("radius_binding", "radius_annotation_evidence", "radius_binding_status", "radius_constructed",
+                    "ancestor_stable_ids"):
+            if key in entity:
+                item[key] = copy.deepcopy(entity[key])
+        item["stable_id"] = entity.get("stable_id") or _source_entity_identity(item, graph.get("source_sha256"))
+        item["parent_entity_ids"] = [entity["id"]]
+        item["parent_stable_ids"] = [item["stable_id"]]
         result.append(item)
     return result
+
+
+def _source_entity_identity(entity, source_sha256):
+    geometry = {key: entity[key] for key in ("type", "start", "end", "center", "radius", "clockwise")
+                if key in entity}
+    payload = json.dumps([source_sha256, geometry], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return "e-" + hashlib.sha256(payload.encode("utf8")).hexdigest()[:20]
 
 
 def _point_box_gap(point, box):
@@ -169,6 +186,8 @@ def _annotation_inventory(gray, records, ring, grid):
             inventory.append(item)
             continue
         size = max(12., float(np.linalg.norm(box.max(axis=0)-box.min(axis=0))))
+        low, high = box.min(axis=0), box.max(axis=0)
+        band = max(4., 2*grid)
         options = []
         for line_index, segment in enumerate(lines):
             for label_end, target_end in (segment, segment[::-1]):
@@ -180,18 +199,50 @@ def _annotation_inventory(gray, records, ring, grid):
                 length = float(np.linalg.norm(direction))
                 if length < max(8., grid):
                     continue
-                arrow = _arrowhead_evidence(gray, target_end, direction/length, size, max(4., 2*grid))
-                options.append((target_gap+.2*label_gap+(0. if arrow else grid), {
+                unit = direction/length
+                ray_gap = _label_ray_entry(label_end,-unit,low-2.,high+2.,max(18.,.75*size))
+                reasons = []
+                arrow = None
+                visibility = None
+                arrow_gap = None
+                if ray_gap is None:
+                    reasons.append("label_ray_misses_source_box")
+                else:
+                    arrow = _arrowhead_evidence(gray,target_end,unit,size,band,ring)
+                    if arrow is None:
+                        reasons.append("source_arrowhead_not_verified")
+                    else:
+                        arrow_gap, arrow_index = tree.query(np.asarray(arrow["tip_px"],float))
+                        if arrow_gap > max(10.,band*1.7):
+                            reasons.append("arrow_tip_misses_material_boundary")
+                        visibility = _leader_contour_visibility(label_end-unit*ray_gap,
+                                                                arrow["tip_px"],[ring],band)
+                        if not visibility["verified"]:
+                            reasons.append("earlier_source_contour_intersection")
+                verified = bool(arrow and not reasons)
+                if verified:
+                    contour_index = int(arrow_index)
+                # An observed stroke is retained for review even when it cannot
+                # establish a directed annotation target. Prefer independently
+                # supported arrows over a closer undirected hatch hypothesis.
+                options.append(((not verified,target_gap+.2*label_gap), {
                     "method": "source_hough_segment_between_ocr_box_and_material_boundary",
                     "leader_id": f"line{line_index:03d}", "segment_px": segment.tolist(),
                     "label_endpoint_gap_px": float(label_gap), "boundary_endpoint_gap_px": float(target_gap),
                     "target_source_px": ring[int(contour_index)].tolist(),
-                    "arrowhead_verified": bool(arrow), "arrowhead": arrow,
-                    "status": "directed_arrow_candidate" if arrow else "undirected_leader_candidate",
+                    "label_ray_intersection_gap_px": ray_gap,
+                    "arrow_tip_to_boundary_gap_px": None if arrow_gap is None else float(arrow_gap),
+                    "contour_visibility": visibility,
+                    "directed_verification_issues": reasons,
+                    "arrowhead_verified": verified, "arrowhead": arrow if verified else None,
+                    "unverified_arrowhead_hypothesis": arrow if not verified else None,
+                    "status": "directed_arrow_candidate" if verified else "undirected_leader_candidate",
                 }))
         if options:
             _, best = min(options, key=lambda value: value[0])
             item.update(leader_status=best["status"], leader=best)
+            item["leader_hypotheses_requiring_review"] = [option for _,option in options
+                if option["directed_verification_issues"]][:6]
         inventory.append(item)
     return inventory, {"detected_source_line_segments": len(lines), "record_budget": 250,
                        "records_considered": len(inventory),
@@ -215,12 +266,27 @@ def _entity_annotation_support(entities, inventory, grid):
         gap = distances[index]
         type_compatible = row.get("kind") != "radius" or entity["type"] == "ARC"
         source_supported = gap <= max(12., 2.25*grid)
+        # A directed radius leader that ends at a shared joint can be closer
+        # to a neighboring long primitive than to the small intended fillet.
+        # Keep only immediately adjacent, independently close alternatives;
+        # these are hypotheses for the editor, not accepted bindings.
+        adjacent = []
+        if (row.get("kind") == "radius" and source_supported and
+                leader.get("arrowhead_verified") and len(entities) > 2):
+            for neighbor_index in ((index - 1) % len(entities), (index + 1) % len(entities)):
+                neighbor_gap = distances[neighbor_index]
+                if (neighbor_gap <= 2.25 * grid and
+                        neighbor_gap - gap <= 2.25 * grid):
+                    adjacent.append({"entity_id": f"g{neighbor_index:03d}",
+                                     "entity_type": entities[neighbor_index]["type"],
+                                     "target_gap_px": neighbor_gap})
         supported += int(source_supported)
         compatible += int(source_supported and type_compatible)
         result.append({**base, "status": "candidate_supported" if source_supported else "target_missed",
                        "candidate_entity_id": f"g{index:03d}", "candidate_entity_type": entity["type"],
                        "target_gap_px": gap, "type_compatible": bool(type_compatible),
                        "arrowhead_verified": bool(leader.get("arrowhead_verified")),
+                       "adjacent_target_hypotheses": adjacent,
                        "source_evidence": leader})
     target_count = sum(bool(row.get("leader")) for row in inventory)
     return result, {"leader_target_count": target_count, "targets_reached": supported,
@@ -245,6 +311,10 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
                   "start": start.tolist(), "end": end.tolist(),
                   "parameter_source": "bounded_source_topology_candidate", "dimension_bound": False,
                   "source_fit_error_px": float(source_entity.get("fit_error_px", 0.))}
+        entity["stable_id"] = source_entity.get("stable_id") or _source_entity_identity(source_entity, source_sha256)
+        for key in ("parent_entity_ids", "parent_stable_ids", "ancestor_stable_ids", "radius_binding_status"):
+            if key in source_entity:
+                entity[key] = copy.deepcopy(source_entity[key])
         if source_entity["type"] == "ARC":
             center = source_to_design(np.asarray([source_entity["center"]], float))[0]
             # Affine transforms in this project are rigid scale/reflection maps.
@@ -255,7 +325,11 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
                 entity.update(parameter_source="multimodal_annotation_guided_arc_refit",
                               radius_annotation_evidence=copy.deepcopy(source_entity["radius_annotation_evidence"]))
             if source_entity.get("radius_binding"):
-                entity.update(parameter_source="multimodal_annotation_guided_arc_refit", dimension_bound=True,
+                # An exact-radius construction proves the numerical geometry,
+                # not that the OCR label was independently associated correctly.
+                # Fresh source binding and the solver certify that separately.
+                entity.update(parameter_source="multimodal_annotation_guided_arc_refit", dimension_bound=False,
+                              radius_constructed=True, radius_binding_status="constructed_unverified",
                               radius_binding=copy.deepcopy(source_entity["radius_binding"]))
         entities.append(entity)
     base_evidence = base_graph.get("source_evidence") or {}
@@ -279,6 +353,15 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
                             "ordered_entity_cycle": True, "dimensions_solved": False,
                             "engineering_verified": False},
              "scope": "A source-only LINE/ARC topology hypothesis for planner comparison and later dimension solving."}
+    graph["entity_identity"] = {
+        "schema_version": "topology-entity-lineage-v1",
+        "display_id_scope": candidate_id,
+        "parent_candidate_id": base_graph.get("candidate_id"),
+        "parent_to_current": {
+            old: [entity["id"] for entity in entities if old in entity.get("parent_entity_ids", [])]
+            for old in sorted({old for entity in entities for old in entity.get("parent_entity_ids", [])})
+        },
+    }
     return graph
 
 

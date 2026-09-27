@@ -17,7 +17,8 @@ import re
 import time
 
 import httpx
-from .api_wire import prepare_request, extract_text, request_headers, endpoint_allowed
+from .api_wire import (prepare_request, extract_text, request_headers, endpoint_allowed,
+                       output_token_budget, numeric_token_usage, anthropic_thinking_mode_requested)
 
 from .vision_provider import _InspectionError, _image_payload, _single_json_object
 
@@ -310,6 +311,7 @@ class PlanningProvider:
             "local_evaluation_sha256": hashlib.sha256(local_json.encode("utf-8")).hexdigest(),
             "local_recommended_candidate_id": local["recommended_candidate_id"],
             "api_selection_admissible": False,
+            "anthropic_thinking_mode_requested": anthropic_thinking_mode_requested(settings),
         }
 
         def finish():
@@ -378,10 +380,11 @@ class PlanningProvider:
         budget = min(600.0, max(0.001, float(settings.api_timeout)))
         receipt["total_timeout_seconds"] = budget
         payload = {"model": settings.model, "temperature": 0,
-                   "max_tokens": 2400 if settings.wire_api == "anthropic_messages" else 900,
+                   "max_tokens": output_token_budget(settings, "planning", 900),
                    "messages": [{"role": "system", "content": PROMPT},
                                 {"role": "user", "content": [{"type": "text", "text": summary_text}, *image_parts]}]}
         endpoint,wire_payload=prepare_request(settings,payload)
+        receipt["request_max_output_tokens"] = wire_payload.get("max_output_tokens", wire_payload.get("max_tokens"))
 
         async def request():
             async with httpx.AsyncClient(timeout=httpx.Timeout(budget, connect=min(10.0, budget)),
@@ -394,10 +397,11 @@ class PlanningProvider:
                     receipt["error_code"] = {401: "authentication", 403: "permission", 404: "model_or_endpoint",
                                              429: "rate_limit"}.get(response.status_code, "http_error")
                     return
-                content, text_source = response.text, "http_body"
+                content, text_source = "", "unavailable"
                 try:
-                    message,text_source,reason,_=extract_text(settings,response)
+                    message,text_source,reason,usage=extract_text(settings,response)
                     content=message
+                    receipt["usage"] = numeric_token_usage(usage)
                     receipt["finish_reason"] = reason if reason in {"stop", "length", "content_filter", "tool_calls", None} else "other"
                     if reason not in (None, "stop"):
                         raise _InspectionError("truncated_output")

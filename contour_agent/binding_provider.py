@@ -12,7 +12,8 @@ import time
 from PIL import Image, ImageDraw
 
 import httpx
-from .api_wire import prepare_request, extract_text, request_headers, endpoint_allowed
+from .api_wire import (prepare_request, extract_text, request_headers, endpoint_allowed,
+                       output_token_budget, numeric_token_usage, anthropic_thinking_mode_requested)
 
 from .vision_provider import _image_payload, _InspectionError, _single_json_object
 
@@ -68,6 +69,30 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
     }
 
 
+def _validate_selection_payload(selection, payload):
+    """Check returned IDs against the actual bounded packet, not the full graph."""
+    record_ids = {row["id"] for row in payload["records"]}
+    candidates = {row["id"]: row["record_id"] for row in payload["candidates"]}
+    relation_ids = {row["id"] for row in payload["relations"]}
+    seen_records, seen_relations = set(), set()
+    for row in selection["bindings"]:
+        if row["record_id"] not in record_ids:
+            raise _InspectionError("record_not_sent")
+        if row["candidate_id"] not in candidates:
+            raise _InspectionError("candidate_not_sent")
+        if candidates[row["candidate_id"]] != row["record_id"]:
+            raise _InspectionError("record_candidate_mismatch")
+        if row["record_id"] in seen_records:
+            raise _InspectionError("duplicate_record_selection")
+        seen_records.add(row["record_id"])
+    for row in selection["relations"]:
+        if row["relation_id"] not in relation_ids:
+            raise _InspectionError("relation_not_sent")
+        if row["relation_id"] in seen_relations:
+            raise _InspectionError("duplicate_relation_selection")
+        seen_relations.add(row["relation_id"])
+
+
 def _detail_panels(image_path, topology_path, inventory, *, limit=4):
     """Up to four source-only paired closeups; no external files or CAD input."""
     rows=[r for r in inventory.get("records",[]) if isinstance(r.get("box"),list) and len(r["box"])>=2]
@@ -111,9 +136,11 @@ class BindingProvider:
         settings, started = self.settings, time.monotonic()
         receipt = {"status": "failed", "protocol": settings.wire_api+"-source-constraint-binding-v2", "model": settings.model,
                    "network_requests": 0, "http_success": False, "schema_success": False,
+                   "semantic_success": False, "selection_payload_verified": False,
                    "image_sent": False, "ground_truth_sent": False, "dimensions_verified": False,
                    "bindings": [], "relations": [], "tls_verification": True,
-                   "trust_environment_proxy": settings.trust_env}
+                   "trust_environment_proxy": settings.trust_env,
+                   "anthropic_thinking_mode_requested": anthropic_thinking_mode_requested(settings)}
 
         def finish():
             receipt["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -163,7 +190,7 @@ class BindingProvider:
             receipt["error_code"] = "invalid_inventory"
             return finish()
         payload = {"model": settings.model, "temperature": 0,
-                   "max_tokens": 1200 if settings.wire_api=="responses" else 2200,
+                   "max_tokens": output_token_budget(settings, "binding", 1200 if settings.wire_api=="responses" else 2200),
                    "messages": [{"role": "system", "content": PROMPT}, {"role": "user", "content": [
                        {"type": "text", "text": inventory_text},
                        {"type": "image_url", "image_url": {"url": source}},
@@ -171,6 +198,7 @@ class BindingProvider:
                        *details,
                    ]}]}
         endpoint,wire_payload=prepare_request(settings,payload)
+        receipt["request_max_output_tokens"] = wire_payload.get("max_output_tokens", wire_payload.get("max_tokens"))
 
         async def request():
             async with httpx.AsyncClient(timeout=httpx.Timeout(budget, connect=min(10., budget)),
@@ -181,14 +209,16 @@ class BindingProvider:
                 if response.status_code != 200:
                     receipt["error_code"] = {401: "authentication", 403: "permission", 404: "model_or_endpoint", 429: "rate_limit"}.get(response.status_code, "http_error")
                     return
-                content, text_source = response.text, "http_body"
+                content, text_source = "", "unavailable"
                 try:
-                    message,text_source,reason,_=extract_text(settings,response)
+                    message,text_source,reason,usage=extract_text(settings,response)
                     content=message
+                    receipt["usage"] = numeric_token_usage(usage)
                     receipt["finish_reason"] = reason if reason in {"stop", "length", "content_filter", "tool_calls", None} else "other"
                     if reason not in (None, "stop"):
                         raise _InspectionError("truncated_output")
                     selection = validate_selection(message)
+                    _validate_selection_payload(selection, inventory_payload)
                 except _InspectionError:
                     receipt["response_excerpt"] = content
                     raise
@@ -198,7 +228,8 @@ class BindingProvider:
                 finally:
                     receipt.update(response_text_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
                                    response_text_chars=len(content), response_text_source=text_source)
-                receipt.update(selection, status="succeeded", schema_success=True)
+                receipt.update(selection, status="succeeded", schema_success=True,
+                               semantic_success=True, selection_payload_verified=True)
         try:
             await asyncio.wait_for(request(), timeout=max(.001, budget - (time.monotonic() - started)))
         except (asyncio.TimeoutError, httpx.TimeoutException):

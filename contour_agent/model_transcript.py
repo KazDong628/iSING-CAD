@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
+import re
 
 
 _STAGES = (
@@ -48,6 +50,7 @@ def _transport(provider):
         "network_requests": provider.get("network_requests") if isinstance(provider.get("network_requests"), int) else None,
         "model": provider.get("model") if isinstance(provider.get("model"), str) else None,
         "protocol": provider.get("protocol") if isinstance(provider.get("protocol"), str) else None,
+        "total_timeout_seconds": provider.get("total_timeout_seconds") if isinstance(provider.get("total_timeout_seconds"), (int, float)) else None,
     }
 
 
@@ -120,6 +123,103 @@ def _stage(stage_id, label, document, provider):
     }
 
 
+def _identifier(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,159}", value) else None
+
+
+def _scalars(value, keys):
+    """Allow-listed audit fields do not inherit arbitrary nested provider content."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in keys:
+        item = value.get(key)
+        if item is None or isinstance(item, bool):
+            result[key] = item
+        elif isinstance(item, (int, float)) and math.isfinite(item):
+            result[key] = item
+        elif _identifier(item):
+            result[key] = item
+    return result
+
+
+def _public_feedback(feedback):
+    if not isinstance(feedback, dict):
+        return {}
+    result = _scalars(feedback, ("candidate_id", "issue_count", "constraint_count", "structural_constraint_count",
+                                  "solver_status", "solver_accepted", "remaining_shape_dof", "unbound_dimensions"))
+    result["issues"] = []
+    issues = feedback.get("issues")
+    for issue in issues[:64] if isinstance(issues, list) else []:
+        if not isinstance(issue, dict) or not _identifier(issue.get("code")):
+            continue
+        row = _scalars(issue, ("code", "entity_id", "record_id", "stable_id", "kind", "relation_id",
+                              "binding_verified", "arrowhead_verified"))
+        if isinstance(issue.get("entity_ids"), list):
+            row["entity_ids"] = [item for item in issue["entity_ids"][:8] if _identifier(item)]
+        result["issues"].append(row)
+    result["dimensions_verified"] = False
+    result["reference_verified"] = False
+    return result
+
+
+def _public_iterations(document):
+    if not isinstance(document, dict) or not isinstance(document.get("rounds"), list):
+        return None
+    result = _scalars(document, ("status", "max_rounds", "stop_reason", "final_candidate_id"))
+    result["rounds"] = []
+    for item in document["rounds"][:3]:
+        if not isinstance(item, dict):
+            continue
+        row = _scalars(item, ("round", "base_candidate_id", "final_candidate_id"))
+        gate = item.get("acceptance_gate") or {}
+        row["acceptance_gate"] = _scalars(gate, ("accepted", "reason", "selection_source",
+                                                 "source_validated_feature_restoration"))
+        row["feedback"] = _public_feedback(item.get("feedback"))
+        row["operations"] = []
+        execution = item.get("execution") or {}
+        operations = execution.get("operations") if isinstance(execution, dict) else []
+        for operation in operations[:6] if isinstance(operations, list) else []:
+            if not isinstance(operation, dict):
+                continue
+            public = _scalars(operation, ("operation_index", "status", "reason", "candidate_id"))
+            proposal = operation.get("operation") or {}
+            if isinstance(proposal, dict):
+                public.update(_scalars(proposal, ("action", "record_id")))
+                if isinstance(proposal.get("entity_ids"), list):
+                    public["entity_ids"] = [item for item in proposal["entity_ids"][:8] if _identifier(item)]
+            detail = operation.get("execution") or {}
+            public.update(_scalars(detail, ("replacement_type", "replacement_count", "net_entity_reduction",
+                                            "radius_binding_applied", "radius_binding_status",
+                                            "feature_restoration_validated")))
+            row["operations"].append(public)
+        result["rounds"].append(row)
+    result["final_feedback"] = _public_feedback(document.get("final_feedback"))
+    result["reference_verified"] = False
+    return result
+
+
+def _public_parameterization(directory):
+    solution = _read_object(directory, "parametric-solution.json")
+    bindings = _read_object(directory, "constraint-bindings.json")
+    if not solution and not bindings:
+        return None
+    result = _scalars(solution, ("status", "accepted", "underconstrained"))
+    result["counts"] = _scalars((bindings or {}).get("counts"),
+                                ("recognized_dimensions", "bound_source_records", "unbound_dimensions", "constraints",
+                                 "structural_local_accepted", "structural_api_accepted"))
+    result["diagnostics"] = _scalars((solution or {}).get("diagnostics"),
+                                     ("constraint_rank", "remaining_shape_dof", "independent_dimension_record_count"))
+    result["constraints"] = []
+    for constraint in (solution or {}).get("constraints", [])[:128]:
+        if isinstance(constraint, dict):
+            result["constraints"].append(_scalars(constraint, ("id", "kind", "record_id", "passed",
+                                                               "value", "actual", "absolute_residual", "tolerance")))
+    result["feedback"] = _public_feedback(_read_object(directory, "reconstruction-feedback.json"))
+    result["reference_verified"] = False
+    return result
+
+
 def build_model_transcript(job: dict, runtime_root: Path):
     """Return only model-returned allow-listed fields, never prompts, secrets or CoT."""
     directory = None
@@ -133,6 +233,7 @@ def build_model_transcript(job: dict, runtime_root: Path):
         except OSError:
             pass
     stages = []
+    iterations = _read_object(directory, "topology-iterations.json")
     for stage_id, label, filename in _STAGES:
         document = _read_object(directory, filename)
         provider = document.get("provider") if isinstance(document, dict) else None
@@ -144,17 +245,27 @@ def build_model_transcript(job: dict, runtime_root: Path):
             stages.append(_stage(stage_id, label, document, provider))
         if stage_id == "planning":
             editing = _read_object(directory, "topology-edit-proposals.json")
-            if not isinstance(editing, dict):
-                continue
-            for edit_id, edit_label, key in (("topology_edit", "局部拓扑编辑", "editor"),
-                                             ("topology_evaluate", "拓扑编辑评估", "evaluator")):
-                edit_provider = editing.get(key)
-                if not isinstance(edit_provider, dict):
+            rounds = iterations.get("rounds") if isinstance(iterations, dict) else None
+            if not isinstance(rounds, list) and isinstance(editing, dict):
+                rounds = editing.get("rounds")
+            per_round = isinstance(rounds, list)
+            for record in rounds[:3] if per_round else [editing]:
+                if not isinstance(record, dict):
                     continue
-                if (not edit_provider.get("network_requests") and
-                        edit_provider.get("status") in {"disabled", "skipped", "not_configured"}):
-                    continue
-                stages.append(_stage(edit_id, edit_label, editing, edit_provider))
+                for edit_id, edit_label, key in (("topology_edit", "局部拓扑编辑", "editor"),
+                                                 ("topology_evaluate", "拓扑编辑评估", "evaluator")):
+                    edit_provider = record.get(key)
+                    if not isinstance(edit_provider, dict):
+                        continue
+                    if (not edit_provider.get("network_requests") and
+                            edit_provider.get("status") in {"disabled", "skipped", "not_configured"}):
+                        continue
+                    round_number = record.get("round") if per_round else None
+                    label = f"第 {round_number} 轮 · {edit_label}" if type(round_number) is int else edit_label
+                    stage = _stage(edit_id, label, record, edit_provider)
+                    if type(round_number) is int:
+                        stage["round"] = round_number
+                    stages.append(stage)
     provider = job.get("provider")
     if job.get("mode") != "autonomous_revision" and isinstance(provider, dict) and (
         provider.get("network_requests") or provider.get("status") not in {"disabled", "skipped", "not_configured", "pending"}
@@ -177,4 +288,6 @@ def build_model_transcript(job: dict, runtime_root: Path):
         "private_chain_of_thought_exposed": False,
         "notice": "显示模型返回后通过结构校验的字段；不保存或展示私有思维链。",
         "stages": stages,
+        "iterations": _public_iterations(iterations),
+        "parameterization": _public_parameterization(directory),
     }

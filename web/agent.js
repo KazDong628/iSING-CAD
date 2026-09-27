@@ -226,7 +226,7 @@ function answerSummary(stage){
 }
 function renderModelTranscript(host,value){
   host.replaceChildren();host.classList.remove("loading");const stages=value?.stages||[];
-  if(!stages.length){host.remove();return;}
+  if(!stages.length&&!value?.iterations&&!value?.parameterization){host.remove();return;}
   const heading=node("div","transcript-heading");heading.append(node("span","","MODEL RECEIPTS"),node("b","",`${stages.length} 个在线阶段`));host.append(heading);
   const table=node("div","receipt-table");for(const text of ["阶段","传输","结构","耗时"])table.append(node("b","",text));
   for(const stage of stages){const transport=stage.transport||{};table.append(node("span","",stage.label),node("code","",transport.http_status?`HTTP ${transport.http_status}`:transport.http_success===false?"HTTP 失败":"未记录"),node("code","",transport.schema_success?"结构有效":"结构无效"),node("code","",Number.isFinite(transport.elapsed_seconds)?`${transport.elapsed_seconds.toFixed(1)}s`:"—"));}host.append(table);
@@ -236,7 +236,44 @@ function renderModelTranscript(host,value){
     head.append(node("b","",stage.label),node("span","",stage.transport?.model||stage.transport?.protocol||"ONLINE MODEL"));card.append(head,node("p","receipt-summary",answerSummary(stage)));
     const details=node("details","receipt-answer");details.open=true;details.append(node("summary","",stage.answer_source==="validated_structured_fields"?"模型回答 · 已校验字段":"模型回答 · 脱敏失败回执"),node("pre","",JSON.stringify(stage.answer,null,2)));card.append(details);cards.append(card);
   }
-  host.append(cards,node("p","transcript-notice",value.notice||"仅显示可审计的模型输出。"));
+  host.append(cards);
+  if(value.iterations)host.append(renderIterationAudit(value.iterations));
+  if(value.parameterization){
+    const audit=value.parameterization,counts=audit.counts||{},diagnostics=audit.diagnostics||{},box=node("div","parameter-audit");
+    box.append(node("b","","参数化求解 · 独立检查"),node("p","",`${audit.accepted?"已接受约束子集的解":"尚未接受参数解"} · ${audit.constraints?.length||0} 项已求解约束 · ${counts.bound_source_records??"—"} 条已绑定标注 / ${counts.recognized_dimensions??"—"} 条识别标注`),
+      node("p","",`未绑定标注 ${counts.unbound_dimensions??"—"} 条 · 剩余形状自由度 ${diagnostics.remaining_shape_dof??"—"}。几何可导出不代表尺寸完整或已通过 GT 验证。`));
+    const issues=audit.feedback?.issues||[];
+    if(issues.length){const list=node("ul","audit-issues");for(const issue of issues.slice(0,12))list.append(node("li","",issueText(issue)));box.append(list);}
+    const details=node("details","receipt-answer");details.append(node("summary","","查看约束残差与未解决项"),node("pre","",JSON.stringify(audit,null,2)));box.append(details);host.append(box);
+  }
+  host.append(node("p","transcript-notice",value.notice||"仅显示可审计的模型输出。"));
+}
+const editActionLabels={merge_chain_as_line:"合并为直线",merge_chain_as_arc:"合并为圆弧",merge_chain_best_fit:"合并冗余图元",refit_chain_as_annotated_arc:"按标注拟合圆弧",refit_entity_as_line:"将单个图元修正为直线",split_chain_at_source_features:"按原图特征拆分",insert_annotated_fillet:"插入标注圆角",apply_nonoverlapping_edits:"组合独立编辑"};
+const auditReasonLabels={radius_target_is_line:"半径标注指向了直线",radius_value_unresolved:"标注半径尚未满足",constraint_residual_failed:"约束残差超限",conflicting_constraints:"尺寸约束冲突",conflicting_relations:"几何关系冲突",no_accepted_improvement:"没有通过检查的进一步改善，保留最后有效结果",round_budget_exhausted:"已达到本轮迭代预算",repeated_geometry:"检测到重复几何，已停止循环",evaluator_preserved_base:"评估保留原候选",evaluator_did_not_select_an_edit:"没有选中可采用的编辑",edited_candidate_failed_local_improvement_gate:"编辑未通过独立接受检查",unresolved_fixed_radius_fit_failed:"固定半径未能满足，仍待解决"};
+function issueText(issue){return `${issue.record_id||issue.entity_id||issue.entity_ids?.join(" → ")||"当前轮廓"} · ${auditReasonLabels[issue.code]||issue.code||"待检查"}${issue.record_id&&issue.entity_id?` (${issue.entity_id})`:""}`;}
+function renderIterationAudit(iterations){
+  const box=node("section","iteration-audit"),rounds=iterations.rounds||[];
+  box.append(node("b","audit-title",`局部拓扑迭代 · ${rounds.length}/${iterations.max_rounds||3} 轮`));
+  for(const round of rounds){
+    const accepted=round.acceptance_gate?.accepted===true,details=node("details",`iteration-round ${accepted?"accepted":"preserved"}`);details.open=true;
+    details.append(node("summary","",`第 ${round.round} 轮 · ${accepted?"采用编辑":"保留原候选"} · ${round.base_candidate_id||"—"} → ${round.final_candidate_id||"—"}`));
+    const operations=round.operations||[];
+    if(operations.length){const list=node("ul","audit-operations");for(const operation of operations){
+      const item=node("li"),title=`${editActionLabels[operation.action]||operation.action||"局部编辑"} · ${operation.entity_ids?.join(" → ")||"独立操作组合"}${operation.record_id?` · ${operation.record_id}`:""}`;
+      item.append(node("span","",title));
+      const candidatePassed=operation.status==="accepted_as_candidate";
+      item.append(node("small",candidatePassed?"candidate-pass":"candidate-reject",candidatePassed?`候选通过本地构建：${operation.candidate_id||"—"}`:`未构建候选：${auditReasonLabels[operation.reason]||operation.reason||operation.status||"等待执行"}`));
+      if(operation.radius_binding_applied===true)item.append(node("small","candidate-pass","标注半径已应用；全局约束仍需联合检查"));
+      else if(operation.radius_binding_status==="unresolved_fixed_radius_fit_failed")item.append(node("small","candidate-reject","固定半径未满足：当前只是自由圆弧拟合"));
+      list.append(item);
+    }details.append(list);}else details.append(node("p","receipt-summary","本轮没有可执行的局部操作。"));
+    const issues=round.feedback?.issues||[];
+    if(issues.length)details.append(node("p","receipt-summary",`本轮输入待解决项：${issues.slice(0,8).map(issueText).join("；")}${issues.length>8?`；另 ${issues.length-8} 项`:""}`));
+    if(round.acceptance_gate?.reason)details.append(node("p","receipt-summary",auditReasonLabels[round.acceptance_gate.reason]||round.acceptance_gate.reason));
+    box.append(details);
+  }
+  box.append(node("p","iteration-stop",auditReasonLabels[iterations.stop_reason]||iterations.stop_reason||"正在执行有界迭代…"));
+  return box;
 }
 async function loadModelTranscript(job,host){
   const key=`${job.id}:${job.updated_at||""}`;
@@ -358,7 +395,7 @@ function renderWorkbench(){
 }
 function renderArtifactLinks(job){
   const box=$("artifact-links");box.replaceChildren();if(!job)return;
-  const labels={dxf:"下载 DXF",svg:"打开矢量",model:"模型 JSON",validation:"验证报告",segmentation_review:"分割审核记录",feedback_plan:"修正计划",topology_plan:"拓扑规划"};
+  const labels={dxf:"下载 DXF",svg:"打开矢量",model:"模型 JSON",validation:"验证报告",segmentation_review:"分割审核记录",feedback_plan:"修正计划",topology_plan:"拓扑规划",topology_iterations:"迭代记录",reconstruction_feedback:"未解决项"};
   for(const [key,label] of Object.entries(labels)){const url=safeUrl(job.artifacts?.[key]);if(!url)continue;const a=node("a","",label);a.href=url;a.target="_blank";box.append(a);}
 }
 function renderTrace(job){
@@ -382,6 +419,8 @@ async function loadDetails(job){
   for(const [key,name] of [["feedback_plan","feedback"],["topology_plan","topology"],["constraint_bindings","bindings"]]){
     const url=safeUrl(job.artifacts?.[key]);if(!url)continue;try{const response=await fetch(url);if(response.ok)detail[name]=await response.json();}catch{}
   }
+  try{detail.audit=state.transcriptCache.get(signature)||await api(`/api/jobs/${encodeURIComponent(job.id)}/model-transcript`);state.transcriptCache.set(signature,detail.audit);}catch{}
+  detail.primitiveDiagnostics=job.validation?.primitive_diagnostics;
   state.detailCache.set(signature,detail);if(state.currentJob?.id===job.id)renderReasonCards(detail);
 }
 function renderReasonCards(detail){
@@ -389,7 +428,12 @@ function renderReasonCards(detail){
   const cards=[];
   if(feedback){cards.push(["观察",feedback.observation||"未提供可采纳观察",`证据：${(feedback.evidence_tags||[]).join(" · ")||"无"}`],["修改决策",feedback.proposed_action||"保持当前轮廓",`${feedback.selected_candidate_id||"ABSTAIN"} · ${feedback.confidence||"—"}`]);}
   if(topology){cards.push(["候选规划",topology.selected_candidate_id||"—",`${topology.candidate_count||0} 个候选 · ${topology.selection_source||"—"}`]);}
-  if(bindings){cards.push(["约束绑定",`${bindings.counts?.api_accepted||0} 条接受`,`${bindings.counts?.unbound_dimensions||0} 条仍未绑定`]);}
+  if(bindings){cards.push(["约束绑定",`${bindings.counts?.bound_source_records??"—"} 条标注绑定`,`${bindings.counts?.unbound_dimensions??"—"} 条仍未绑定 · ${bindings.counts?.structural_accepted||0} 条结构关系`]);}
+  const iterations=detail.audit?.iterations,parameterization=detail.audit?.parameterization;
+  if(iterations)cards.push(["迭代进度",`${iterations.rounds?.length||0}/${iterations.max_rounds||3} 轮`,auditReasonLabels[iterations.stop_reason]||iterations.stop_reason||"运行中"]);
+  if(parameterization)cards.push(["参数化求解",`${parameterization.constraints?.length||0} 项已求解约束`,`剩余形状自由度 ${parameterization.diagnostics?.remaining_shape_dof??"—"} · ${parameterization.accepted?"已接受约束子集的解":"参数解未接受"}`]);
+  const primitives=detail.primitiveDiagnostics?.primitives||[],jumps=primitives.map(row=>row.tangent_jump_deg).filter(Number.isFinite);
+  if(jumps.length)cards.push(["接点诊断",`最大方向跳变 ${Math.max(...jumps).toFixed(2)}°`,"测量值不代表错误；是否应相切须由原图与标注判断。"]);
   if(!cards.length){box.append(node("p","empty-copy","等待规划与校验数据。"));return;}
   for(const [label,title,copy] of cards){const card=node("div","reason-card");card.append(node("small","",label.toUpperCase()),node("b","",title),node("p","",copy));box.append(card);}
 }

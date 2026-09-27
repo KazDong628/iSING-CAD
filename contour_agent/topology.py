@@ -378,12 +378,19 @@ def build_topology(image_path, document, model, output_dir):
     records=canonical_records(document)
     source=_StrokeEvidence(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),records,grid)
     baseline_support=source.summarize(ring)
-    corrected,accepted,corrections=_repair_local_shortcuts(ring,source,grid)
-    corrected,text_changes,text_attempts=_repair_text_occlusions(corrected,records,source,grid)
-    accepted.extend(text_changes);corrections.extend(text_attempts)
+    oracle_mask=model.get("oracle_mask_conditioned") is True
+    if oracle_mask:
+        # This experiment explicitly supplies a complete material mask. Ink
+        # shortcuts repair uncertain segmentation, so they cannot rewrite this
+        # fixed geometric observation merely by finding a nearby hatch stroke.
+        corrected=ring.copy();accepted=[];corrections=[]
+    else:
+        corrected,accepted,corrections=_repair_local_shortcuts(ring,source,grid)
+        corrected,text_changes,text_attempts=_repair_text_occlusions(corrected,records,source,grid)
+        accepted.extend(text_changes);corrections.extend(text_attempts)
     corrected_support=source.summarize(corrected)
     candidates=[];logs=[]
-    for multiple in (.75,1.5,2.5):
+    for multiple in (() if oracle_mask else (.75,1.5,2.5)):
         try:
             entities,log=_candidate(corrected,source,grid,multiple)
             # Source-based selection only. Coarser shape hypotheses may exceed
@@ -397,7 +404,26 @@ def build_topology(image_path, document, model, output_dir):
             logs.append(log)
         except (ValueError,ArithmeticError) as error:
             logs.append({"grid_multiple":multiple,"eligible":False,"error":str(error)})
-    if candidates:
+    if oracle_mask:
+        # Preserve the already validated initial CAD as the exact rollback
+        # candidate. Later annotation-guided edits remain free to change its
+        # decomposition, within the original mask representation budget.
+        system=model["coordinate_system"]
+        initial_scale=float(model["scale"]["pixels_per_mm"]) if system["units"]=="mm" else 1.
+        initial_origin=np.asarray(system["origin_source_px"],float)
+        entities=[]
+        for item in model["entities"]:
+            entity={"type":item["type"],"fit_error_px":0.}
+            for key in ("start","end","center"):
+                if key in item:entity[key]=(np.asarray(item[key],float)*[initial_scale,-initial_scale]+initial_origin).tolist()
+            if item["type"]=="ARC":
+                entity.update(radius=float(item["radius"])*initial_scale,clockwise=not bool(item["clockwise"]))
+            entities.append(entity)
+        selected={"tolerance_px":float(model.get("curve_fit",{}).get("tolerance_px") or .25),
+                  "grid_multiple":None,"entity_count":len(entities),
+                  "source_stroke_support":source.summarize(_sample_entities(entities)[0])}
+        selection="oracle_mask_preserved_initial_cad_geometry"
+    elif candidates:
         _,_,entities,selected=min(candidates,key=lambda item:(item[0],item[1]))
         selection="fewest_source_supported_valid_primitives_then_stroke_distance"
     else:
@@ -436,7 +462,9 @@ def build_topology(image_path, document, model, output_dir):
                          "accepted_local_corrections":accepted,"local_correction_candidates":corrections,
                          "coarse_candidates":logs,"selection":selection,"selected_candidate":selected,
                          "source_deviation_diagnostic":source_deviation,"baseline_modified":False,
-                         "ground_truth_used":False,"dimensions_solved":False,"engineering_verified":False}
+                         "ground_truth_used":False,"dimensions_solved":False,"engineering_verified":False,
+                         "boundary_observation_policy":"fixed_oracle_mask" if oracle_mask else "source_supported_segmentation_repair",
+                         "mask_boundary_repair_skipped":oracle_mask}
     graph={"schema_version":"source-topology-v1","status":"proposal","units":units,"coordinate_system":coord,
            "nodes":nodes,"entities":geometries,"relations":_relations(geometries),
            "source_grid_pitch_px":grid,"proposal_tolerance_px":selected["tolerance_px"],

@@ -427,8 +427,13 @@ def solve_parametric(graph,constraints,*,output_dir=None):
         # the trust region continues optimizing their soft prior. Keep the
         # existing normalized unit; objective, tolerances and success gate stay
         # unchanged.
+        # Radius feasibility can require moving both endpoints before the
+        # trust-region step settles.  A connected, valid CL60 source graph
+        # reaches the unchanged numerical convergence gate after 726 calls;
+        # the former 400-call budget rejected that valid candidate.  Keep a
+        # finite budget and the same tolerances / acceptance checks.
         fit=least_squares(objective,starting[active],bounds=(lower[active],upper[active]),
-                          max_nfev=400,ftol=1e-11,xtol=1e-11,gtol=1e-9,x_scale=1.,**linear_options)
+                          max_nfev=1200,ftol=1e-11,xtol=1e-11,gtol=1e-9,x_scale=1.,**linear_options)
         solved_vector=expand(fit.x)
         node_map,candidate=decode(solved_vector)
         if not np.isfinite(solved_vector).all():raise FloatingPointError("Nonfinite optimization result")

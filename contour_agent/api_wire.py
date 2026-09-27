@@ -7,6 +7,50 @@ import re
 from urllib.parse import urlparse
 
 
+_ANTHROPIC_OUTPUT_BUDGETS = {
+    "planning": 8192, "binding": 8192, "evaluation": 8192,
+    "editing": 12288, "dimensions": 2200,
+}
+
+
+def output_token_budget(settings, stage, default_tokens):
+    """Bound reasoning-capable Messages output without changing other protocols.
+
+    This is one request's combined output allowance, not a retry or a deadline
+    extension. Text-only dimension parsing retains its existing allowance.
+    """
+    if stage not in _ANTHROPIC_OUTPUT_BUDGETS:
+        raise ValueError("unknown_output_budget_stage")
+    if type(default_tokens) is not int or not 1 <= default_tokens <= 12288:
+        raise ValueError("invalid_output_budget")
+    return (_ANTHROPIC_OUTPUT_BUDGETS[stage]
+            if settings.wire_api == "anthropic_messages" else default_tokens)
+
+
+def numeric_token_usage(usage):
+    """Keep only whitelisted token counters, never provider reasoning or text."""
+    if not isinstance(usage, dict):
+        return {}
+    result = {key: usage[key] for key in (
+        "input_tokens", "output_tokens", "total_tokens", "prompt_tokens", "completion_tokens",
+        "cache_creation_input_tokens", "cache_read_input_tokens",
+    ) if type(usage.get(key)) is int and usage[key] >= 0}
+    for parent, key in (("output_tokens_details", "reasoning_tokens"),
+                        ("completion_tokens_details", "reasoning_tokens"),
+                        ("input_tokens_details", "cached_tokens"),
+                        ("prompt_tokens_details", "cached_tokens")):
+        details = usage.get(parent)
+        if isinstance(details, dict) and type(details.get(key)) is int and details[key] >= 0:
+            result[parent + "." + key] = details[key]
+    return result
+
+
+def anthropic_thinking_mode_requested(settings):
+    """Requested policy only; an adapter may still emit thinking blocks."""
+    return (getattr(settings, "anthropic_thinking_mode", "provider_default")
+            if settings.wire_api == "anthropic_messages" else None)
+
+
 def _input_content(content):
     if isinstance(content, str):
         return [{"type": "input_text", "text": content}]
@@ -63,6 +107,8 @@ def prepare_request(settings, chat_payload):
             rows.append({"role":message["role"],"content":converted})
         payload={"model":chat_payload["model"],"messages":rows,
                  "max_tokens":chat_payload.get("max_tokens",1000)}
+        if anthropic_thinking_mode_requested(settings) == "disabled":
+            payload["thinking"] = {"type": "disabled"}
         if system:payload["system"]="\n\n".join(system)
         if "temperature" in chat_payload:payload["temperature"]=chat_payload["temperature"]
         return settings.base_url.rstrip("/")+"/v1/messages",payload

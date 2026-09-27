@@ -17,7 +17,8 @@ import re
 import time
 
 import httpx
-from .api_wire import prepare_request, extract_text, request_headers, endpoint_allowed
+from .api_wire import (prepare_request, extract_text, request_headers, endpoint_allowed,
+                       anthropic_thinking_mode_requested)
 from PIL import Image, ImageDraw
 
 from .config import Settings
@@ -152,6 +153,7 @@ class VisionProvider:
             "image_sent": False, "ground_truth_sent": False, "dimension_certified": False,
             "verdict": "uncertain", "roi": None, "issues": [], "units": "unknown",
             "tls_verification": True, "trust_environment_proxy": settings.trust_env,
+            "anthropic_thinking_mode_requested": anthropic_thinking_mode_requested(settings),
         }
 
         def finish():

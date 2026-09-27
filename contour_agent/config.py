@@ -32,12 +32,13 @@ class Settings:
     disable_response_storage: bool = field(default_factory=lambda: os.getenv("CONTOUR_DISABLE_RESPONSE_STORAGE", "true").lower() == "true")
     api_key: str = field(default_factory=lambda: os.getenv("CONTOUR_API_KEY") or os.getenv("USTC_API_KEY") or
                               os.getenv("CADRECON_API_KEY", ""), repr=False)
-    api_timeout: float = field(default_factory=lambda: max(5., min(600., float(os.getenv("CONTOUR_API_TIMEOUT", "60")))))
+    api_timeout: float = field(default_factory=lambda: max(5., min(600., float(os.getenv("CONTOUR_API_TIMEOUT", "600")))))
     trust_env: bool = field(default_factory=lambda: os.getenv("CONTOUR_TRUST_ENV", "false").lower() == "true")
     allow_insecure_http: bool = False
     auth_scheme: str = "bearer"
     segmentation_checkpoint: str = field(default_factory=lambda: os.getenv("CONTOUR_SEGMENTATION_CHECKPOINT", ""))
     segmentation_manifest: str = field(default_factory=lambda: os.getenv("CONTOUR_SEGMENTATION_MANIFEST", ""))
+    anthropic_thinking_mode: str = field(default_factory=lambda: os.getenv("CONTOUR_ANTHROPIC_THINKING_MODE", "provider_default").strip().lower())
 
     def __post_init__(self):
         parsed = urlparse(self.base_url)
@@ -49,14 +50,19 @@ class Settings:
             raise ValueError("CONTOUR_WIRE_API must be chat_completions, responses or anthropic_messages")
         if self.auth_scheme not in {"bearer", "x-api-key"}:
             raise ValueError("API auth scheme must be bearer or x-api-key")
+        if self.anthropic_thinking_mode not in {"provider_default", "disabled"}:
+            raise ValueError("CONTOUR_ANTHROPIC_THINKING_MODE must be provider_default or disabled")
 
     def public(self) -> dict:
         profiles, default_id = provider_registry(self)
         active = profiles[default_id]
         return {"provider_configured": bool(active.api_key), "base_url": active.base_url,
                 "model": active.model, "model_provider":active.model_provider,"wire_api":active.wire_api,
+                "anthropic_thinking_mode": self.anthropic_thinking_mode,
+                "anthropic_thinking_mode_requested": self.anthropic_thinking_mode if active.wire_api == "anthropic_messages" else None,
                 "default_provider_id": default_id,
-                "providers": [profile.public(default=profile_id == default_id) for profile_id, profile in profiles.items()],
+                "providers": [profile.public(default=profile_id == default_id, anthropic_thinking_mode=self.anthropic_thinking_mode)
+                              for profile_id, profile in profiles.items()],
                 "response_storage_disabled":self.disable_response_storage,
                 "timeout_seconds": self.api_timeout,
                 "tls_verification": True, "trust_environment_proxy": self.trust_env,
@@ -81,11 +87,12 @@ class ProviderProfile:
                        wire_api=self.wire_api, api_key=self.api_key,
                        allow_insecure_http=self.allow_insecure_http, auth_scheme=self.auth_scheme)
 
-    def public(self, *, default=False) -> dict:
+    def public(self, *, default=False, anthropic_thinking_mode="provider_default") -> dict:
         return {"id": self.id, "name": self.name, "model_provider": self.model_provider,
                 "model": self.model, "wire_api": self.wire_api,
                 "configured": bool(self.api_key), "default": bool(default),
                 "auth_scheme": self.auth_scheme,
+                "anthropic_thinking_mode_requested": anthropic_thinking_mode if self.wire_api == "anthropic_messages" else None,
                 "transport_security": "http" if self.allow_insecure_http else "https"}
 
 

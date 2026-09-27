@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import math
+import inspect
 from pathlib import Path
 import shutil
 
@@ -20,6 +21,8 @@ from shapely.geometry import Polygon
 
 from .automatic import _verify_dxf_readback
 from .vectorize import _sample_entities, assess_fit_quality
+from .reconstruction_feedback import (reconstruction_feedback, geometry_fingerprint,
+                                       constraint_regression, primitive_diagnostics)
 
 
 CORE = ("drawing.dxf", "preview.svg", "overlay.png", "model.json", "validation.json", "curve-fit.json")
@@ -35,6 +38,10 @@ def _export_chain(image_path, baseline, entities, output_dir, *, topology=False,
     """Export geometry under an explicit source-topology or constraint basis."""
     output=Path(output_dir);output.mkdir(parents=True,exist_ok=True)
     entities=copy.deepcopy(entities)
+    if topology:
+        for entity in entities:
+            if entity.get("radius_binding"):
+                entity.update(dimension_bound=False,radius_binding_status="constructed_unverified")
     if not 2 <= len(entities) <= 1000:
         raise ValueError("Unsupported parametric entity count")
     units=baseline["coordinate_system"]["units"]
@@ -99,6 +106,7 @@ def _export_chain(image_path, baseline, entities, output_dir, *, topology=False,
                 "validation_basis":"source_stroke_supported_topology_and_closed_geometry" if topology else "accepted_numerical_constraint_subset_and_closed_geometry",
                 "source_mask_fidelity_used_as_acceptance_gate":False,
                 "issues":[],"meaning":"Partial source-bound parametric draft; geometry and enforced constraints are checked separately from reference accuracy."}
+    validation["primitive_diagnostics"]=primitive_diagnostics(entities)
     model=copy.deepcopy(baseline)
     model.update(entities=entities,validation=validation,curve_fit=deviation,
                  initial_curve_fit=baseline.get("curve_fit"),automatic_completion=baseline.get("complete_material_exterior",True),
@@ -117,7 +125,50 @@ def export_parametric(image_path, baseline, solution, output_dir):
         raise ValueError("Only an accepted numerical solution may be exported")
     if solution.get("units",baseline["coordinate_system"]["units"])!=baseline["coordinate_system"]["units"]:
         raise ValueError("Solution and source units differ")
-    return _export_chain(image_path,baseline,solution["entities"],output_dir,constraint_validation=solution.get("validation"))
+    entities=copy.deepcopy(solution["entities"])
+    for entity in entities:
+        if entity.get("radius_binding"):
+            verified=any(row.get("kind")=="radius" and entity.get("id") in row.get("entities",[]) and
+                         row.get("record_id")==entity["radius_binding"].get("record_id") and row.get("passed") is True
+                         for row in solution.get("constraints",[]))
+            entity.update(dimension_bound=verified,radius_binding_status="verified_constraint_subset" if verified else "constructed_unverified")
+    return _export_chain(image_path,baseline,entities,output_dir,constraint_validation=solution.get("validation"))
+
+
+def _oracle_mask_validation(baseline, entities):
+    """Compare every oracle-stage result with the immutable initial mask.
+
+    This is a representation check against the explicitly supplied raster
+    input, not a reference-DXF comparison. Never reset its budget to a newer
+    fitted topology or a solver proposal.
+    """
+    if baseline.get("oracle_mask_conditioned") is not True:
+        return {"applicable":False,"passed":True}
+    try:
+        budget=float(baseline["curve_fit"]["total_deviation_budget_px"])
+        if not math.isfinite(budget) or budget<=0:raise ValueError("invalid initial mask budget")
+        ring=baseline["extraction"]["raw_polyline_px"]
+        system=baseline["coordinate_system"]
+        scale=float(baseline["scale"]["pixels_per_mm"]) if system["units"]=="mm" else 1.
+        origin=np.asarray(system["origin_source_px"],float)
+        source_entities=[]
+        for item in entities:
+            source={"type":item["type"]}
+            for key in ("start","end","center"):
+                if key in item:source[key]=(np.asarray(item[key],float)*[scale,-scale]+origin).tolist()
+            if item["type"]=="ARC":source.update(radius=float(item["radius"])*scale,clockwise=not bool(item["clockwise"]))
+            source_entities.append(source)
+        quality=assess_fit_quality(ring,source_entities)
+        deviation=float(quality["source_boundary_deviation_px"]["conservative_upper_bound_px"])
+        passed=bool(quality["sampled_topology_valid"] and math.isfinite(deviation) and deviation<=budget)
+        return {"applicable":True,"passed":passed,"original_deviation_budget_px":budget,
+                "conservative_max_deviation_px":deviation,"quality":quality,
+                "observation":"initial_extraction_raw_polyline_px","budget_source":"initial_curve_fit_total_deviation_budget_px",
+                "reason":None if passed else "original_oracle_mask_budget_exceeded",
+                "reference_dxf_read":False,"reference_accuracy_verified":False}
+    except (KeyError,TypeError,ValueError,IndexError,ArithmeticError):
+        return {"applicable":True,"passed":False,"reason":"original_oracle_mask_observation_unavailable",
+                "reference_dxf_read":False,"reference_accuracy_verified":False}
 
 
 def _topology_source_validation(image_path, baseline, graph):
@@ -186,14 +237,55 @@ def _topology_source_validation(image_path, baseline, graph):
         elif metrics[1]<metrics[0]-.035 or metrics[3]>metrics[2]+metrics[4]:
             reasons.append("source_stroke_support_degraded")
     except (KeyError,TypeError,ValueError):reasons.append("missing_source_support_metrics")
+    mask_validation=_oracle_mask_validation(baseline,graph.get("entities",[]))
+    if not mask_validation["passed"]:reasons.append(mask_validation["reason"])
     return {"passed":not reasons,"reasons":list(dict.fromkeys(reasons)),"source_evidence":evidence,"source_sha256":graph.get("source_sha256"),
             "coordinate_mapping":coordinate_check,
+            "oracle_mask_validation":mask_validation,
             "acceptance_basis":"source_hash_stroke_support_closed_simple_geometry_and_DXF_readback",
-            "dimensions_verified":False,"reference_verified":False,"mask_fidelity_gate_used":False}
+            "dimensions_verified":False,"reference_verified":False,"mask_fidelity_gate_used":mask_validation["applicable"]}
+
+
+def _solved_source_validation(image_path, document, baseline, graph, entities):
+    """Check source ink again after solving, at the original fixed stroke gate."""
+    from .topology import _StrokeEvidence
+    from .ocr import canonical_records
+    image=cv2.imdecode(np.fromfile(str(image_path),np.uint8),cv2.IMREAD_GRAYSCALE)
+    if image is None:return {"passed":False,"reasons":["source_image_unavailable"]}
+    grid=float(graph.get("source_grid_pitch_px") or 1.)
+    evidence=_StrokeEvidence(image,canonical_records(document),grid)
+    scale=float(baseline["scale"]["pixels_per_mm"]) if graph["units"]=="mm" else 1.
+    origin=np.asarray(baseline["coordinate_system"]["origin_source_px"],float)
+    def measure(chain):
+        points,_,_=_sample_entities(chain,max_step_px=max(.25,grid/scale/2))
+        return evidence.summarize(points*[scale,-scale]+origin)
+    before,after=measure(graph["entities"]),measure(entities)
+    passed=(after["edge_supported_fraction"]>=before["edge_supported_fraction"]-.035 and
+            after["p90_edge_distance_px"]<=before["p90_edge_distance_px"]+grid)
+    reasons=[] if passed else ["solved_source_stroke_support_degraded"]
+    by_id={row.get("id"):row for row in entities}
+    constructed=[]
+    for entity in graph["entities"]:
+        binding=entity.get("radius_binding")
+        if entity.get("type")=="ARC" and binding and isinstance(binding.get("nominal"),(int,float)):
+            current=by_id.get(entity["id"],{})
+            delta=abs(float(current.get("radius",math.inf))-float(binding["nominal"]))
+            constructed.append({"entity_id":entity["id"],"record_id":binding.get("record_id"),"absolute_residual":delta,
+                                "tolerance":.05,"passed":delta<=.05,"binding_verified":False})
+            if delta>.05:reasons.append("constructed_annotation_radius_changed_after_solve")
+    mask_validation=_oracle_mask_validation(baseline,entities)
+    if not mask_validation["passed"]:reasons.append(mask_validation["reason"])
+    return {"passed":not reasons,"reasons":reasons,"constructed_radius_preservation":constructed,
+            "oracle_mask_validation":mask_validation,
+            "before":before,"after":after,"maximum_support_drop":.035,"maximum_p90_increase_px":grid,
+            "scope":("Source-stroke comparison and original oracle raster representation budget after numerical solving; no reference DXF comparison."
+                     if mask_validation["applicable"] else "Source-stroke comparison after numerical solving; not GT or a relaxed mask-fidelity gate."),
+            "reference_verified":False}
 
 
 def _topology_edit_stage(image_path, document, baseline, selected, bundle, output, *,
-                         editor_provider=None, evaluator_provider=None, use_api=False):
+                         editor_provider=None, evaluator_provider=None, use_api=False,
+                         round_index=1, feedback=None, verifier=None):
     """Propose, execute and independently evaluate bounded local topology edits."""
     from .planning_provider import evaluate_candidates
     from .topology_editing import execute_topology_edits, propose_annotation_arc_edits
@@ -214,7 +306,10 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
     if not overlay.is_absolute():overlay=output/overlay
     if use_api and editor_provider is not None and overlay.is_file():
         try:
-            editor_receipt=editor_provider.propose(image_path,overlay,selected,bundle.get("annotation_inventory",[]))
+            options={"feedback":feedback} if "feedback" in inspect.signature(editor_provider.propose).parameters else {}
+            editor_receipt=editor_provider.propose(image_path,overlay,selected,bundle.get("annotation_inventory",[]),**options)
+        except InterruptedError:
+            raise
         except Exception:
             editor_receipt.update(status="failed",reason="topology_edit_provider_error",
                                   schema_success=False,network_requests=None)
@@ -222,25 +317,46 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
                       if editor_receipt.get("schema_success") is True else [])
     local_annotation_operations=propose_annotation_arc_edits(
         selected.get("graph") or {},bundle.get("annotation_inventory",[]),limit=4)
-    operations=[];occupied=set();seen=set()
-    for operation in [*local_annotation_operations,*agent_operations]:
+    operations=[];seen=set()
+    # Explicit agent edits get the bounded operation budget before deterministic
+    # hints; a failed generic R-refit must not starve a requested fillet/split.
+    for operation in [*agent_operations,*local_annotation_operations]:
         ids=tuple(operation.get("entity_ids") or [])
         signature=(operation.get("action"),ids,operation.get("record_id"))
-        if signature in seen or occupied.intersection(ids):continue
-        operations.append(operation);seen.add(signature);occupied.update(ids)
+        if signature in seen:continue
+        operations.append(operation);seen.add(signature)
         if len(operations)>=5:break
     if operations:
         try:
             edited,execution=execute_topology_edits(image_path,document,baseline,selected,bundle,operations,output)
+        except InterruptedError:
+            raise
         except Exception:
             execution.update(proposed=len(operations),status="failed",reason="local_topology_edit_execution_error")
-    pool=[selected,*edited]
+    if round_index>1:
+        mapping={row["id"]:f"r{round_index:02d}-{row['id']}" for row in edited}
+        for row in edited:
+            row["id"]=mapping[row["id"]]
+            row["graph"]["candidate_id"]=row["id"]
+            if row["graph"].get("entity_identity"):
+                row["graph"]["entity_identity"]["display_id_scope"]=row["id"]
+        for row in execution.get("operations",[]):
+            if row.get("candidate_id") in mapping:row["candidate_id"]=mapping[row["candidate_id"]]
+    if verifier:
+        for row in edited:
+            row["constraint_feedback"]=verifier(row)
+            row["constraint_regression_gate"]=constraint_regression(feedback or {},row["constraint_feedback"])
+    pool=[selected,*[row for row in edited if row.get("constraint_regression_gate",{}).get("passed",True)]]
     local=evaluate_candidates(pool,max_candidates=5)
     admissible=set(local.get("admissible_candidate_ids",[]))
-    if edited and use_api and evaluator_provider is not None:
+    if len(pool)<=1:
+        evaluator_receipt.update(status="skipped",reason="no_valid_edit_candidate",network_requests=0)
+    if len(pool)>1 and use_api and evaluator_provider is not None:
         try:
             evaluator_receipt=evaluator_provider.select(
                 image_path,pool,selected["id"],bundle.get("annotation_inventory",[]))
+        except InterruptedError:
+            raise
         except Exception:
             evaluator_receipt.update(status="failed",reason="topology_evaluation_provider_error",
                                      schema_success=False,network_requests=None)
@@ -248,6 +364,17 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
                  if evaluator_receipt.get("schema_success") is True else None)
     by_id={row["id"]:row for row in pool}
     evaluated={row["candidate_id"]:row for row in local.get("evaluated",[]) if row.get("admissible")}
+    if proposed_id is None and evaluator_receipt.get("schema_success") is not True:
+        # Offline/API-failure fallback requires strict local improvement, not
+        # merely the most plausible model-selected hypothesis.
+        base_eval=evaluated.get(selected.get("id"),{})
+        eligible=[row for row in edited if row["id"] in admissible and
+                  row.get("constraint_regression_gate",{}).get("passed",True) and
+                  evaluated[row["id"]].get("score",0)>=base_eval.get("score",1) and
+                  (len(row["graph"]["entities"])<len(selected["graph"]["entities"]) or
+                   row.get("constraint_feedback",{}).get("issue_count",10**9)<(feedback or {}).get("issue_count",0))]
+        if eligible:
+            proposed_id=max(eligible,key=lambda row:evaluated[row["id"]]["score"])["id"]
     gate={"accepted":False,"reason":"evaluator_did_not_select_an_edit",
           "proposed_candidate_id":proposed_id,"base_candidate_id":selected.get("id")}
     final=selected
@@ -259,16 +386,25 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
         edit_execution=((by_id[proposed_id].get("graph") or {}).get("source_evidence") or {}).get("topology_edit") or {}
         edit_actions=[edit_execution.get("action")]
         edit_actions.extend(row.get("action") for row in edit_execution.get("operations",[]) if isinstance(row,dict))
-        annotation_guided="refit_chain_as_annotated_arc" in edit_actions
+        annotation_guided=bool(set(edit_actions)&{"refit_chain_as_annotated_arc","insert_annotated_fillet"})
         count_improved=edit_metrics.get("entity_count",10**9) < base_metrics.get("entity_count",0)
         count_preserved_for_annotation=bool(
             annotation_guided and edit_metrics.get("entity_count",10**9) <= base_metrics.get("entity_count",0))
+        growth_operations=[row for row in (edit_execution.get("operations") or [edit_execution])
+                           if isinstance(row,dict) and row.get("net_entity_reduction",0)<0]
+        feature_restored=bool(growth_operations) and all(row.get("feature_restoration_validated") and row.get("radius_binding_applied")
+                                                        for row in growth_operations)
+        type_corrected=bool("refit_entity_as_line" in edit_actions and
+                            edit_metrics.get("source_boundary_support",0)>=base_metrics.get("source_boundary_support",0) and
+                            edit_metrics.get("entity_count")==base_metrics.get("entity_count"))
+        regression=by_id[proposed_id].get("constraint_regression_gate",{"passed":True})
         accepted=bool(
             edit_eval.get("score") is not None and base_eval.get("score") is not None and
             edit_eval["score"] >= base_eval["score"]-.02 and
             edit_metrics.get("source_boundary_support",0.) >= base_metrics.get("source_boundary_support",0.)-.02 and
             edit_metrics.get("unsupported_primitive_count",10**9) <= base_metrics.get("unsupported_primitive_count",0)+1 and
-            (count_improved or count_preserved_for_annotation)
+            (count_improved or count_preserved_for_annotation or feature_restored or type_corrected) and
+            regression.get("passed") is True
         )
         gate={"accepted":accepted,
               "reason":None if accepted else "edited_candidate_failed_local_improvement_gate",
@@ -276,8 +412,11 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
               "minimum_local_score":round(float(base_eval.get("score",0.))-.02,9),
               "minimum_source_boundary_support":max(0.,float(base_metrics.get("source_boundary_support",0.))-.02),
               "maximum_unsupported_primitive_count":int(base_metrics.get("unsupported_primitive_count",0))+1,
-              "must_reduce_entity_count":not annotation_guided,
-              "annotation_guided_primitive_correction":annotation_guided}
+              "must_reduce_entity_count":not (annotation_guided or feature_restored or type_corrected),
+              "annotation_guided_primitive_correction":annotation_guided,
+              "source_validated_feature_restoration":feature_restored,
+              "constraint_regression":regression,
+              "selection_source":"online_evaluator" if evaluator_receipt.get("schema_success") else "strict_local_improvement"}
         if accepted:final=by_id[proposed_id]
     record={"schema_version":"multimodal-local-topology-edit-stage-v1","status":"completed",
             "base_candidate_id":selected.get("id"),"final_candidate_id":final.get("id"),
@@ -296,8 +435,132 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
     return final,record
 
 
+def _topology_edit_loop(image_path, document, baseline, selected, bundle, output, *,
+                        editor_provider=None, evaluator_provider=None, use_api=False,
+                        progress=None, max_rounds=3):
+    """Bounded edit -> source binding -> solve -> evaluation feedback loop.
+
+    Preflight uses only local source evidence. The final online binding stage
+    runs once. All rounds persist before another provider request begins.
+    """
+    from .constraint_binding import analyze_constraint_bindings
+    from .parametric_solver import solve_parametric
+    if isinstance(max_rounds,bool) or not 1<=max_rounds<=3:
+        raise ValueError("topology_iteration_budget_must_be_1_to_3")
+    output=Path(output);root=output/"topology-iterations";root.mkdir(parents=True,exist_ok=True)
+    emit=progress or (lambda stage,message:None)
+    record={"schema_version":"bounded-topology-iterations-v1","status":"running","max_rounds":max_rounds,
+            "rounds":[],"stop_reason":None,"ground_truth_used":False,
+            "scope":"Local preflight constraints guide edits; online verdicts do not certify dimensions or reference accuracy."}
+    seen={geometry_fingerprint(selected["graph"])};cache={};proposed_operations=set()
+    def verify(candidate):
+        graph=candidate["graph"];key=geometry_fingerprint(graph)
+        if key in cache:return cache[key]
+        directory=root/"constraint-preflight"/key[:16];directory.mkdir(parents=True,exist_ok=True)
+        if not _topology_source_validation(image_path,baseline,graph)["passed"]:
+            result=reconstruction_feedback(graph)
+            result.update(solver_status="source_validation_failed",constraint_count=1)
+        else:
+            try:
+                bindings=analyze_constraint_bindings(image_path,document,baseline,graph,directory,use_api=False)
+                solution=solve_parametric(graph,bindings.get("constraints",[]),output_dir=directory)
+                result=reconstruction_feedback(graph,bindings,solution)
+                if solution.get("accepted") and not _solved_source_validation(image_path,document,baseline,graph,solution["entities"])["passed"]:
+                    result.update(solver_status="solved_source_support_rejected",solver_accepted=False)
+            except InterruptedError:
+                raise
+            except Exception:
+                result=reconstruction_feedback(graph)
+                result.update(solver_status="preflight_failed",constraint_count=1)
+        cache[key]=result
+        return result
+    for number in range(1,max_rounds+1):
+        feedback=copy.deepcopy(verify(selected))
+        feedback["round"]=number
+        feedback["previous_operations"]=[{**row.get("operation",{}),"status":row.get("status"),"reason":row.get("reason")}
+                                           for previous in record["rounds"]
+                                           for row in previous["execution"].get("operations",[]) if isinstance(row.get("operation"),dict)][-15:]
+        feedback["previous_rounds"]=[{"round":row["round"],"acceptance_gate":row["acceptance_gate"],
+                                      "execution":row["execution"]} for row in record["rounds"]]
+        _write(output/"topology-iterations.json",record)
+        emit("topology_edit_iteration",f"局部拓扑第 {number}/{max_rounds} 轮：结合源图证据、未绑定标注和约束求解诊断评估编辑。")
+        directory=root/f"round-{number:02d}";directory.mkdir(parents=True,exist_ok=True)
+        proposed,step=_topology_edit_stage(image_path,document,baseline,selected,bundle,directory,
+            editor_provider=editor_provider,evaluator_provider=evaluator_provider,use_api=use_api,
+            round_index=number,feedback=feedback,verifier=verify)
+        step.update(round=number,feedback=feedback)
+        signature=geometry_fingerprint(proposed["graph"])
+        if step["acceptance_gate"].get("accepted"):
+            if signature in seen:
+                step["acceptance_gate"].update(accepted=False,reason="repeated_geometry")
+                step["final_candidate_id"]=selected["id"]
+                record["stop_reason"]="repeated_geometry"
+            else:
+                selected=proposed;seen.add(signature)
+        else:
+            editor=step.get("editor",{})
+            signatures={json.dumps({key:op.get(key) for key in ("action","entity_ids","record_id")},sort_keys=True)
+                        for op in editor.get("operations",[]) if isinstance(op,dict)}
+            can_revise=(use_api and editor.get("schema_success") is True and
+                        bool(signatures-proposed_operations) and number<max_rounds)
+            proposed_operations.update(signatures)
+            # Rejected fresh proposals are useful feedback. Give the editor a
+            # bounded chance to revise them against the unchanged valid graph.
+            if not can_revise:record["stop_reason"]="no_accepted_improvement"
+        record["rounds"].append(step)
+        record["final_candidate_id"]=selected["id"]
+        record["final_feedback"]=verify(selected)
+        _write(output/"topology-iterations.json",record)
+        _write(output/"topology-candidates.json",bundle)
+        if record["stop_reason"]:break
+    record.update(status="completed",stop_reason=record["stop_reason"] or "round_budget_exhausted")
+    _write(output/"topology-iterations.json",record)
+    # Preserve old receipt consumers while adding the full per-round audit.
+    summary={**record["rounds"][-1],"rounds":record["rounds"],"max_rounds":max_rounds,
+             "stop_reason":record["stop_reason"],"final_candidate_id":selected["id"],
+             "accepted_round_count":sum(row["acceptance_gate"].get("accepted") is True for row in record["rounds"])}
+    _write(output/"topology-edit-proposals.json",summary)
+    return selected,summary
+
+
+def _source_valid_topology_choice(image_path, baseline, selected, selected_graph, candidates,
+                                  local_evaluation, base_graph, *, allow_alternatives=True):
+    """Recheck ranked hypotheses at the unchanged publication gate.
+
+    Ranking is not publication approval. A rejected simplification must not
+    prevent the last source-supported topology from reaching binding/solving.
+    Every attempted graph retains its exact validation receipt.
+    """
+    by_id={row["id"]:row for row in candidates}
+    base=candidates[0]
+    choices=[(selected,selected_graph,"selected_candidate")]
+    if allow_alternatives:
+        ranked=sorted((row for row in local_evaluation.get("evaluated",[]) if row.get("admissible")),
+                      key=lambda row:float(row.get("score") or 0.),reverse=True)
+        choices.extend((by_id[row["candidate_id"]],by_id[row["candidate_id"]]["graph"],"ranked_candidate")
+                       for row in ranked if row["candidate_id"] in by_id and
+                       row["candidate_id"] not in {selected["id"],base["id"]})
+    # Even without annotation leaders an online editor may have proposed a
+    # different graph. Its rejection must still preserve the exact base;
+    # allow_alternatives controls generated candidates, not this rollback.
+    if selected_graph != base_graph:
+        choices.append((base,base_graph,"preserved_base_topology"))
+    attempts=[]
+    for candidate,graph,kind in choices:
+        validation=_topology_source_validation(image_path,baseline,graph)
+        attempts.append({"candidate_id":candidate["id"],"graph_source":kind,"validation":validation})
+        if validation["passed"]:
+            return candidate,graph,{"status":"retained_selection" if len(attempts)==1 else "fallback_selected",
+                                    "original_selected_candidate_id":selected["id"],
+                                    "selected_candidate_id":candidate["id"],"selected_graph_source":kind,
+                                    "attempts":attempts,"thresholds_unchanged":True}
+    return selected,selected_graph,{"status":"no_source_valid_topology",
+                                   "original_selected_candidate_id":selected["id"],
+                                   "selected_candidate_id":None,"attempts":attempts,"thresholds_unchanged":True}
+
+
 def _plan_topology(image_path, document, baseline, base_graph, output_dir, *, planner_provider=None,
-                   editor_provider=None, evaluator_provider=None, use_api=False):
+                   editor_provider=None, evaluator_provider=None, use_api=False, progress=None):
     """Choose one bounded source-only topology candidate and persist the audit.
 
     Annotation evidence controls whether simplification is allowed.  With no
@@ -309,6 +572,7 @@ def _plan_topology(image_path, document, baseline, base_graph, output_dir, *, pl
     from .topology_candidates import generate_topology_candidates, materialize_selected_candidate
 
     output=Path(output_dir)
+    base_overlay=(output/"topology-overlay.png").read_bytes() if (output/"topology-overlay.png").is_file() else None
     bundle=generate_topology_candidates(image_path,document,baseline,base_graph,output,max_candidates=5)
     candidates=bundle["candidates"]
     by_id={row["id"]:row for row in candidates}
@@ -330,6 +594,8 @@ def _plan_topology(image_path, document, baseline, base_graph, output_dir, *, pl
     elif use_api and planner_provider is not None:
         try:
             receipt=planner_provider.select(image_path,candidates)
+        except InterruptedError:
+            raise
         except Exception:
             # Provider exceptions are not serialized because they can contain
             # headers.  Source-only candidates and local evaluation survive.
@@ -380,11 +646,11 @@ def _plan_topology(image_path, document, baseline, base_graph, output_dir, *, pl
     edit_stage=None
     if annotation_evidence:
         selected=by_id[selected_id]
-        selected,edit_stage=_topology_edit_stage(image_path,document,baseline,selected,bundle,output,
+        selected,edit_stage=_topology_edit_loop(image_path,document,baseline,selected,bundle,output,
                                                   editor_provider=editor_provider,
-                                                  evaluator_provider=evaluator_provider,use_api=use_api)
+                                                  evaluator_provider=evaluator_provider,use_api=use_api,progress=progress)
         selected_id=selected["id"]
-        if edit_stage.get("acceptance_gate",{}).get("accepted"):
+        if edit_stage.get("accepted_round_count",0):
             source="multimodal_local_topology_edit"
         materialization=materialize_selected_candidate(selected,bundle,output)
         selected_graph=selected["graph"]
@@ -393,21 +659,41 @@ def _plan_topology(image_path, document, baseline, base_graph, output_dir, *, pl
         # visible micro-segment.  The edit still needs local execution and an
         # independent evaluator; abstention preserves the exact base graph.
         selected=by_id[base_id]
-        edited_selected,edit_stage=_topology_edit_stage(image_path,document,baseline,selected,bundle,output,
+        edited_selected,edit_stage=_topology_edit_loop(image_path,document,baseline,selected,bundle,output,
                                                          editor_provider=editor_provider,
-                                                         evaluator_provider=evaluator_provider,use_api=use_api)
-        if edit_stage.get("acceptance_gate",{}).get("accepted"):
+                                                         evaluator_provider=evaluator_provider,use_api=use_api,progress=progress)
+        if edit_stage.get("accepted_round_count",0):
             selected=edited_selected;selected_id=selected["id"]
             source="multimodal_local_topology_edit_without_annotation_leader"
             materialization=materialize_selected_candidate(selected,bundle,output)
             selected_graph=selected["graph"]
+    selected,selected_graph,source_selection=_source_valid_topology_choice(
+        image_path,baseline,selected,selected_graph,bundle["candidates"],local,base_graph,
+        allow_alternatives=annotation_evidence)
+    if source_selection["status"]=="fallback_selected":
+        selected_id=selected["id"]
+        source="source_validation_fallback"
+        if source_selection["selected_graph_source"]=="preserved_base_topology":
+            _write(output/"topology.json",base_graph)
+            if base_overlay is not None:(output/"topology-overlay.png").write_bytes(base_overlay)
+            materialization={"status":"preserved_base_topology","candidate_id":selected_id,
+                             "topology_path":str(output/"topology.json"),
+                             "overlay_path":str(output/"topology-overlay.png") if base_overlay is not None else None,
+                             "ground_truth_used":False,"reference_accuracy_verified":False}
+        else:
+            materialization=materialize_selected_candidate(selected,bundle,output)
     plan={"schema_version":"source-topology-plan-v1","status":"selected",
           "selected_candidate_id":selected_id,"selection_source":source,
           "annotation_evidence_available":annotation_evidence,
           "source_annotation_leader_count":len(leader_rows),
           "candidate_count":len(candidates),"local_evaluation":local,
            "provider":receipt,"online_selection_gate":online_gate,"topology_editing":edit_stage,
-          "selected_entity_counts":selected.get("entity_counts",{}),
+          "source_validation_selection":source_selection,
+          "selected_entity_counts":({"total":len(selected_graph["entities"]),
+                                     "LINE":sum(row["type"]=="LINE" for row in selected_graph["entities"]),
+                                     "ARC":sum(row["type"]=="ARC" for row in selected_graph["entities"])}
+                                    if source_selection.get("selected_graph_source")=="preserved_base_topology"
+                                    else selected.get("entity_counts",{})),
           "selected_annotation_coverage":selected.get("annotation_coverage"),
           "selected_unsupported_primitive_count":selected.get("unsupported_primitive_count"),
           "materialization":materialization,"ground_truth_used":False,
@@ -425,7 +711,10 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
     output=Path(output_dir)
     current=baseline
     emit=progress or (lambda stage,message:None)
-    stage={"status":"running","accepted":False,"ground_truth_used":False,"all_dimensions_verified":False,
+    oracle_mask=baseline.get("oracle_mask_conditioned") is True
+    stage={"status":"running","accepted":False,"ground_truth_used":oracle_mask,
+           "ground_truth_use":"raster_mask_input_only" if oracle_mask else "none",
+           "oracle_mask_conditioned":oracle_mask,"all_dimensions_verified":False,
            "geometry_updated_by_api":False,"dimensions_updated_by_api":False,
            "provider":{"status":"not_invoked","network_requests":0},"stages":[]}
     def checkpoint(name,message):
@@ -479,7 +768,7 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
         checkpoint("topology_planning","生成多个 LINE/ARC 拓扑候选，按标注引线覆盖和源边界证据规划对象数量。")
         graph,topology_plan=_plan_topology(image_path,document,baseline,base_graph,output,
                                            planner_provider=planner_provider,editor_provider=editor_provider,
-                                           evaluator_provider=evaluator_provider,use_api=use_api)
+                                           evaluator_provider=evaluator_provider,use_api=use_api,progress=checkpoint)
         stage["topology_planning"]={key:value for key,value in topology_plan.items()
                                      if key not in {"local_evaluation"}}
         stage["topology_planning"]["local_evaluation"]=topology_plan["local_evaluation"]
@@ -511,6 +800,9 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
         checkpoint("parametric_solve","联合求解图元尺寸与连接关系，逐项核验已绑定约束。")
         solution=solve_parametric(graph,stage["constraints"],output_dir=output)
         _write(output/"parametric-solution.json",solution)
+        feedback=reconstruction_feedback(graph,bindings,solution)
+        _write(output/"reconstruction-feedback.json",feedback)
+        stage["reconstruction_feedback"]=feedback
         stage["solver"]={key:value for key,value in solution.items() if key not in {"entities","nodes","candidate_entities","candidate_nodes","constraints"}}
         if solution.get("accepted") is not True:
             stage.update(status="candidate_rejected",accepted=False,reason=solution.get("status","solver_rejected"))
@@ -518,11 +810,22 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
             return ({**current,"parameterization":copy.deepcopy(stage)} if stage.get("topology_exported") else current),stage
         candidate_dir=output/"parametric-export"
         checkpoint("parametric_validate","数值候选已产生；独立验证导出拓扑、单位与DXF回读后再发布。")
+        source_check=_solved_source_validation(image_path,document,baseline,graph,solution["entities"])
+        stage["solved_source_validation"]=source_check
+        if not source_check["passed"]:
+            failure_reason=(source_check.get("reasons") or ["solved_source_stroke_support_degraded"])[0]
+            stage.update(status="candidate_rejected",accepted=False,reason=failure_reason)
+            message=("求解后的边界超出原始掩膜表示误差预算；保留上一套有效轮廓。"
+                     if failure_reason.startswith("original_oracle_mask_") else
+                     "求解后的边界偏离原图笔画；保留上一套有效轮廓，约束残差与源图检查分别记录。")
+            checkpoint("parametric_retained",message)
+            return {**current,"parameterization":copy.deepcopy(stage)},stage
         updated=export_parametric(image_path,baseline,solution,candidate_dir)
         stage.update(underconstrained=solution.get("underconstrained",True))
         selected=bindings.get("bindings",[]) if bindings.get("provider",{}).get("schema_success") is True else []
         api_dimensions=any(row.get("accepted") is True and row.get("source")=="ocr_api_binding" for row in selected)
-        api_relations=any(row.get("accepted") is True and row.get("relation_id") for row in selected)
+        api_relations=any(row.get("accepted") is True and row.get("relation_id") and
+                          row.get("admission_method","api_and_source")=="api_and_source" for row in selected)
         updated=publish(candidate_dir,updated,kind="parametric",api_geometry=api_dimensions or api_relations,
                         api_dimensions=api_dimensions)
         return updated,stage
