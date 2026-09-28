@@ -5,6 +5,7 @@ network calls, dataset labels, or reference geometry are needed.
 """
 import json
 import io
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -254,3 +255,109 @@ def test_segmentation_review_gate_pauses_accepts_pixel_edits_and_resumes_export(
     assert model["manual_intervention"] is True
     assert model["ground_truth_used"] is False
     assert model["validation"]["dxf_readback"]["passed"]
+
+
+def test_uploaded_gt_dxf_generates_verified_oracle_mask(integration, monkeypatch):
+    context = integration
+
+    def learned_with_artifacts(model_path, source_path, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        Image.new("L", (128, 96), 0).save(output_dir / "prediction-mask.png")
+        Image.open(source_path).convert("RGB").save(output_dir / "prediction-overlay.png")
+        context["calls"]["learned"].append((Path(model_path), Path(source_path), output_dir))
+        return extraction(learned=True)
+
+    monkeypatch.setattr(segmentation, "cached_extract", learned_with_artifacts)
+    pending = create_case(context, use_segmentation=True, require_segmentation_review=True).json()
+    assert pending["status"] == "awaiting_segmentation_review"
+
+    mask = Image.new("L", (128, 96), 0)
+    for x in range(18, 111):
+        for y in range(18, 79):
+            mask.putpixel((x, y), 255)
+    payload = io.BytesIO()
+    mask.save(payload, format="PNG")
+    pixels = payload.getvalue()
+    rejected = context["client"].put(
+        f"/api/jobs/{pending['id']}/segmentation-review",
+        files={"mask": ("oracle.png", pixels, "image/png"),
+               "mask_source": (None, "gt_oracle")},
+    )
+    assert rejected.status_code == 400
+
+    def generated(dxf_bytes, image_path, ocr_path, hint_path, mask_size, *, temporary_root):
+        assert dxf_bytes == b"uploaded reference DXF"
+        assert mask_size == (128, 96) and Path(hint_path).is_file()
+        return pixels, {
+            "schema_version": "job-oracle-dxf-import-v1", "source": "uploaded_gt_dxf",
+            "source_gt_sha256": hashlib.sha256(dxf_bytes).hexdigest(),
+            "mask_sha256": hashlib.sha256(pixels).hexdigest(),
+            "source_image_sha256": hashlib.sha256(Path(image_path).read_bytes()).hexdigest(),
+            "source_ocr_sha256": hashlib.sha256(Path(ocr_path).read_bytes()).hexdigest(),
+            "mask_size": {"width": 128, "height": 96}, "foreground_pixels": 93 * 61,
+            "ground_truth_dxf_coordinates_sent_to_provider": False,
+        }
+
+    monkeypatch.setattr("contour_agent.oracle_mask_import.generate_oracle_mask", generated)
+    imported = context["client"].post(
+        f"/api/jobs/{pending['id']}/oracle-mask-from-dxf",
+        files={"dxf": ("reference.dxf", b"uploaded reference DXF", "application/dxf")},
+    )
+    assert imported.status_code == 200
+    assert imported.json()["artifacts"]["oracle_generated_mask"]
+    assert context["client"].get(imported.json()["artifacts"]["oracle_generated_mask"]).content == pixels
+    assert context["client"].get(imported.json()["artifacts"]["oracle_mask_import"]).json()["ground_truth_dxf_coordinates_sent_to_provider"] is False
+    assert context["client"].get(f"/api/jobs/{pending['id']}/artifacts/reference.dxf").status_code == 404
+
+    tampered = io.BytesIO()
+    altered = mask.copy()
+    altered.putpixel((18, 18), 0)
+    altered.save(tampered, format="PNG")
+    rejected = context["client"].put(
+        f"/api/jobs/{pending['id']}/segmentation-review",
+        files={"mask": ("tampered.png", tampered.getvalue(), "image/png"),
+               "mask_source": (None, "gt_oracle")},
+    )
+    assert rejected.status_code == 400
+    response = context["client"].put(
+        f"/api/jobs/{pending['id']}/segmentation-review",
+        files={"mask": ("oracle.png", pixels, "image/png"),
+               "mask_source": (None, "gt_oracle")},
+    )
+    assert response.status_code == 202
+    job = response.json()
+    assert job["status"] in {"completed", "needs_review"}
+    assert job["segmentation_review"]["source"] == "registered_dxf_gt"
+    assert job["segmentation_review"]["ground_truth_used"] is True
+    assert job["segmentation_review"]["reviewed"] is False
+    assert job["segmentation_review"]["ground_truth_dxf_coordinates_used_for_mask_creation"] is True
+    assert job["segmentation_review"]["ground_truth_dxf_coordinates_used_for_prediction"] is False
+    assert job["manual_intervention"] is False
+    model = read_model(context, job)
+    assert model["algorithm_version"] == "oracle-gt-mask-conditioned-v1"
+    assert model["oracle_mask_conditioned"] is True
+    assert model["ground_truth_used"] is True
+    assert model["manual_intervention"] is False
+    assert model["validation"]["dxf_readback"]["passed"]
+
+    edited_pending = create_case(context, use_segmentation=True, require_segmentation_review=True).json()
+    edited_import = context["client"].post(
+        f"/api/jobs/{edited_pending['id']}/oracle-mask-from-dxf",
+        files={"dxf": ("reference.dxf", b"uploaded reference DXF", "application/dxf")},
+    )
+    assert edited_import.status_code == 200
+    edited_response = context["client"].put(
+        f"/api/jobs/{edited_pending['id']}/segmentation-review",
+        files={"mask": ("edited.png", tampered.getvalue(), "image/png"),
+               "mask_source": (None, "gt_oracle_edited")},
+    )
+    assert edited_response.status_code == 202
+    edited_job = edited_response.json()
+    assert edited_job["segmentation_review"]["source"] == "registered_dxf_gt_edited"
+    assert edited_job["segmentation_review"]["ground_truth_used"] is True
+    assert edited_job["segmentation_review"]["oracle_mask_conditioned"] is False
+    edited_model = read_model(context, edited_job)
+    assert edited_model["algorithm_version"] == "gt-assisted-human-reviewed-mask-v1"
+    assert edited_model["ground_truth_used"] is True
+    assert edited_model["manual_intervention"] is True

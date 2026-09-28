@@ -54,7 +54,7 @@
               <label class="tool-button" title="选择局部问题截图"><input id="feedback-file" type="file" accept=".jpg,.jpeg,.png,.webp">⌗ 反馈截图</label>
               <span class="drop-hint">可拖入文件，或按 Ctrl+V 粘贴截图</span>
             </div>
-              <div class="run-options"><label class="provider-picker">模型 <select id="provider-select" aria-label="在线模型"></select></label><label><input id="use-api" type="checkbox" checked> 在线 Agent</label><label><input id="use-segmentation" type="checkbox" checked> 深度分割</label><button id="stop-job" class="stop-job" type="button" hidden><span>■</span> 停止</button><button id="send" type="submit"><span class="send-label">运行</span><span class="send-arrow">➤</span><span class="send-spinner" aria-hidden="true"></span></button></div>
+              <div class="run-options"><label class="provider-picker">模型 <select id="provider-select" aria-label="在线模型"><option value="">正在加载模型…</option></select></label><label><input id="use-api" type="checkbox" checked> 在线 Agent</label><label><input id="use-segmentation" type="checkbox" checked> 深度分割</label><button id="stop-job" class="stop-job" type="button" hidden><span>■</span> 停止</button><button id="send" type="submit"><span class="send-label">运行</span><span class="send-arrow">➤</span><span class="send-spinner" aria-hidden="true"></span></button></div>
           </div>
         </div>
         <p id="composer-status" class="composer-status">首次运行：1 张工程图 + 1 个 OCR；二次修改：1 张局部截图。</p>
@@ -77,6 +77,7 @@
             <div class="review-tools">
               <button id="review-add" type="button" class="active">＋ 补全</button>
               <button id="review-erase" type="button">－ 擦除</button>
+              <label class="review-import">导入 GT DXF → 生成掩膜（仅实验）<input id="review-dxf-file" type="file" accept=".dxf,application/dxf"></label>
               <label>笔刷 <input id="review-brush" type="range" min="4" max="90" value="24"><output id="review-brush-value">24 px</output></label>
               <button id="review-undo" type="button">撤销</button>
               <button id="review-reset" type="button">恢复模型结果</button>

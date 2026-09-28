@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -5,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from contour_agent.config import Settings
+from contour_agent.config import ROOT, Settings
 from contour_agent.conversation_store import ConversationStore
 from contour_agent.server import create_app
 
@@ -41,6 +42,20 @@ def test_agent_page_and_conversation_api_are_local_and_persistent(tmp_path):
         assert [row["role"] for row in body["messages"]] == ["user", "assistant"]
         assert "source_image" not in str(body) and "source_ocr" not in str(body)
         assert client.get(f"/api/conversations/{conversation_id}").json()["memory"]["turn_count"] == 1
+
+
+def test_agent_assets_use_content_versions_and_disable_browser_cache(tmp_path):
+    app = create_app(Settings(runtime_root=tmp_path, api_key=""))
+    with TestClient(app) as client:
+        page = client.get("/agent")
+        assert page.status_code == 200
+        assert page.headers["cache-control"] == "no-store"
+        for asset in ("agent.css", "agent.js"):
+            digest = hashlib.sha256((ROOT / "web" / asset).read_bytes()).hexdigest()[:12]
+            assert f'/static/{asset}?v={digest}' in page.text
+            response = client.get(f"/static/{asset}?v={digest}")
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-store"
 
 
 def test_default_conversation_title_tracks_first_turn(tmp_path):

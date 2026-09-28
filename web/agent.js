@@ -9,7 +9,7 @@ const state = {
   providers: [], selectedProvider: "",
   welcome: null,
   zoom: {preview:{scale:1,offsetX:0,offsetY:0,key:""},review:{scale:1,offsetX:0,offsetY:0,key:""}},
-  review: {jobId:null,loading:false,loaded:false,tool:"add",brush:24,history:[],baseline:null,source:null,mask:null},
+  review: {jobId:null,loading:false,loaded:false,tool:"add",brush:24,history:[],baseline:null,source:null,mask:null,maskSource:"human_review"},
 };
 const busy = new Set(["queued", "extracting", "solving", "auditing"]);
 const clamp = (value,minimum,maximum) => Math.min(maximum,Math.max(minimum,value));
@@ -102,7 +102,7 @@ function node(tag, className, text) {
 async function loadBootstrap() {
   try {
     state.welcome=$("welcome");
-    const [config,catalog,rows]=await Promise.all([api("/api/config"),api("/api/catalog"),api("/api/conversations")]);
+    const config=await api("/api/config");
     $("connection-label").textContent="本地执行器在线";
     state.providers=config.providers||[];
     const providerSelect=$("provider-select");providerSelect.replaceChildren();
@@ -111,6 +111,7 @@ async function loadBootstrap() {
     state.selectedProvider=state.providers.some(row=>row.id===saved&&row.configured)?saved:fallback;providerSelect.value=state.selectedProvider;
     updateProviderSelection();
     $("use-segmentation").disabled=!config.segmentation_available;
+    const [catalog,rows]=await Promise.all([api("/api/catalog"),api("/api/conversations")]);
     const select=$("case-select");
     for(const item of catalog.cases.filter(row=>row.image&&row.ocr)){
       const option=document.createElement("option");option.value=item.id;option.textContent=item.id;select.append(option);
@@ -118,7 +119,14 @@ async function loadBootstrap() {
     state.conversations=rows.conversations||[];
     if(!state.conversations.length){ await createConversation(); }
     else { renderConversationList(); await openConversation(state.conversations[0].id); }
-  } catch(error) { $("connection-label").textContent="本地执行器不可用"; toast(error.message,true); }
+  } catch(error) {
+    $("connection-label").textContent="本地执行器不可用";
+    if(!state.providers.length){
+      $("provider-select").replaceChildren(new Option("模型加载失败，请刷新页面",""));
+      $("use-api").checked=false;$("use-api").disabled=true;
+    }
+    toast(error.message,true);
+  }
 }
 function updateProviderSelection(){
   const profile=state.providers.find(row=>row.id===$("provider-select").value)||state.providers.find(row=>row.id===state.selectedProvider);
@@ -296,7 +304,7 @@ function loadReviewImage(url){
   });
 }
 function setReviewControls(disabled){
-  for(const id of ["review-add","review-erase","review-brush","review-undo","review-reset","review-confirm"]){$(id).disabled=disabled;}
+  for(const id of ["review-add","review-erase","review-dxf-file","review-brush","review-undo","review-reset","review-confirm"]){$(id).disabled=disabled;}
   if(!disabled)$("review-undo").disabled=!state.review.history.length;
 }
 function drawSegmentationReview(){
@@ -312,14 +320,16 @@ async function initSegmentationEditor(job){
   const review=state.review;
   if(review.jobId===job.id&&(review.loaded||review.loading))return;
   const sourceUrl=safeUrl(job.source_image_url),maskUrl=safeUrl(job.artifacts?.segmentation_mask);
+  const oracleUrl=job.oracle_mask_import?.mask_sha256?safeUrl(job.artifacts?.oracle_generated_mask):null;
   if(!sourceUrl||!maskUrl)throw new Error("任务缺少可编辑的分割图或原图。");
-  review.jobId=job.id;review.loading=true;review.loaded=false;review.history=[];review.baseline=null;review.source=null;review.mask=null;
+  review.jobId=job.id;review.loading=true;review.loaded=false;review.history=[];review.baseline=null;review.source=null;review.mask=null;review.maskSource="human_review";
   state.zoom.review={scale:1,offsetX:0,offsetY:0,key:job.id};
   $("review-loading").hidden=false;$("review-loading").textContent="正在载入分割图…";$("review-status").textContent="正在准备像素级编辑器…";setReviewControls(true);
   try{
-    const version=encodeURIComponent(job.updated_at||Date.now()),[source,maskImage]=await Promise.all([
+    const version=encodeURIComponent(job.updated_at||Date.now()),[source,maskImage,oracleImage]=await Promise.all([
       loadReviewImage(`${sourceUrl}${sourceUrl.includes("?")?"&":"?"}v=${version}`),
       loadReviewImage(`${maskUrl}${maskUrl.includes("?")?"&":"?"}v=${version}`),
+      oracleUrl?loadReviewImage(`${oracleUrl}${oracleUrl.includes("?")?"&":"?"}v=${version}`):Promise.resolve(null),
     ]);
     if(state.review.jobId!==job.id)return;
     const mask=document.createElement("canvas");mask.width=maskImage.naturalWidth;mask.height=maskImage.naturalHeight;
@@ -329,7 +339,20 @@ async function initSegmentationEditor(job){
     context.putImageData(pixels,0,0);
     const canvas=$("review-canvas");canvas.width=mask.width;canvas.height=mask.height;
     review.source=source;review.mask=mask;review.baseline=context.getImageData(0,0,mask.width,mask.height);review.loaded=true;
-    $("review-loading").hidden=true;$("review-status").textContent="绿色为材料。Ctrl + 滚轮可在指针位置缩放；擦除标注线、剖面线和多余块，补全缺失区域。";setReviewControls(false);drawSegmentationReview();resetZoom("review",job.id);
+    if(oracleImage){
+      if(oracleImage.naturalWidth!==mask.width||oracleImage.naturalHeight!==mask.height)throw new Error("DXF派生掩膜尺寸与模型分割图不一致。");
+      context.clearRect(0,0,mask.width,mask.height);context.drawImage(oracleImage,0,0);
+      const oraclePixels=context.getImageData(0,0,mask.width,mask.height);
+      for(let index=0;index<oraclePixels.data.length;index+=4){
+        const foreground=oraclePixels.data[index]>=128;
+        oraclePixels.data[index]=27;oraclePixels.data[index+1]=190;oraclePixels.data[index+2]=142;oraclePixels.data[index+3]=foreground?255:0;
+      }
+      context.putImageData(oraclePixels,0,0);review.maskSource="gt_oracle";
+    }
+    $("review-loading").hidden=true;$("review-status").textContent=oracleImage?
+      "已从GT DXF生成掩膜；请检查绿色区域与原图是否对齐，确认后继续开发实验。":
+      "绿色为材料。Ctrl + 滚轮可在指针位置缩放；擦除标注线、剖面线和多余块，补全缺失区域。";
+    setReviewControls(false);drawSegmentationReview();resetZoom("review",job.id);
   }finally{review.loading=false;}
 }
 function setReviewTool(tool){
@@ -341,6 +364,10 @@ function reviewPoint(event){
 }
 function paintReview(from,to){
   const review=state.review;if(!review.loaded||!review.mask)return;
+  if(review.maskSource==="gt_oracle"){
+    review.maskSource="gt_oracle_edited";
+    $("review-status").textContent="GT派生掩膜已人工涂改；本次仍记录GT来源，并标记为人工修订。";
+  }
   const context=review.mask.getContext("2d",{willReadFrequently:true});
   context.save();context.globalCompositeOperation=review.tool==="erase"?"destination-out":"source-over";context.strokeStyle="#1bbe8e";context.fillStyle="#1bbe8e";
   context.lineWidth=review.brush;context.lineCap="round";context.lineJoin="round";context.beginPath();context.moveTo(from.x,from.y);context.lineTo(to.x,to.y);context.stroke();
@@ -357,20 +384,52 @@ function undoReview(){
   review.mask.getContext("2d",{willReadFrequently:true}).putImageData(item,0,0);$("review-undo").disabled=!review.history.length;drawSegmentationReview();
 }
 function resetReview(){
-  const review=state.review;if(!review.baseline||!review.mask)return;pushReviewHistory();review.mask.getContext("2d",{willReadFrequently:true}).putImageData(review.baseline,0,0);drawSegmentationReview();
+  const review=state.review;if(!review.baseline||!review.mask)return;pushReviewHistory();review.mask.getContext("2d",{willReadFrequently:true}).putImageData(review.baseline,0,0);review.maskSource="human_review";$("review-status").textContent="已恢复模型分割结果；可继续人工修正。";drawSegmentationReview();
+}
+async function importOracleReviewDxf(file){
+  const review=state.review;if(!file||!review.loaded||!review.mask)return;
+  if(!file.name.toLowerCase().endsWith(".dxf")||file.size>20_000_000){toast("请选择不超过20MB的GT DXF文件。",true);return;}
+  const jobId=review.jobId;
+  setReviewControls(true);$("review-status").textContent="正在读取GT DXF、与原图配准并生成材料掩膜…";
+  try{
+    const form=new FormData();form.append("dxf",file,file.name);
+    const job=await api(`/api/jobs/${encodeURIComponent(jobId)}/oracle-mask-from-dxf`,{method:"POST",body:form});
+    if(review.jobId!==jobId||!review.loaded)return;
+    const maskUrl=safeUrl(job.artifacts?.oracle_generated_mask);
+    if(!maskUrl)throw new Error("服务端未返回DXF派生掩膜。");
+    const image=await loadReviewImage(`${maskUrl}?v=${encodeURIComponent(job.updated_at||Date.now())}`);
+    if(image.naturalWidth!==review.mask.width||image.naturalHeight!==review.mask.height)throw new Error("生成的GT掩膜尺寸与当前分割图不一致。");
+    const canvas=document.createElement("canvas");canvas.width=review.mask.width;canvas.height=review.mask.height;
+    const context=canvas.getContext("2d",{willReadFrequently:true});context.drawImage(image,0,0);
+    const pixels=context.getImageData(0,0,canvas.width,canvas.height);let foreground=0;
+    for(let index=0;index<pixels.data.length;index+=4){
+      const value=pixels.data[index];
+      if(pixels.data[index+3]!==255||value!==pixels.data[index+1]||value!==pixels.data[index+2]||(value!==0&&value!==255))throw new Error("DXF生成的掩膜不是黑白二值图。");
+      pixels.data[index]=27;pixels.data[index+1]=190;pixels.data[index+2]=142;pixels.data[index+3]=value===255?255:0;
+      if(value===255)foreground++;
+    }
+    if(foreground<3||foreground>=canvas.width*canvas.height)throw new Error("DXF生成的掩膜没有有效的单一材料区域。");
+    review.mask.getContext("2d",{willReadFrequently:true}).putImageData(pixels,0,0);
+    review.history=[];review.maskSource="gt_oracle";$("review-undo").disabled=true;
+    state.currentJob=job;if(state.conversation?.jobs)state.conversation.jobs[job.id]=job;
+    $("review-status").textContent="已从GT DXF自动生成掩膜。请检查绿色区域与原图是否对齐；确认后作为开发实验输入继续构建。";
+    drawSegmentationReview();toast("GT DXF 已转换为掩膜，请检查后确认。");
+  }catch(error){$("review-status").textContent=error.message;toast(error.message,true);}
+  finally{$("review-dxf-file").value="";if(review.jobId===jobId&&review.loaded)setReviewControls(false);}
 }
 async function submitSegmentationReview(){
   const review=state.review;if(!review.loaded||!review.mask||!review.jobId)return;
-  setReviewControls(true);$("review-status").textContent="正在保存人工修订，并恢复参数化建模流水线…";
+  const maskSource=review.maskSource;
+  setReviewControls(true);$("review-status").textContent=maskSource==="gt_oracle"?"正在保存DXF派生GT掩膜并恢复建模流水线…":maskSource==="gt_oracle_edited"?"正在保存GT辅助人工修订并恢复建模流水线…":"正在保存人工修订，并恢复参数化建模流水线…";
   try{
     const output=document.createElement("canvas"),foreground=document.createElement("canvas");output.width=foreground.width=review.mask.width;output.height=foreground.height=review.mask.height;
     const white=foreground.getContext("2d");white.fillStyle="#fff";white.fillRect(0,0,foreground.width,foreground.height);white.globalCompositeOperation="destination-in";white.drawImage(review.mask,0,0);
     const context=output.getContext("2d");context.fillStyle="#000";context.fillRect(0,0,output.width,output.height);context.drawImage(foreground,0,0);
     const blob=await new Promise((resolve,reject)=>output.toBlob(value=>value?resolve(value):reject(new Error("无法编码审核掩膜。")),"image/png"));
-    const form=new FormData();form.append("mask",blob,"reviewed-segmentation-mask.png");
+    const form=new FormData();form.append("mask",blob,"reviewed-segmentation-mask.png");form.append("mask_source",maskSource);
     const job=await api(`/api/jobs/${encodeURIComponent(review.jobId)}/segmentation-review`,{method:"PUT",body:form});
     state.currentJob=job;if(state.conversation?.jobs)state.conversation.jobs[job.id]=job;
-    review.loaded=false;review.jobId=null;renderAll();startPolling();toast("分割已确认，正在继续拓扑与参数化构建。");
+    review.loaded=false;review.jobId=null;renderAll();startPolling();toast(maskSource==="gt_oracle"?"GT掩膜实验输入已记录，正在继续拓扑与参数化构建。":maskSource==="gt_oracle_edited"?"GT辅助人工修订已记录，正在继续构建。":"分割已确认，正在继续拓扑与参数化构建。");
   }catch(error){$("review-status").textContent=error.message;setReviewControls(false);toast(error.message,true);}
 }
 function renderWorkbench(){
@@ -516,6 +575,7 @@ $("preview-fit").onclick=()=>resetZoom("preview");
 $("review-fit").onclick=()=>resetZoom("review");
 $("review-add").onclick=()=>setReviewTool("add");
 $("review-erase").onclick=()=>setReviewTool("erase");
+$("review-dxf-file").onchange=event=>importOracleReviewDxf(event.target.files[0]);
 $("review-brush").oninput=event=>{state.review.brush=Number(event.target.value);$("review-brush-value").textContent=`${state.review.brush} px`;};
 $("review-undo").onclick=undoReview;
 $("review-reset").onclick=resetReview;

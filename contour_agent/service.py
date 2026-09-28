@@ -535,7 +535,47 @@ class AgentService:
         self._event(job, "segmentation_review", "分割图已生成；流水线暂停，等待人工添加、擦除并确认材料区域。")
         self._persist_if_active(job)
 
-    def submit_segmentation_review(self, job_id, content: bytes, *, asynchronous=True):
+    def import_oracle_dxf(self, job_id, content: bytes):
+        """Derive a reviewable GT mask without retaining or publishing DXF geometry."""
+        from .oracle_mask_import import generate_oracle_mask
+
+        with self.lock:
+            job = self.store.get(job_id)
+            if job.get("mode") != "autonomous_image" or job.get("status") != "awaiting_segmentation_review":
+                raise ValueError("该任务当前不在分割检查阶段。")
+            root = self.settings.runtime_root.resolve()
+            output = Path(job.get("artifact_directory", "")).resolve(strict=True)
+            predicted_path = output / "segmentation-mask.png"
+            if not output.is_relative_to(root) or not predicted_path.is_file():
+                raise ValueError("任务缺少原始模型分割掩膜。")
+            with Image.open(predicted_path) as image:
+                mask_size = image.size
+            image_path, ocr_path = Path(job["source_image"]), Path(job["source_ocr"])
+        pixels, receipt = generate_oracle_mask(content, image_path, ocr_path, predicted_path,
+                                               mask_size, temporary_root=root)
+        with self.lock:
+            job = self.store.get(job_id)
+            if job.get("status") != "awaiting_segmentation_review" or Path(job.get("artifact_directory", "")).resolve() != output:
+                raise ValueError("任务状态已变化，GT掩膜未导入。")
+            if digest(image_path) != receipt["source_image_sha256"] or digest(ocr_path) != receipt["source_ocr_sha256"]:
+                raise ValueError("导入期间原图或OCR发生变化，GT掩膜未导入。")
+            mask_path = output / "oracle-generated-mask.png"
+            temporary = output / "oracle-generated-mask.png.tmp"
+            temporary.write_bytes(pixels)
+            temporary.replace(mask_path)
+            receipt_path = output / "oracle-mask-import.json"
+            temporary_receipt = output / "oracle-mask-import.json.tmp"
+            temporary_receipt.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf8")
+            temporary_receipt.replace(receipt_path)
+            job["oracle_mask_import"] = receipt
+            self._publish_automatic_artifacts(job, output)
+            self._event(job, "oracle_mask_generated", "已从上传的GT DXF生成同尺寸掩膜；请检查叠加位置后确认。此项仅用于开发实验。")
+            self.store.save(job)
+            return self.public_job(job)
+
+    def submit_segmentation_review(self, job_id, content: bytes, *, source="human_review", asynchronous=True):
+        if source not in {"human_review", "gt_oracle", "gt_oracle_edited"}:
+            raise ValueError("未知掩膜来源；仅支持人工审核或声明的GT实验掩膜。")
         if not content or len(content) > 12_000_000:
             raise ValueError("审核掩膜必须是小于12MB的PNG图像。")
         with self.lock:
@@ -566,6 +606,19 @@ class AgentService:
             foreground = int(reviewed.sum())
             if foreground < 3 or foreground >= reviewed.size:
                 raise ValueError("审核掩膜必须保留有效且非满幅的材料区域。")
+            gt_derived = source in {"gt_oracle", "gt_oracle_edited"}
+            oracle_mask = source == "gt_oracle"
+            import_receipt = job.get("oracle_mask_import") or {}
+            if gt_derived:
+                generated_path = resolved / "oracle-generated-mask.png"
+                if (not generated_path.is_file() or import_receipt.get("mask_sha256") != digest(generated_path)
+                        or import_receipt.get("source_image_sha256") != digest(Path(job["source_image"]))
+                        or import_receipt.get("source_ocr_sha256") != digest(Path(job["source_ocr"]))):
+                    raise ValueError("必须先上传当前图纸对应的GT DXF并成功生成掩膜。")
+                with Image.open(generated_path) as generated_image:
+                    generated = np.asarray(generated_image.convert("L")) >= 128
+                if reviewed.shape != generated.shape or (oracle_mask and not np.array_equal(reviewed, generated)):
+                    raise ValueError("声明为原始GT的掩膜必须与服务端DXF生成的掩膜完全一致；人工涂改请标记为GT辅助修订。")
             model_mask = resolved / "model-segmentation-mask.png"
             model_overlay = resolved / "model-segmentation-overlay.png"
             if not model_mask.exists():
@@ -577,9 +630,9 @@ class AgentService:
             temporary = reviewed_mask.with_suffix(".png.tmp")
             Image.fromarray(reviewed.astype(np.uint8) * 255).save(temporary, format="PNG")
             temporary.replace(reviewed_mask)
-            with Image.open(job["source_image"]) as source:
-                source = source.convert("RGB").resize((reviewed.shape[1], reviewed.shape[0]), Image.Resampling.LANCZOS)
-                overlay = np.asarray(source).copy()
+            with Image.open(job["source_image"]) as source_image:
+                source_image = source_image.convert("RGB").resize((reviewed.shape[1], reviewed.shape[0]), Image.Resampling.LANCZOS)
+                overlay = np.asarray(source_image).copy()
             overlay[reviewed] = (overlay[reviewed] * .58 + np.asarray([45, 205, 159]) * .42).astype(np.uint8)
             reviewed_overlay = resolved / "reviewed-segmentation-overlay.png"
             Image.fromarray(overlay).save(reviewed_overlay, format="PNG")
@@ -589,20 +642,32 @@ class AgentService:
             removed = int((predicted & ~reviewed).sum())
             record = {
                 "schema_version": "job-segmentation-review-v1", "status": "approved",
-                "reviewed_at": now(), "reviewed": True, "ground_truth_used": False,
+                "reviewed_at": now(), "reviewed": not oracle_mask, "ground_truth_used": gt_derived,
+                "oracle_mask_conditioned": oracle_mask,
+                "source": "registered_dxf_gt" if oracle_mask else "registered_dxf_gt_edited" if gt_derived else "human_review",
+                "calibration_or_development": gt_derived, "held_out": False,
+                "ground_truth_dxf_coordinates_used_for_mask_creation": gt_derived,
+                "ground_truth_dxf_coordinates_used_for_prediction": False,
+                "ground_truth_dxf_coordinates_sent_to_provider": False,
+                "source_gt_sha256": import_receipt.get("source_gt_sha256") if gt_derived else None,
                 "model_mask_sha256": digest(model_mask), "reviewed_mask_sha256": digest(reviewed_mask),
                 "mask_size": {"width": reviewed.shape[1], "height": reviewed.shape[0]},
                 "model_foreground_pixels": int(predicted.sum()), "reviewed_foreground_pixels": foreground,
                 "added_pixels": added, "removed_pixels": removed,
-                "scope": "Human pixel-mask review only; does not certify dimensions or reference accuracy.",
+                "scope": ("GT-derived raster mask is a declared development input; it does not certify automatic segmentation, dimensions or independent reference accuracy."
+                          if gt_derived else "Human pixel-mask review only; does not certify dimensions or reference accuracy."),
             }
             (resolved / "segmentation-review.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf8")
             job["segmentation_review"] = {**record, "mask_path": str(reviewed_mask)}
-            job["manual_intervention"] = True
+            job["manual_intervention"] = not oracle_mask
+            job["ground_truth_used"] = gt_derived
+            job["oracle_mask_conditioned"] = oracle_mask
             job["status"] = "queued"
             job["solve_revision"] = int(job.get("solve_revision", 1)) + 1
             self._publish_automatic_artifacts(job, resolved)
-            self._event(job, "segmentation_approved", f"人工分割已确认：补全 {added} 像素，擦除 {removed} 像素；继续拓扑与参数化构建。")
+            self._event(job, "segmentation_approved", ("已导入GT派生掩膜作为开发测试输入；" if oracle_mask else
+                        "GT派生掩膜经人工修订；" if gt_derived else "人工分割已确认：")
+                        + f"补全 {added} 像素，擦除 {removed} 像素；继续拓扑与参数化构建。")
             self.store.save(job)
         if asynchronous:
             self._submit(job_id, self._automatic, job_id)
@@ -745,6 +810,8 @@ class AgentService:
                "segmentation_evidence":"segmentation.json","contour_overlay":"contour-overlay.png",
                "model_segmentation_mask":"model-segmentation-mask.png",
                "model_segmentation_overlay":"model-segmentation-overlay.png",
+               "oracle_generated_mask":"oracle-generated-mask.png",
+               "oracle_mask_import":"oracle-mask-import.json",
                "reviewed_segmentation_mask":"reviewed-segmentation-mask.png",
                "reviewed_segmentation_overlay":"reviewed-segmentation-overlay.png",
                "segmentation_review":"segmentation-review.json",

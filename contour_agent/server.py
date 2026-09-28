@@ -1,6 +1,7 @@
 """Local web workbench and persisted asynchronous job API."""
 from __future__ import annotations
 import json
+import hashlib
 import re
 import shutil
 import uuid
@@ -9,9 +10,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 from .config import ROOT, Settings, load_local_env
 from .dataset import resolve_inside
 from .geometry import template_schema
@@ -94,7 +96,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/agent", include_in_schema=False)
     def agent_workbench():
-        return FileResponse(ROOT / "web" / "agent.html", media_type="text/html", headers={"Cache-Control": "no-store"})
+        web = ROOT / "web"
+        html = (web / "agent.html").read_text(encoding="utf-8")
+        for asset in ("agent.css", "agent.js"):
+            digest = hashlib.sha256((web / asset).read_bytes()).hexdigest()[:12]
+            html = html.replace(f'/static/{asset}"', f'/static/{asset}?v={digest}"')
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     @app.get("/segmentation-results", include_in_schema=False)
     def segmentation_results():
@@ -223,12 +230,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job = service.store.get(job_id)
         return FileResponse(job["source_image"])
 
+    @app.post("/api/jobs/{job_id}/oracle-mask-from-dxf")
+    async def import_job_oracle_dxf(job_id: str, dxf: UploadFile = File(...)):
+        if not (dxf.filename or "").lower().endswith(".dxf"):
+            raise ValueError("请选择DXF文件以生成GT掩膜。")
+        from .oracle_mask_import import MAX_UPLOAD_BYTES
+        content = await dxf.read(MAX_UPLOAD_BYTES + 1)
+        if not content or len(content) > MAX_UPLOAD_BYTES:
+            raise ValueError("GT DXF 必须是非空且不超过20MB的文件。")
+        return await run_in_threadpool(service.import_oracle_dxf, job_id, content)
+
     @app.put("/api/jobs/{job_id}/segmentation-review", status_code=202)
-    async def approve_job_segmentation(job_id: str, mask: UploadFile = File(...)):
+    async def approve_job_segmentation(job_id: str, mask: UploadFile = File(...),
+                                       mask_source: str = Form("human_review")):
         if (mask.content_type or "").lower() != "image/png":
             raise ValueError("审核掩膜必须使用PNG格式。")
         content = await mask.read(12_000_001)
-        return service.public_job(service.submit_segmentation_review(job_id, content))
+        return service.public_job(service.submit_segmentation_review(job_id, content, source=mask_source))
 
     @app.get("/api/jobs/{job_id}/artifacts/{name}")
     def artifact(job_id: str, name: str):
@@ -242,7 +260,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "parametric-stage.json","parametric-solution.json","baseline-drawing.dxf","baseline-preview.svg",
                         "baseline-overlay.png","baseline-model.json","feedback-plan.json","feedback-screenshot.png",
                         "model-segmentation-mask.png","model-segmentation-overlay.png",
-                        "reviewed-segmentation-mask.png","reviewed-segmentation-overlay.png","segmentation-review.json"}:
+                        "reviewed-segmentation-mask.png","reviewed-segmentation-overlay.png","segmentation-review.json",
+                        "oracle-generated-mask.png","oracle-mask-import.json"}:
             raise HTTPException(404, "产物不存在。")
         job = service.store.get(job_id)
         directory = job.get("artifact_directory")
@@ -524,11 +543,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/static/agent.js", include_in_schema=False)
     def agent_javascript():
-        return FileResponse(web / "agent.js", media_type="text/javascript")
+        return FileResponse(web / "agent.js", media_type="text/javascript", headers={"Cache-Control": "no-store"})
 
     @app.get("/static/agent.css", include_in_schema=False)
     def agent_stylesheet():
-        return FileResponse(web / "agent.css", media_type="text/css")
+        return FileResponse(web / "agent.css", media_type="text/css", headers={"Cache-Control": "no-store"})
 
     app.mount("/static", StaticFiles(directory=web), name="static")
 
