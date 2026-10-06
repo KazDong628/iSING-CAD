@@ -15,6 +15,7 @@ import argparse
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -79,10 +80,14 @@ def _providers(online: bool, provider_profile: str | None, *, anthropic_thinking
 def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
                          manifest_path: str | Path = ROOT / "runtime/segmentation/gt-data-v3/manifest.json",
                          online: bool = False, provider_profile: str | None = None,
-                         evaluate: bool = False, anthropic_thinking: str | None = None) -> dict:
+                         evaluate: bool = False, anthropic_thinking: str | None = None,
+                         evaluation_target_tolerance_mm: float = .1) -> dict:
     """Create a new immutable run and preserve stage/artifact evidence on failure."""
     if anthropic_thinking not in (None, "disabled"):
         raise ValueError("--anthropic-thinking accepts only disabled")
+    if (type(evaluation_target_tolerance_mm) not in (int, float) or
+            not math.isfinite(evaluation_target_tolerance_mm) or evaluation_target_tolerance_mm <= 0):
+        raise ValueError("evaluation_target_tolerance_mm_must_be_finite_positive")
     if anthropic_thinking is not None and not online:
         raise ValueError("--anthropic-thinking requires --online with an Anthropic provider")
     run = Path(run_dir).resolve()
@@ -96,6 +101,8 @@ def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
              "case_id": case_id, "oracle_mask_conditioned": True,
              "calibration_or_development": True, "held_out": False,
              "online_requested": bool(online), "post_export_evaluation_requested": bool(evaluate),
+             "evaluation_target_tolerance_mm": float(evaluation_target_tolerance_mm),
+             "frozen_strict_evaluation_tolerance_mm": .1,
              "ground_truth_coordinates_sent_to_provider": False,
              "ground_truth_dxf_used_as_prediction_geometry": False,
              "status": "initializing", "last_stage": "initializing", "stage_history": []}
@@ -172,7 +179,13 @@ def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
         state["parameterization_status"] = stage.get("status")
         state["parameterization_accepted"] = bool(stage.get("accepted"))
         state["prediction_artifact"] = "after/drawing.dxf" if (after / "drawing.dxf").is_file() else None
-        state["status"] = "completed" if stage.get("accepted") else "completed_with_retained_draft"
+        publication=stage.get("publication") or {}
+        subset_published=(stage.get("constraint_subset_accepted") is True and
+                          publication.get("status")=="committed" and publication.get("kind")=="parametric")
+        state["constraint_subset_published"]=subset_published
+        state["status"] = ("completed" if stage.get("accepted") else
+                           "completed_with_unresolved_radii" if subset_published else
+                           "completed_with_retained_draft")
         state["prediction_completed_at"] = _stamp()
         checkpoint("prediction_finished", "预测产物已冻结；GT 比较只能在此后单独执行。")
 
@@ -181,7 +194,9 @@ def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
             # The comparator may open GT for independent post-export scoring;
             # its result has no path back to any provider call in this run.
             from scripts.evaluate_oracle_mask_run import evaluate_oracle_mask_run
-            evaluation = evaluate_oracle_mask_run(run, case_id=case_id)
+            evaluation_options = ({"target_tolerance_mm": float(evaluation_target_tolerance_mm)}
+                                  if evaluation_target_tolerance_mm != .1 else {})
+            evaluation = evaluate_oracle_mask_run(run, case_id=case_id, **evaluation_options)
             state["evaluation_status"] = evaluation.get("status")
             state["evaluation_summary"] = "evaluation/summary.json"
             checkpoint("post_export_evaluation_finished")
@@ -212,10 +227,13 @@ def main() -> None:
     parser.add_argument("--anthropic-thinking", choices=("disabled",),
                         help="Request disabled thinking for an online Anthropic provider; adapter compliance is not assumed.")
     parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--evaluation-target-mm", type=float, default=.1,
+                        help="Additional post-export target (e.g. 1 mm); never changes source gates or exact R constraints.")
     args = parser.parse_args()
     result = run_oracle_mask_case(args.case_id, args.run_dir, manifest_path=args.manifest,
                                   online=args.online, provider_profile=args.provider_profile,
-                                  evaluate=args.evaluate, anthropic_thinking=args.anthropic_thinking)
+                                  evaluate=args.evaluate, anthropic_thinking=args.anthropic_thinking,
+                                  evaluation_target_tolerance_mm=args.evaluation_target_mm)
     print(json.dumps({"run_dir": str(result["run_dir"]), "status": result["state"]["status"],
                       "prediction": str(result["prediction"]),
                       "evaluation_status": result["state"].get("evaluation_status")}, ensure_ascii=False), flush=True)

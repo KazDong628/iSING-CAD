@@ -21,6 +21,23 @@ def _operation(action, ids, record_id=None):
     return {"action": action, "entity_ids": ids, "record_id": record_id, "evidence_tags": ["source_boundary"]}
 
 
+def test_rejected_source_diagnostics_are_visible_without_coordinates_or_private_data():
+    feedback={"previous_operations":[{**_operation("split_chain_at_source_features",["g001"],"r003"),
+        "status":"rejected","reason":"source_stroke_support_degraded",
+        "source_validation":{"source_evidence":{"baseline_stroke_support":{"stroke_supported_fraction":.9},
+                                                   "proposal_stroke_support":{"stroke_supported_fraction":.84}},
+                             "private_response":"never-send"},
+        "local_source_diagnostics":{"entities":[{"entity_id":"historical-g9","record_id":"r003",
+            "stroke_supported_fraction":.67,"start":[123.,456.],
+            "quarters":[{"quarter":1,"stroke_supported_fraction":.2},
+                        {"quarter":4,"stroke_supported_fraction":.99}]}]}}]}
+    result=bounded_iteration_feedback(feedback,_graph(),{"r003"})
+    row=result["previous_operations"][0]
+    assert row["source_support"]=={"baseline_support":.9,"candidate_support":.84}
+    assert row["local_source_support"][0]["quarters"][0]=={"quarter":1,"support":.2}
+    assert "never-send" not in json.dumps(result) and "123" not in json.dumps(result)
+
+
 @pytest.mark.parametrize("action,ids,record_id", [
     ("refit_entity_as_line", ["g001"], None),
     ("split_chain_at_source_features", ["g004", "g000"], None),
@@ -193,3 +210,58 @@ def test_evaluator_reserves_admissible_base_within_five_candidate_budget(monkeyp
     assert packet["candidate_order"][0] == "cand-0"
     assert len(packet["candidate_order"]) == 5
     assert len(packet["candidate_image_order"]) == 5
+
+
+def test_post_solve_radius_drift_feedback_is_bounded_and_not_a_verified_binding():
+    from contour_agent.topology_edit_provider import bounded_iteration_feedback
+    feedback = {"previous_operations": [{"action": "refit_chain_as_annotated_arc",
+        "entity_ids": ["g000"], "source_validation": {"passed": False,
+            "before": {"stroke_supported_fraction": .83}, "after": {"stroke_supported_fraction": .84},
+            "constructed_radius_preservation": [
+                {"entity_id": "g000", "record_id": "r008", "nominal": 15., "actual_radius": 15.185,
+                 "absolute_residual": .185, "passed": False, "private": "do not send"},
+                {"entity_id": "g001", "record_id": "unknown", "passed": False, "nominal": 1e8}]}}]}
+    result = bounded_iteration_feedback(feedback, _graph(), {"r008"})
+    row = result["previous_operations"][0]
+    assert row["source_support"] == {"baseline_support": .83, "candidate_support": .84}
+    drift = row["constructed_radius_preservation_failures"]
+    assert len(drift) == 1 and drift[0]["record_id"] == "r008"
+    assert drift[0]["binding_verified"] is False and drift[0]["actual_radius"] == 15.185
+    assert "do not send" not in json.dumps(result)
+
+
+def test_current_bound_radius_interval_failure_sends_scalar_evidence_without_points():
+    feedback={"issues":[{"code":"bound_radius_source_interval_failed","entity_id":"g000",
+        "record_id":"r005","binding_verified":True,"bound_record_ids":["r005","unknown"],
+        "source_max_deviation_px":6.427586,"original_deviation_budget_px":3.792406,
+        "source_failed_quarters":[1,2,9],"private":"never-send"}],
+        "source_mask_diagnostics":{"geometry_stage":"rejected_solver_candidate","entities":[
+            {"entity_id":"g000","conservative_max_deviation_px":6.427586,
+             "exceeds_original_budget":True,"failed_quarters":[1,2],
+             "worst_source_point_px":[1042.451,1614.27],"private":"never-send"},
+            {"entity_id":"historical-g019","conservative_max_deviation_px":7.}]}}
+    result=bounded_iteration_feedback(feedback,_graph(),{"r005"})
+    issue=result["issues"][0]
+    assert issue["binding_verified"] and issue["bound_record_ids"]==["r005"]
+    assert issue["source_failed_quarters"]==[1,2]
+    assert result["source_intervals"]==[{"entity_id":"g000","conservative_max_deviation_px":6.427586,
+        "exceeds_original_budget":True,"failed_quarters":[1,2]}]
+    serialized=json.dumps(result)
+    assert "1042" not in serialized and "never-send" not in serialized and "historical-g019" not in serialized
+
+
+def test_editor_parent_remaining_timeout_caps_one_network_request(monkeypatch,tmp_path):
+    image=tmp_path/"source.png"
+    Image.new("RGB",(64,64),"white").save(image)
+    async def handler(request):
+        await asyncio.sleep(1)
+        return httpx.Response(200,json={})
+    original=httpx.AsyncClient
+    monkeypatch.setattr("contour_agent.topology_edit_provider.httpx.AsyncClient",
+        lambda **kwargs:original(**kwargs,transport=httpx.MockTransport(handler)))
+    started=time.monotonic()
+    receipt=TopologyEditProvider(Settings(api_key="test-key",api_timeout=600)).propose(
+        image,image,{"id":"base","graph":_graph()},[],request_timeout_seconds=.04)
+    assert time.monotonic()-started<.5
+    assert receipt["total_timeout_seconds"]==.04 and receipt["network_requests"]==1
+    assert receipt["error_code"]=="timeout"

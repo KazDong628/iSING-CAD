@@ -323,8 +323,12 @@ def _error_localization(predicted, reference, step):
     return output
 
 
-def compare_dxf_entities(prediction, reference):
-    """Audit two finished files and retain the frozen 0.1 mm physical scorer."""
+def compare_dxf_entities(prediction, reference, *, additional_parameter_tolerances_mm=()):
+    """Keep the frozen score and optionally add explicitly labelled diagnostics."""
+    tolerances = tuple(additional_parameter_tolerances_mm)
+    if len(tolerances) > 4 or any(type(t) not in (int, float) or not math.isfinite(t) or t <= 0 for t in tolerances):
+        raise ValueError("additional_parameter_tolerances_must_be_finite_positive_and_bounded")
+    tolerances = sorted(set(float(t) for t in tolerances if float(t) != .1))
     pa = audit_dxf(prediction, prefix="p"); ra = audit_dxf(reference, prefix="r")
     pc, _ = _curves(Path(prediction)); rc, _ = _curves(Path(reference))
     physical = evaluate_autonomous_artifact(Path(prediction), Path(reference))
@@ -347,6 +351,7 @@ def compare_dxf_entities(prediction, reference):
         alignment = {"kind": "D4_translation_shape_diagnostic", "coordinate_unit": "mm",
                      "transform": transform, "scale_fitted": False, "engineering_verified": False}
         correspondence = _correspondence(aligned, rc)
+        supplemental = [_correspondence(aligned, rc, tolerance) for tolerance in tolerances]
         localization = _error_localization(aligned, rc, physical["sample_step_mm"])
         visual = {"prediction": _visual_curves(aligned), "reference": _visual_curves(rc)}
         aligned_entities = [_entity(curve, index, "p", "mm") for index, curve in enumerate(aligned)]
@@ -361,11 +366,13 @@ def compare_dxf_entities(prediction, reference):
         else: visual = {"prediction": [], "reference": []}
         correspondence = {"status": "not_computed", "reason": alignment["reason"], "rows": [], "counts": {},
                           "one_to_many_fragment_candidates": {}, "unmatched_reference_ids": [f"r{i:04d}" for i in range(len(rc))]}
+        supplemental = [{**correspondence, "parameter_tolerance_mm": tolerance} for tolerance in tolerances]
         aligned_entities = []
         localization = {"status": "not_computed", "reason": "Physical units or registration are unavailable; no mm localization is manufactured."}
     return {"schema_version": "dxf-entity-comparison-v1", "prediction": pa, "reference": ra,
             "physical_units_available": available, "physical_score": physical, "alignment": alignment,
             "entity_correspondence": correspondence, "aligned_prediction_entities": aligned_entities,
+            "supplemental_entity_correspondence": supplemental,
             "error_localization": localization,
             "visualization": visual, "engineering_verified": False,
             "limitations": ["Entity count differences can indicate fragmentation, omitted design primitives or extra geometry; counts alone cannot identify which.",

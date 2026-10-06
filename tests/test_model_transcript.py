@@ -187,3 +187,106 @@ def test_local_iterations_and_constraint_residuals_are_visible_without_online_re
     assert result["parameterization"]["feedback"]["issues"][0]["record_id"] == "r009"
     assert result["parameterization"]["reference_verified"] is False
     assert "DO-NOT-EXPOSE" not in json.dumps(result)
+
+
+def test_radius_target_stage_exposes_only_valid_source_points_and_record_ids(tmp_path):
+    output = tmp_path / "jobs" / "radius-targets"
+    output.mkdir(parents=True)
+    (output / "radius-targets.json").write_text(json.dumps({
+        "status": "succeeded", "network_requests": 1, "http_success": True,
+        "schema_success": True, "model": "source-agent", "elapsed_seconds": 2.4,
+        "proposals": [
+            {"record_id": "r003", "tip_px": [140.5, 260.], "shaft_px": [150., 200.],
+             "private_prompt": "DO-NOT-EXPOSE", "evidence": {"api_key": "DO-NOT-EXPOSE"}},
+            {"record_id": "r004", "tip_px": [{"secret": "DO-NOT-EXPOSE"}, 3], "shaft_px": [1, 2]},
+            {"record_id": "r005", "tip_px": [True, 3], "shaft_px": [1, 2]}],
+        "unknown_record_ids": ["r004", {"secret": "DO-NOT-EXPOSE"}],
+        "omitted_record_ids": ["r016"], "response_text": "DO-NOT-EXPOSE",
+        "input_images": [{"payload": "DO-NOT-EXPOSE"}], "arrowheads_verified": True,
+    }), encoding="utf8")
+    result = build_model_transcript({"id": "r" * 32, "artifact_directory": str(output)}, tmp_path)
+    assert [stage["id"] for stage in result["stages"]] == ["radius_targets"]
+    stage = result["stages"][0]
+    assert stage["label"] == "半径箭头定位"
+    assert stage["transport"]["elapsed_seconds"] == 2.4
+    assert stage["answer"]["proposals"] == [
+        {"record_id": "r003", "tip_px": [140.5, 260.], "shaft_px": [150., 200.]}]
+    assert stage["answer"]["unknown_record_ids"] == ["r004"]
+    assert stage["answer"]["omitted_record_ids"] == ["r016"]
+    assert not stage["answer"]["arrowheads_verified"]
+    assert not stage["answer"]["missing_arrow_detection_is_exemption"]
+    assert "DO-NOT-EXPOSE" not in json.dumps(result)
+
+
+def test_radius_audit_distinguishes_subset_acceptance_coverage_and_dxf_readback(tmp_path):
+    output = tmp_path / "jobs" / "radius-audit"
+    output.mkdir(parents=True)
+    documents = {
+        "parametric-solution.json": {"status": "accepted", "accepted": True, "constraints": []},
+        "parametric-stage.json": {"status": "completed_with_unresolved_radii", "accepted": False,
+                                  "constraint_subset_accepted": True, "all_dimensions_verified": False},
+        "radius-contract.json": {
+            "satisfied": False, "all_annotated_radii_verified": False,
+            "current_dxf_verified": True, "publication_status": "committed",
+            "reasons": ["radius_arrow_detection_unresolved"],
+            "coverage": {"recognized_count": 3, "required_count": 2, "bound_count": 1,
+                         "unresolved_count": 2, "ambiguous_count": 1,
+                         "recognized_radius_records": ["r001", "r002", "r003"],
+                         "confirmed_arrow_records": ["r001", "r002"], "unknown_arrow_records": ["r003"],
+                         "all_radius_records_resolved": False, "all_confirmed_arrows_bound": False,
+                         "required_mappings": [{"source_evidence": {"secret": "DO-NOT-EXPOSE"}}],
+                         "unresolved": [{"record_id": "r003", "nominal": 40., "reason": "source_arrow_not_verified",
+                                         "candidate_entity_ids": ["g003"], "private_reasoning": "DO-NOT-EXPOSE"}]},
+            "exact_radius_validation": {"required_count": 1, "passed": True, "dxf_readback_performed": False,
+                                        "checks": [{"record_id": "r001", "entity_id": "g001", "nominal": 3.,
+                                                    "actual": 3., "dxf_radius": None, "tolerance": 0., "passed": True}]}},
+        "validation.json": {"exact_radius_validation": {
+            "mode": "exact_native_arc_radius", "required_count": 1, "passed": False, "dxf_readback_performed": True,
+            "checks": [{"record_id": "r001", "entity_id": "g001", "nominal": 3., "actual": 3.,
+                        "dxf_radius": 3.01, "absolute_residual": 0., "tolerance": 0., "enforcement": "exact",
+                        "passed": False, "nested": {"secret": "DO-NOT-EXPOSE"}}]}}
+    }
+    for name, document in documents.items():
+        (output / name).write_text(json.dumps(document), encoding="utf8")
+    result = build_model_transcript({"id": "s" * 32, "artifact_directory": str(output)}, tmp_path)
+    audit = result["parameterization"]
+    assert audit["constraint_subset_accepted"] and audit["accepted"]
+    assert not audit["pipeline_accepted"] and not audit["all_dimensions_verified"]
+    assert audit["pipeline_status"] == "completed_with_unresolved_radii"
+    contract = audit["radius_contract"]
+    assert not contract["satisfied"] and not contract["missing_arrow_detection_is_exemption"]
+    assert contract["coverage"]["recognized_count"] == 3
+    assert contract["coverage"]["confirmed_count"] == 2
+    assert contract["coverage"]["bound_count"] == 1
+    assert contract["coverage"]["unknown_count"] == 1 and contract["coverage"]["ambiguous_count"] == 1
+    exact = contract["exact_radius_validation"]
+    assert exact["dxf_readback_performed"] and not exact["passed"]
+    assert exact["checks"][0]["value"] == exact["checks"][0]["actual"] == 3.
+    assert exact["checks"][0]["dxf_radius"] == 3.01 and exact["checks"][0]["tolerance"] == 0.
+    assert "DO-NOT-EXPOSE" not in json.dumps(result)
+
+
+def test_candidate_radius_readback_cannot_certify_retained_dxf():
+    from contour_agent.model_transcript import _public_radius_contract
+    contract={"satisfied":False,"candidate_satisfied":True,"current_dxf_verified":False,
+              "publication_status":"rolled_back","exact_radius_validation":{
+                  "passed":True,"dxf_readback_performed":True,"required_count":1,"checks":[]}}
+    public=_public_radius_contract(contract,{}, {"exact_radius_validation":{
+        "passed":True,"dxf_readback_performed":True,"required_count":0,"checks":[]}})
+    assert public["current_dxf_verified"] is False and public["candidate_satisfied"] is True
+    assert public["publication_status"]=="rolled_back" and public["satisfied"] is False
+    assert public["exact_radius_validation"]["required_count"]==1
+
+
+def test_radius_contract_without_solver_receipt_does_not_claim_subset_acceptance(tmp_path):
+    output = tmp_path / "jobs" / "radius-only"
+    output.mkdir(parents=True)
+    (output / "radius-contract.json").write_text(json.dumps({
+        "satisfied": False, "coverage": {"recognized_count": 1, "unknown_arrow_records": ["r001"],
+                                          "recognized_radius_records": ["r001"], "confirmed_arrow_records": [],
+                                          "bound_count": 0, "ambiguous_count": 0}}), encoding="utf8")
+    result = build_model_transcript({"id": "t" * 32, "artifact_directory": str(output)}, tmp_path)
+    audit = result["parameterization"]
+    assert not audit["constraint_subset_accepted"] and not audit["pipeline_accepted"]
+    assert audit["radius_contract"]["coverage"]["unknown_count"] == 1
+    assert audit["radius_contract"]["exact_radius_validation"]["dxf_readback_performed"] is None

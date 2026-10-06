@@ -125,3 +125,43 @@ def test_unitless_area_is_not_mislabeled_square_millimetres(tmp_path):
     path = tmp_path / "unknown.dxf"
     _rectangle(path, units=0)
     assert _single_cycle_area(audit_dxf(path)) == {"status": "unknown_units", "area_mm2": None}
+
+
+def test_one_mm_target_keeps_strict_failure_and_separates_shape_from_reconstruction(tmp_path):
+    run, dataset = _fixture(tmp_path)
+    path = run / "after" / "drawing.dxf"
+    document = ezdxf.readfile(path)
+    # Change shape, not just an origin that registration can remove.
+    for entity in document.modelspace():
+        for name in ("start", "end"):
+            point = getattr(entity.dxf, name)
+            if point.x > 105:
+                setattr(entity.dxf, name, (point.x + .6, point.y, 0))
+    document.saveas(path)
+    report = evaluate_oracle_mask_run(run, dataset_root=dataset, target_tolerance_mm=1.)
+    target = report["target_acceptance"]
+    assert not report["checks"]["registered_shape_within_0_1mm"]
+    assert target["checks"]["registered_shape_within_target"]
+    assert target["primitive_matching"]["matched_count"] == 4
+    assert report["primitive_matching"]["matched_count"] < 4
+    assert not target["all_requested_checks_passed"]
+    assert not target["checks"]["all_annotated_radii_exact_in_current_dxf"]
+    assert target["annotated_radius_tolerance_mm"] == 0.
+
+
+def test_one_mm_target_does_not_hide_object_fragmentation(tmp_path):
+    run, dataset = _fixture(tmp_path, split=True)
+    report = evaluate_oracle_mask_run(run, dataset_root=dataset, target_tolerance_mm=1.)
+    checks = report["target_acceptance"]["checks"]
+    assert checks["registered_shape_within_target"]
+    assert not checks["filtered_object_types_and_counts_equal"]
+    assert not checks["complete_primitive_parameters_match"]
+    assert not report["target_acceptance"]["all_requested_checks_passed"]
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("nan"), float("inf")])
+def test_invalid_target_rejected_before_any_reference_read(tmp_path, monkeypatch, value):
+    monkeypatch.setattr("scripts.evaluate_oracle_mask_run.build_catalog",
+                        lambda _: pytest.fail("invalid target must not read GT"))
+    with pytest.raises(ValueError, match="finite_positive"):
+        evaluate_oracle_mask_run(tmp_path / "absent", target_tolerance_mm=value)

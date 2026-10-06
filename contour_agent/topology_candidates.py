@@ -20,9 +20,12 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from .constraint_binding import (_arrowhead_evidence, _label_ray_entry,
-                                 _leader_contour_visibility, _leaders)
+                                 _leader_contour_visibility, _leaders,
+                                 verify_source_arrow_proposal)
 from .ocr import canonical_records
-from .topology import _StrokeEvidence, _primitive_distance, _relations
+from .source_arrow_localization import (localize_source_arrow_proposal,
+    native_radius_leader_segments, verify_source_hough_leader, source_label_shaft_ownership)
+from .topology import _StrokeEvidence, _primitive_distance, _relations, stroke_support_fraction
 from .vectorize import _closed_ring, _sample_entities, assess_fit_quality, fit_polyline
 
 
@@ -189,7 +192,28 @@ def _annotation_inventory(gray, records, ring, grid):
         low, high = box.min(axis=0), box.max(axis=0)
         band = max(4., 2*grid)
         options = []
-        for line_index, segment in enumerate(lines):
+        # A multimodal pixel location is a hypothesis only. Recheck original
+        # pixels and the label/shaft path before it can become arrow evidence.
+        proposals = row.get("source_arrow_proposals")
+        proposals = proposals[:2] if isinstance(proposals, list) else []
+        item["source_arrow_proposal_count"] = len(proposals)
+        item["locally_verified_source_arrow_proposal_count"] = 0
+        for proposal_index, proposal in enumerate(proposals):
+            evidence = localize_source_arrow_proposal(gray, row, proposal, ring, band, contours=[ring],
+                                                     verifier=verify_source_arrow_proposal)
+            if evidence is None:
+                continue
+            target_gap, contour_index = tree.query(np.asarray(evidence["arrowhead"]["tip_px"], float))
+            evidence = {**evidence, "leader_id": f"source-proposal-{proposal_index:02d}",
+                        "target_source_px": ring[int(contour_index)].tolist(),
+                        "boundary_endpoint_gap_px": float(target_gap),
+                        "arrow_tip_to_boundary_gap_px": float(target_gap),
+                        "directed_verification_issues": [], "status": "directed_arrow_candidate"}
+            options.append(((False, float(evidence["score"])), evidence))
+            item["locally_verified_source_arrow_proposal_count"] += 1
+        native_lines = native_radius_leader_segments(gray, row, records)
+        for line_index, segment in enumerate(lines + native_lines):
+            native_line = line_index >= len(lines)
             for label_end, target_end in (segment, segment[::-1]):
                 label_gap = _point_box_gap(label_end, box)
                 target_gap, contour_index = tree.query(target_end)
@@ -205,6 +229,7 @@ def _annotation_inventory(gray, records, ring, grid):
                 arrow = None
                 visibility = None
                 arrow_gap = None
+                ownership = None
                 if ray_gap is None:
                     reasons.append("label_ray_misses_source_box")
                 else:
@@ -212,6 +237,9 @@ def _annotation_inventory(gray, records, ring, grid):
                     if arrow is None:
                         reasons.append("source_arrowhead_not_verified")
                     else:
+                        ownership = source_label_shaft_ownership(gray, row, arrow["tip_px"], unit)
+                        if ownership["repetitive_label_crossing"]:
+                            reasons.append(ownership["reason"])
                         arrow_gap, arrow_index = tree.query(np.asarray(arrow["tip_px"],float))
                         if arrow_gap > max(10.,band*1.7):
                             reasons.append("arrow_tip_misses_material_boundary")
@@ -219,6 +247,24 @@ def _annotation_inventory(gray, records, ring, grid):
                                                                 arrow["tip_px"],[ring],band)
                         if not visibility["verified"]:
                             reasons.append("earlier_source_contour_intersection")
+                # Full-resolution short strokes and contour-crossing shafts
+                # require the same complete source proof as model proposals.
+                # A detected taper alone still cannot promote hatch strokes.
+                if native_line or reasons == ["earlier_source_contour_intersection"]:
+                    full = verify_source_hough_leader(gray, row, [label_end, target_end], ring, band,
+                                                     [ring], verifier=verify_source_arrow_proposal)
+                    if full is not None:
+                        target_gap, contour_index = tree.query(np.asarray(full["arrowhead"]["tip_px"], float))
+                        options.append(((False, float(full["score"])), {
+                            **full, "leader_id": f"line{line_index:03d}",
+                            "detection_resolution": "native_local" if native_line else "global_scaled",
+                            "target_source_px": ring[int(contour_index)].tolist(),
+                            "boundary_endpoint_gap_px": float(target_gap),
+                            "arrow_tip_to_boundary_gap_px": float(target_gap),
+                            "directed_verification_issues": [], "status": "directed_arrow_candidate"}))
+                        continue
+                    if native_line:
+                        continue
                 verified = bool(arrow and not reasons)
                 if verified:
                     contour_index = int(arrow_index)
@@ -233,6 +279,7 @@ def _annotation_inventory(gray, records, ring, grid):
                     "label_ray_intersection_gap_px": ray_gap,
                     "arrow_tip_to_boundary_gap_px": None if arrow_gap is None else float(arrow_gap),
                     "contour_visibility": visibility,
+                    "source_label_association": ownership,
                     "directed_verification_issues": reasons,
                     "arrowhead_verified": verified, "arrowhead": arrow if verified else None,
                     "unverified_arrowhead_hypothesis": arrow if not verified else None,
@@ -319,6 +366,20 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
             center = source_to_design(np.asarray([source_entity["center"]], float))[0]
             # Affine transforms in this project are rigid scale/reflection maps.
             radius = float(np.linalg.norm(start-center))
+            binding = source_entity.get("radius_binding")
+            if binding and base_graph.get("units") == "mm":
+                nominal = binding.get("nominal")
+                if (isinstance(nominal, bool) or not isinstance(nominal, (int, float)) or
+                        not math.isfinite(nominal) or nominal <= 0):
+                    raise ValueError("invalid_constructed_radius_nominal")
+                # Preserve the declared exact constant through a scale/rigid
+                # round trip, only after both endpoints prove circle incidence.
+                # This numerical roundoff check is not a dimension tolerance.
+                incidence = max(abs(float(np.linalg.norm(point-center))-nominal)
+                                for point in (start, end))
+                if incidence > 1e-8 * max(1., nominal):
+                    raise ValueError("constructed_radius_incidence_failed")
+                radius = float(nominal)
             entity.update(center=center.tolist(), radius=radius,
                           clockwise=not bool(source_entity["clockwise"]) if reflected else bool(source_entity["clockwise"]))
             if source_entity.get("radius_annotation_evidence"):
@@ -454,10 +515,25 @@ def generate_topology_candidates(image_path, document, baseline_model, base_grap
     if not math.isfinite(grid) or grid <= 0:
         raise ValueError("Base topology requires a positive source_grid_pitch_px")
     design_to_source, source_to_design, orientation_det = _affines(base_graph, baseline_model)
-    ring = _base_source_ring(base_graph, design_to_source, grid)
+    raw_boundary = (baseline_model.get("extraction") or {}).get("raw_polyline_px")
+    if raw_boundary is not None:
+        # Re-fitting an already approximated CAD irreversibly hides small
+        # annotated corners. Candidate construction must see the immutable
+        # segmentation observation; the first candidate still preserves CAD.
+        ring = _closed_ring(raw_boundary)
+        if len(ring) > 30000 or not np.isfinite(ring).all():
+            raise ValueError("Invalid immutable source mask boundary")
+        from shapely.geometry import Polygon
+        if not Polygon(ring).is_valid or Polygon(ring).area <= 0:
+            raise ValueError("Invalid immutable source mask boundary")
+        observation_source = "initial_extraction_raw_polyline_px"
+    else:
+        ring = _base_source_ring(base_graph, design_to_source, grid)
+        observation_source = "base_cad_samples_no_raw_observation_available"
     base_source_entities = _base_source_entities(base_graph, design_to_source, orientation_det)
     records = canonical_records(document)
     inventory, inventory_summary = _annotation_inventory(gray, records, ring, grid)
+    inventory_summary["boundary_observation_source"] = observation_source
     stroke = _StrokeEvidence(gray, records, grid)
     parent_hash = _json_hash(base_graph)
     candidates = []
@@ -492,7 +568,7 @@ def generate_topology_candidates(image_path, document, baseline_model, base_grap
             before_support = graph["source_evidence"]["baseline_stroke_support"]
             after_support = graph["source_evidence"]["proposal_stroke_support"]
             support_gate = bool(
-                float(after_support["edge_supported_fraction"]) >= float(before_support["edge_supported_fraction"])-.035 and
+                stroke_support_fraction(after_support,against=before_support) >= stroke_support_fraction(before_support,against=after_support)-.035 and
                 float(after_support["p90_edge_distance_px"]) <= float(before_support["p90_edge_distance_px"])+grid)
             planning_penalty = (counts["total"]/max(1, len(base_graph.get("entities", []))) +
                                 deviation["conservative_upper_bound_px"]/max(grid, 1e-6) +

@@ -35,6 +35,15 @@ def digest(path: Path):
             h.update(chunk)
     return h.hexdigest()
 
+
+def _parameterization_needs_review(job):
+    stage=job.get("parameterization") or {}
+    if not stage:return False
+    contract=stage.get("annotation_radius_contract")
+    return bool(stage.get("accepted") is not True or
+                (contract is not None and (not contract.get("satisfied") or
+                                          contract.get("publication_status")=="candidate_only")))
+
 class AgentService:
     def __init__(self, settings: Settings, *, recover_running=False):
         self.settings = settings
@@ -112,6 +121,7 @@ class AgentService:
                             from .parametric_pipeline import _write
                             _write(directory/"parametric-stage.json",job["parameterization"])
                     job["status"] = ("completed" if job.get("automatic_completion") else "needs_review") if published else "failed"
+                    if published and _parameterization_needs_review(job):job["status"]="needs_review"
                     job["automatic_completion"] = bool(published and job.get("automatic_completion"))
                     if not published:
                         job["validation"]={**(job.get("validation") or {}),"passed":False,"recovery_integrity_verified":False}
@@ -752,6 +762,8 @@ class AgentService:
                 job["automatic_completion"]=result["automatic_completion"]
                 if parameterization.get("accepted"):
                     job["completion_class"]="partial_parametric_draft"
+                elif parameterization.get("constraint_subset_accepted"):
+                    job["completion_class"]="partial_parametric_draft_unresolved_radii"
                 elif parameterization.get("topology_exported"):
                     job["completion_class"]="source_topology_draft"
                 self._publish_automatic_artifacts(job,output)
@@ -770,6 +782,8 @@ class AgentService:
                     self._event(job,"vision_unavailable","在线视觉复核未完成；自动生成的轮廓和原图叠加已保留，不转为人工补参数流程。")
                     job["issues"].append("在线视觉复核未完成，不能计为在线核验通过。")
             job["status"]="completed" if result["validation"]["passed"] else "failed"
+            if result["validation"]["passed"] and _parameterization_needs_review(job):
+                job["status"]="needs_review"
             if result.get("complete_material_exterior") is False:
                 job["completion_class"]="incomplete_material_exterior_draft"
                 job["automatic_completion"]=False
@@ -824,6 +838,8 @@ class AgentService:
                      corrections="correction-evidence.json",constraint_bindings="constraint-bindings.json",
                      binding_candidates="binding-candidates.json",binding_overlay="binding-topology.png",
                      parametric_solution="parametric-solution.json",parameterization="parametric-stage.json",
+                     radius_targets="radius-targets.json",radius_contract="radius-contract.json",
+                     workflow_provenance="workflow-provenance.json",
                      baseline_dxf="baseline-drawing.dxf",baseline_svg="baseline-preview.svg",
                      baseline_overlay="baseline-overlay.png",baseline_model="baseline-model.json")
         names.update(feedback_plan="feedback-plan.json", feedback_screenshot="feedback-screenshot.png")
@@ -911,6 +927,12 @@ class AgentService:
                     verified_stage["publication"]={**publication,"status":"committed","recovered":True}
                 job["parameterization"]=verified_stage
                 job["completion_class"]="partial_parametric_draft"
+            elif model.get("parameterization",{}).get("constraint_subset_accepted"):
+                job["parameterization"]={**model["parameterization"],**(job.get("parameterization") or {}),
+                                         "accepted":False,"constraint_subset_accepted":True,
+                                         "status":"completed_with_unresolved_radii"}
+                job["completion_class"]="partial_parametric_draft_unresolved_radii"
+                job["status"]="needs_review"
             elif model.get("parameterization",{}).get("topology_exported"):
                 recovered_stage=job.get("parameterization") or model["parameterization"]
                 recovered_stage.update(accepted=False,topology_exported=True,

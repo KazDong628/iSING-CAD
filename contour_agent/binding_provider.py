@@ -6,6 +6,7 @@ import base64
 import hashlib
 from io import BytesIO
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -49,24 +50,149 @@ def validate_selection(content):
     return value
 
 
+_SCALAR = "scalar"
+_POINT = (_SCALAR, 2)
+_SEGMENT = (_POINT, 2)
+_IDENTIFIERS = "identifiers"
+_SOURCE_TEXT = {key: _SCALAR for key in ("method", "checked", "symbol_confusion", "text_confirmed", "reason")}
+_SHAFT = {key: _SCALAR for key in ("verified", "supported_fraction",
+    "maximum_unobserved_run_px", "maximum_allowed_gap_px")}
+_VISIBILITY = {key: _SCALAR for key in ("verified", "first_intersection_to_target_px", "target_support_band_px")}
+_ATTACHMENT = {key: _SCALAR for key in ("checked", "directed_ray_reaches_text", "arrow_tip_inside_text_box",
+    "full_source_shaft_verified", "normalized_text_to_shaft", "text_behind_arrow_fraction", "strong_text_adjacency", "reason")}
+_OWNERSHIP = {**{key: _SCALAR for key in ("physical_arrow_id", "status", "duplicate_observation_count",
+    "duplicate_target_ambiguity_preserved")}, "competing_record_ids": _IDENTIFIERS}
+_WHOLE_INTERVAL = {key: _SCALAR for key in ("method", "checked", "passed", "status", "observation",
+    "conservative_max_residual_px", "source_deviation_budget_px", "nominal_circle_arrow_alignment",
+    "minimum_arrow_alignment", "fixed_endpoints_chord_feasible", "endpoints_may_move_in_joint_solve", "reason")}
+_ARROW = {**{key: _SCALAR for key in ("verified", "length_px")},
+          "tip_px": _POINT, "direction_px": _POINT}
+_LEADER = {**{key: _SCALAR for key in ("method", "arrowhead_verified", "label_gap_px", "crossing_source_contour",
+    "crossing_admission", "radial_alignment", "proposal_origin", "model_proposal_used")},
+    "segment_px": _SEGMENT, "arrowhead": _ARROW, "shaft_evidence": _SHAFT,
+    "contour_visibility": _VISIBILITY, "source_text_shaft_attachment": _ATTACHMENT,
+    "source_arrow_ownership": _OWNERSHIP,
+    "source_label_association": {key: _SCALAR for key in ("checked", "repetitive_label_crossing", "reason")}}
+_SOURCE_LINE = {key: _SCALAR for key in ("lo", "hi", "cross", "thickness", "covered_fraction",
+    "maximum_projection_gap_px", "intersection_gap_px", "verified", "reason", "status")}
+_STATION = {**{key: _SCALAR for key in ("observed_station_px", "representative_node", "support_kind",
+    "coordinate_equality_enforced")}, "member_nodes": _IDENTIFIERS, "source_supported_entities": _IDENTIFIERS}
+_SOURCE_EVIDENCE = {**{key: _SCALAR for key in ("method", "axis", "uniquely_supported_leader", "alternative_arcs",
+    "directed_source_target_count", "multiple_directed_source_targets_require_review",
+    "legacy_leader_not_an_ownership_certificate", "arrowhead_verified", "source_span_scale_compatible",
+    "alternative_station_pairs")},
+    "leader": _LEADER, "whole_primitive_radius": _WHOLE_INTERVAL,
+    "source_text": {key: _SCALAR for key in ("checked", "symbol_confusion", "text_confirmed", "reason")},
+    "source_arrow_ownership_rejection_reasons": (_SCALAR, 16),
+    "dimension_line": _SOURCE_LINE, "line_endpoints_px": _SEGMENT, "endpoint_gaps_px": _POINT,
+    "extension_lines": (_SOURCE_LINE, 2), "observed_station_groups": (_STATION, 2)}
+_RELATION_EVIDENCE = {**{key: _SCALAR for key in ("method", "verified", "passed", "reason", "status",
+    "observed_station_px", "span_px", "proposal_band_px", "support_kind", "shared_node",
+    "boundary_observation", "observed_deviation_degrees", "mask_observed_deviation_degrees", "tolerance_degrees")},
+    "supporting_strokes": (_SOURCE_LINE, 2),
+    "sides": ({key: _SCALAR for key in ("verified", "reason", "sample_count", "unambiguous_samples",
+                                         "scale_disagreement_degrees")}, 2),
+    "mask_sides": ({key: _SCALAR for key in ("verified", "reason", "sample_count", "scale_disagreement_degrees")}, 2)}
+
+
+def _source_summary(value, schema, audit, depth=0):
+    """Bound explicit source fields; unknown nested data never enters a request.
+
+    These are selection hints, not binding certificates. Complete source
+    observations and rejected paths remain in the local inventory artifact.
+    Identifier arrays are not truncated: the final byte cap fails closed if
+    their identity inventory itself cannot fit.
+    """
+    if depth > 7:
+        audit["invalid_or_depth_limited_values"] += 1
+        return None
+    if value is None:
+        return None
+    if schema == _IDENTIFIERS:
+        if not isinstance(value, list) or any(not isinstance(item, str) or
+                not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", item) for item in value):
+            raise ValueError("invalid source identity list")
+        return list(value)
+    if schema == _SCALAR:
+        if isinstance(value, str):
+            if len(value) > 160:
+                audit["truncated_strings"] += 1
+            return value[:160]
+        if isinstance(value, bool) or isinstance(value, (int, float)) and math.isfinite(value):
+            return value
+        audit["invalid_or_depth_limited_values"] += 1
+        return None
+    if isinstance(schema, tuple):
+        if not isinstance(value, (list, tuple)):
+            audit["invalid_or_depth_limited_values"] += 1
+            return None
+        item_schema, limit = schema
+        audit["truncated_collection_items"] += max(0, len(value)-limit)
+        return [_source_summary(item, item_schema, audit, depth+1) for item in value[:limit]]
+    if not isinstance(value, dict):
+        audit["invalid_or_depth_limited_values"] += 1
+        return None
+    audit["omitted_nonwhitelisted_fields"] += len(set(value)-set(schema))
+    return {key: _source_summary(value[key], child, audit, depth+1)
+            for key, child in schema.items() if key in value}
+
+
+def _source_path_review_summary(paths, audit):
+    """Keep review counts and failure reasons without repeating entire shafts."""
+    if not isinstance(paths, list):
+        audit["invalid_or_depth_limited_values"] += 1
+        return None
+    reasons = {}
+    for path in paths:
+        if not isinstance(path, dict):
+            continue
+        reason = path.get("reason") or path.get("status") or "source_path_requires_review"
+        if isinstance(reason, str):
+            reasons[reason] = reasons.get(reason, 0)+1
+    selected = sorted(reasons)[:16]
+    audit["truncated_collection_items"] += max(0, len(reasons)-16)
+    return {"count": len(paths), "reason_counts": {key[:160]: reasons[key] for key in selected},
+            "reason_kinds_omitted": max(0, len(reasons)-16), "full_paths_retained_in_local_inventory": True}
+
+
 def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relation_limit=24):
-    """Whitelist only source material; do not serialize model/report dictionaries."""
+    """Explicit, recursively bounded source summaries with unchanged row IDs."""
     records = inventory.get("records", [])[:record_limit]
     ids = {row["id"] for row in records}
     candidates = [row for row in inventory.get("candidates", []) if row.get("record_id") in ids][:candidate_limit]
-    def source_evidence(row):
-        # A fitted radius is an initial guess. Exclude nominal proximity so it
-        # cannot become the model's shortcut for choosing a source association.
-        return {key:value for key,value in (row.get("evidence") or {}).items()
-                if key not in {"fitted_radius","fitted_value","nominal_difference"}}
-    return {
-        "units": inventory.get("units"),
-        "records": [{"id": row["id"], "text": str(row.get("text", ""))[:240],
-                     "parsed": row.get("parsed"), "box": row.get("box"),
-                     "source_text_evidence":row.get("source_text_evidence")} for row in records],
-        "candidates": [{**{key: row.get(key) for key in ("id", "record_id", "kind", "entities", "nodes")},"evidence":source_evidence(row)} for row in candidates],
-        "relations": [{key: row.get(key) for key in ("id", "type", "entities", "nodes")} for row in inventory.get("relations", [])[:relation_limit]],
-    }
+    relations = inventory.get("relations", [])[:relation_limit]
+    audit = {"method": "source_evidence_whitelist_summary_v1", "full_audit_retained_locally": True,
+             "omitted_nonwhitelisted_fields": 0, "truncated_strings": 0,
+             "truncated_collection_items": 0, "invalid_or_depth_limited_values": 0}
+    record_rows = [{"id": row["id"], "text": _source_summary(str(row.get("text", "")), _SCALAR, audit),
+                   "parsed": _source_summary(row.get("parsed"), {key: _SCALAR for key in
+                       ("kind", "nominal", "upper_deviation", "lower_deviation", "symbol", "unit")}, audit),
+                   "box": _source_summary(row.get("box"), (_POINT, 8), audit),
+                   "source_text_evidence": _source_summary(row.get("source_text_evidence"), _SOURCE_TEXT, audit)}
+                  for row in records]
+    candidate_rows = []
+    for row in candidates:
+        evidence = row.get("evidence") or {}
+        source = _source_summary(evidence, _SOURCE_EVIDENCE, audit)
+        for key in ("occluded_leader_hypotheses", "ambiguous_crossing_leaders_requiring_review"):
+            if evidence.get(key):
+                source[key+"_summary"] = _source_path_review_summary(evidence[key], audit)
+        candidate_rows.append({**{key: row.get(key) for key in ("id", "record_id", "kind", "entities", "nodes")},
+                               "evidence": source})
+    all_records = inventory.get("all_records", inventory.get("records", []))
+    all_candidates = inventory.get("all_candidates", inventory.get("candidates", []))
+    full_relations = inventory.get("relations", [])
+    return {"units": inventory.get("units"), "records": record_rows, "candidates": candidate_rows,
+            "relations": [{**{key: row.get(key) for key in ("id", "type", "entities", "nodes")},
+                           "evidence": _source_summary(row.get("evidence"), _RELATION_EVIDENCE, audit)} for row in relations],
+            "inventory_coverage": {"all_record_count": len(all_records), "all_candidate_count": len(all_candidates),
+                "all_relation_count": len(full_relations), "sent_record_count": len(records),
+                "sent_candidate_count": len(candidates), "sent_relation_count": len(relations),
+                "radius_record_denominator": inventory.get("radius_binding_coverage", {}).get("recognized_count"),
+                "record_ids_not_sent": [row["id"] for row in all_records if row["id"] not in ids],
+                "relation_ids_not_sent": [row["id"] for row in full_relations[relation_limit:]],
+                "packet_row_limits": [record_limit, candidate_limit, relation_limit]},
+            "source_evidence_summary": audit}
 
 
 def _validate_selection_payload(selection, payload):
@@ -175,7 +301,12 @@ class BindingProvider:
             details,detail_receipts = _detail_panels(image_path,topology_path,inventory_payload,
                                                      limit=2 if settings.wire_api=="responses" else 4)
             inventory_text = json.dumps(inventory_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            if len(inventory_text) > 60000:
+            receipt.update(inventory_text_chars=len(inventory_text),
+                           inventory_text_bytes=len(inventory_text.encode("utf-8")),
+                           inventory_byte_limit=60000,
+                           source_evidence_summary=inventory_payload["source_evidence_summary"],
+                           inventory_coverage=inventory_payload["inventory_coverage"])
+            if receipt["inventory_text_bytes"] > 60000:
                 raise _InspectionError("inventory_size_limit")
             receipt.update(source_image=source_meta, topology_image=topology_meta,
                            input_records=len(inventory_payload["records"]), input_candidates=len(inventory_payload["candidates"]),

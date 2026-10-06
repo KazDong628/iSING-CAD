@@ -21,6 +21,7 @@ from .api_wire import (prepare_request, extract_text, request_headers, endpoint_
                        output_token_budget, numeric_token_usage, anthropic_thinking_mode_requested)
 
 from .vision_provider import _InspectionError, _image_payload, _single_json_object
+from .topology import stroke_support_fraction
 
 
 _ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
@@ -87,11 +88,15 @@ def _source_support(candidate, graph):
     signals = candidate.get("planner_signals") if isinstance(candidate.get("planner_signals"), dict) else {}
     value = candidate.get("source_boundary_support", candidate.get("source_stroke_support", signals.get("source_boundary_support")))
     if isinstance(value, dict):
-        value = value.get("edge_supported_fraction")
+        try:value = stroke_support_fraction(value)
+        except (TypeError,ValueError):value = None
     if value is None:
         source = graph.get("source_evidence") or {}
         support = source.get("proposal_stroke_support") or source.get("source_boundary_support") or {}
-        value = support.get("edge_supported_fraction") if isinstance(support, dict) else support
+        if isinstance(support, dict):
+            try:value = stroke_support_fraction(support)
+            except (TypeError,ValueError):value = None
+        else:value = support
     value = _number(value)
     return value if value is not None and 0 <= value <= 1 else None
 

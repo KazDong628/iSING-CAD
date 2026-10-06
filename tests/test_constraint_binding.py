@@ -28,6 +28,17 @@ def source(tmp_path):
     return path,document,model,graph
 
 
+def observed_coarse_radius_source(path, model, radius=90., center=(90., 180.)):
+    """R45 source arc remains near the fixture's coarse R40 proposal."""
+    import numpy as np
+    theta = np.linspace(-np.pi/2, np.pi/2, 361)
+    points = np.c_[center[0]+radius*np.cos(theta), center[1]+radius*np.sin(theta)]
+    model["extraction"] = {"raw_polyline_px": points.tolist()}
+    image = Image.open(path)
+    ImageDraw.Draw(image).line([tuple(point) for point in points], fill="black", width=2)
+    image.save(path)
+
+
 def test_source_dimension_line_binding_and_persisted_topology(tmp_path):
     path,document,model,graph=source(tmp_path)
     result=analyze_constraint_bindings(path,document,model,graph,tmp_path/"out")
@@ -178,6 +189,7 @@ def test_y_dimension_uses_cad_upward_node_order(tmp_path):
 def test_line_leader_can_bind_coarse_arc_without_old_nominal_fit_gate(tmp_path,monkeypatch):
     import numpy as np
     path,document,model,graph=source(tmp_path)
+    observed_coarse_radius_source(path, model)
     document={"records":[{"text":"R45","box":[[240,180],[265,180],[265,200],[240,200]]}]}
     graph["entities"]=[{"id":"g000","type":"ARC","start":[0,100],"end":[0,20],"center":[0,60],"radius":40,"clockwise":True}]
     image=Image.open(path);draw=ImageDraw.Draw(image)
@@ -577,6 +589,7 @@ def test_geometrically_tangent_proposal_does_not_override_visible_corner(tmp_pat
 
 def test_topology_leader_is_rechecked_against_current_entity_ids_and_pixels(tmp_path,monkeypatch):
     path,_,model,graph=source(tmp_path)
+    observed_coarse_radius_source(path, model)
     document={"records":[{"text":"R45","box":[[240,180],[265,180],[265,200],[240,200]]}]}
     graph["entities"]=[{"id":"g009","type":"ARC","start":[0,100],"end":[0,20],"center":[0,60],"radius":40,"clockwise":True}]
     graph["annotation_support"]=[{"record_id":"r000","candidate_entity_id":"g000","arrowhead_verified":True,
@@ -608,6 +621,7 @@ def test_radius_edit_diagnostic_does_not_claim_nominal_applied(tmp_path):
 
 def test_constructed_fillet_metadata_cannot_force_radius_constraint(tmp_path,monkeypatch):
     path,_,model,graph=source(tmp_path)
+    observed_coarse_radius_source(path, model, radius=80., center=(100., 180.))
     document={"records":[{"text":"R40","box":[[240,180],[265,180],[265,200],[240,200]]}]}
     graph["entities"]=[{"id":"g009","type":"ARC","start":[40,60],"end":[0,100],"center":[0,60],
                         "radius":40,"clockwise":False,"dimension_bound":True,
@@ -649,3 +663,157 @@ def test_constructed_radius_with_wrong_source_record_stays_reviewable(tmp_path):
     prior=_constructed_radius_priors({"entities":[entity]},records)[0]
     assert prior["exact_constructed_radius_preserved"] and not prior["construction_matches_source_ocr"]
     assert prior["status"]=="construction_metadata_requires_review" and not prior["source_binding_verified"]
+
+
+def test_radius_coverage_does_not_exempt_undetected_arrows_or_metadata(tmp_path, monkeypatch):
+    path, _, model, graph = source(tmp_path)
+    document = {"records": [{"text": "R40", "box": [[240,180],[265,180],[265,200],[240,200]]}]}
+    graph["entities"] = [{"id": "g000", "type": "ARC", "start": [0,100], "end": [0,20],
+                          "center": [0,60], "radius": 40., "clockwise": True,
+                          "radius_binding": {"record_id": "r000", "nominal": 40., "arrowhead_verified": True}}]
+    graph["annotation_support"] = [{"record_id": "r000", "candidate_entity_id": "g000",
+                                    "arrowhead_verified": True,
+                                    "source_evidence": {"segment_px": [[239.,180.],[180.,180.]]}}]
+    monkeypatch.setattr("contour_agent.constraint_binding._leaders", lambda *args: [])
+    result = analyze_constraint_bindings(path, document, model, graph, tmp_path/"out")
+    coverage = result["radius_binding_coverage"]
+    assert coverage["recognized_radius_records"] == ["r000"]
+    assert coverage["unknown_arrow_records"] == ["r000"]
+    assert coverage["verified_absent_arrow_records"] == []
+    assert coverage["confirmed_arrow_records"] == []
+    assert not coverage["all_radius_records_resolved"]
+    assert coverage["unresolved"][0]["reason"] == "source_arrow_not_verified"
+
+
+def test_verified_radius_arrow_targeting_line_remains_required(tmp_path, monkeypatch):
+    import numpy as np
+    path, _, model, graph = source(tmp_path)
+    document = {"records": [{"text": "R45", "box": [[240,180],[265,180],[265,200],[240,200]]}]}
+    graph["entities"] = [{"id": "g009", "type": "LINE", "start": [40,100], "end": [40,20]}]
+    image = Image.open(path); draw = ImageDraw.Draw(image)
+    draw.line((180,100,180,260), fill="black", width=2)
+    draw.line((239,180,180,180), fill="black", width=2)
+    draw.polygon([(180,180),(195,175),(195,185)], fill="black"); image.save(path)
+    monkeypatch.setattr("contour_agent.constraint_binding._leaders",
+                        lambda *args: [np.array([[239.,180.],[180.,180.]])])
+    result = analyze_constraint_bindings(path, document, model, graph, tmp_path/"out")
+    coverage = result["radius_binding_coverage"]
+    assert result["constraints"] == []
+    assert coverage["confirmed_arrow_records"] == ["r000"]
+    assert coverage["required_count"] == 1 and coverage["bound_count"] == 0
+    assert coverage["required_mappings"][0]["candidate_entity_ids"] == ["g009"]
+    assert coverage["unresolved"][0]["reason"] == "radius_target_is_line_requires_topology_edit"
+    assert not coverage["all_confirmed_arrows_bound"] and not coverage["all_radius_records_resolved"]
+
+
+def test_radius_coverage_keeps_provider_abstention_in_required_denominator(tmp_path, monkeypatch):
+    result = analyze_stub(tmp_path, monkeypatch, stub_inventory(), [])
+    coverage = result["radius_binding_coverage"]
+    assert coverage["confirmed_arrow_records"] == ["r000"]
+    assert coverage["required_count"] == 1 and coverage["bound_count"] == 0
+    assert coverage["unresolved"][0]["reason"] == "provider_abstained_from_sent_record"
+    assert not coverage["all_radius_records_resolved"]
+
+
+def test_radius_binding_coverage_is_not_numeric_satisfaction(tmp_path, monkeypatch):
+    result = analyze_stub(tmp_path, monkeypatch, stub_inventory(), [{"record_id":"r000","candidate_id":"c000"}])
+    constraint = result["constraints"][0]
+    assert constraint["required"] and constraint["enforcement"] == "exact"
+    assert constraint["nominal_source"] == "source_ocr" and constraint["source_arrow_verified"]
+    coverage = result["radius_binding_coverage"]
+    assert coverage["all_confirmed_arrows_bound"] and coverage["all_radius_records_resolved"]
+    assert coverage["bound_mappings"][0]["constraint_id"] == constraint["id"]
+    assert not coverage["numeric_satisfaction_verified"]
+
+
+def test_radius_coverage_preserves_competing_source_targets(tmp_path, monkeypatch):
+    inventory = stub_inventory()
+    second = deepcopy(inventory["all_candidates"][0])
+    second.update(id="c001", entities=["g001"], local_reliable=False)
+    inventory["all_candidates"][0]["local_reliable"] = False
+    inventory["all_candidates"].append(second)
+    inventory["candidates"] = inventory["all_candidates"]
+    result = analyze_stub(tmp_path, monkeypatch, inventory, [], graph={
+        "nodes": [], "entities": [{"id":"g000","type":"ARC"},{"id":"g001","type":"ARC"}]})
+    coverage = result["radius_binding_coverage"]
+    assert coverage["ambiguous_count"] == 1
+    assert coverage["ambiguous"][0]["candidate_entity_ids"] == ["g000", "g001"]
+    assert coverage["required_count"] == 1 and not coverage["all_confirmed_arrows_bound"]
+
+
+def test_explicit_radius_arrow_can_cross_contour_only_with_complete_source_shaft():
+    import cv2
+    import numpy as np
+    from contour_agent.constraint_binding import _leader_evidence, verify_source_arrow_proposal
+    gray = np.full((120,290), 255, np.uint8)
+    cv2.line(gray, (100,60), (229,60), 0, 2)
+    cv2.fillConvexPoly(gray, np.array([[100,60],[116,54],[116,66]], np.int32), 0)
+    cv2.line(gray, (180,35), (180,85), 0, 2)
+    arc = np.c_[np.full(9,100.), np.linspace(58,62,9)]
+    crossing = np.array([[180.,35.],[180.,85.]])
+    record = {"id":"r000", "parsed":{"kind":"radius","nominal":40.},
+              "box":[[230.,45.],[265.,45.],[265.,75.],[230.,75.]]}
+    proposal = {"record_id":"r000", "shaft_px":[229.,60.], "tip_px":[100.,60.]}
+    # Proposal origin is not evidence: the same complete source proof applies
+    # to an independently detected Hough segment and an online hypothesis.
+    detected = _leader_evidence(np.asarray(record["box"]), arc, np.array([60.,60.]),
+                               [np.array([proposal["shaft_px"], proposal["tip_px"]])], 5.,
+                               gray, [arc,crossing])
+    assert detected is not None and detected["shaft_evidence"]["verified"]
+    assert detected["proposal_origin"] == "source_hough"
+    assert not detected["contour_visibility"]["verified"]
+    verified = verify_source_arrow_proposal(gray, record, proposal, arc, 5., [arc,crossing])
+    assert verified is not None and verified["arrowhead_verified"]
+    assert verified["crossing_source_contour"]
+    assert verified["shaft_evidence"]["verified"]
+    assert not verified["contour_visibility"]["verified"]
+    damaged = gray.copy(); damaged[54:67,135:160] = 255
+    assert verify_source_arrow_proposal(damaged, record, proposal, arc, 5., [arc,crossing]) is None
+    assert _leader_evidence(np.asarray(record["box"]), arc, np.array([60.,60.]),
+                            [np.array([proposal["shaft_px"], proposal["tip_px"]])], 5.,
+                            damaged, [arc,crossing]) is None
+    assert verify_source_arrow_proposal(gray, record, {**proposal,"record_id":"r001"}, arc, 5.) is None
+
+
+def test_provider_arrow_proposal_requires_real_arrow_pixels():
+    import cv2
+    import numpy as np
+    from contour_agent.constraint_binding import verify_source_arrow_proposal
+    gray = np.full((120,290), 255, np.uint8)
+    cv2.line(gray, (100,60), (229,60), 0, 2)
+    record = {"id":"r000", "parsed":{"kind":"radius","nominal":40.},
+              "box":[[230.,45.],[265.,45.],[265.,75.],[230.,75.]]}
+    proposal = {"record_id":"r000", "shaft_px":[229.,60.], "tip_px":[100.,60.], "verified":True}
+    arc = np.c_[np.full(9,100.), np.linspace(58,62,9)]
+    assert verify_source_arrow_proposal(gray, record, proposal, arc, 5.) is None
+
+
+def test_online_arrow_proposals_persist_json_with_competing_arc_scores(tmp_path, monkeypatch):
+    """Online pixel arithmetic must not leak numpy.bool_ into the receipt."""
+    import numpy as np
+    from contour_agent.constraint_binding import _label_ray_entry
+    path, _, model, graph = source(tmp_path)
+    observed_coarse_radius_source(path, model)
+    document = {"records": [{"text": "R45", "box": [[240,180],[265,180],[265,200],[240,200]],
+                              "source_arrow_proposals": [{"record_id":"r000", "shaft_px":[239.,180.],
+                                                          "tip_px":[180.,180.]}]}]}
+    graph["entities"] = [
+        {"id":"g000", "type":"ARC", "start":[0,100], "end":[0,20],
+         "center":[0,60], "radius":40., "clockwise":True},
+        {"id":"g001", "type":"ARC", "start":[0,40], "end":[0,-40],
+         "center":[0,0], "radius":40., "clockwise":True}]
+    image = Image.open(path); draw = ImageDraw.Draw(image)
+    draw.line((239,180,180,180), fill="black", width=2)
+    draw.polygon([(180,180),(195,175),(195,185)], fill="black"); image.save(path)
+    monkeypatch.setattr("contour_agent.constraint_binding._leaders", lambda *args: [])
+    result = analyze_constraint_bindings(path,document,model,graph,tmp_path/"online")
+    inventory = json.loads((tmp_path/"online/binding-candidates.json").read_text(encoding="utf8"))
+    assert len(inventory["all_candidates"]) == 2
+    assert all(type(row["local_reliable"]) is bool for row in inventory["all_candidates"])
+    assert result["constraints"][0]["entities"] == ["g000"]
+    persisted = json.loads((tmp_path/"online/constraint-bindings.json").read_text(encoding="utf8"))
+    assert persisted["radius_binding_coverage"]["bound_count"] == 1
+    # Exercise the numpy ray-box arithmetic that seeded the invalid bool type.
+    value = _label_ray_entry(np.array([229.,60.]),np.array([1.,0.]),
+                             np.array([230.,45.]),np.array([265.,75.]),20.)
+    assert type(value) is float

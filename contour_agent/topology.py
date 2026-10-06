@@ -26,6 +26,19 @@ def _write(path, value):
     path.write_text(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False),encoding="utf8")
 
 
+def stroke_support_fraction(metrics, *, against=None):
+    """Use explicit v2 stroke coverage, retaining old receipts unchanged."""
+    if not isinstance(metrics, dict):
+        raise TypeError("Source support metrics must be an object")
+    common_v2=("stroke_supported_fraction" in metrics and
+               (against is None or (isinstance(against,dict) and "stroke_supported_fraction" in against and
+                                    against.get("support_measurement_version")==metrics.get("support_measurement_version"))))
+    value = metrics.get("stroke_supported_fraction") if common_v2 else metrics.get("edge_supported_fraction")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError("Invalid source support fraction")
+    return float(value)
+
+
 def _sample_path(points, step, maximum=30000):
     points=np.asarray(points,float)
     lengths=np.linalg.norm(np.diff(points,axis=0),axis=1)
@@ -80,6 +93,7 @@ class _StrokeEvidence:
             for x0,y0,x1,y1 in lines[:1000,0]:
                 cv2.line(coherent,(int(x0),int(y0)),(int(x1),int(y1)),255,3)
         edges[(self.text_mask!=0)&(coherent==0)]=0
+        self.interior_text_mask=self.text_mask.copy()
         self.text_mask[(coherent!=0)&(edges!=0)]=0
         gx=cv2.Sobel(smooth,cv2.CV_32F,1,0,ksize=3)
         gy=cv2.Sobel(smooth,cv2.CV_32F,0,1,ksize=3)
@@ -87,15 +101,23 @@ class _StrokeEvidence:
         self.distance=distance.astype(np.float32)
         ny,nx=indices
         self.gx=gx[ny,nx];self.gy=gy[ny,nx]
+        self.source_gray=small
+        self.edge_gx=gx;self.edge_gy=gy
         self.edges=edges;self.grid=grid_pitch
         self.near=max(1.5,.35*grid_pitch*self.scale)
         self.metadata={"working_image_size":{"width":edges.shape[1],"height":edges.shape[0]},
                        "working_scale":self.scale,"edge_nearness_original_px":self.near/self.scale,
                        "orientation_tolerance_degrees":45.,"masked_ocr_text_regions":boxes,
-                       "method":"Canny_stroke_distance_and_local_tangent_agreement_excluding_OCR_text_preserving_long_observed_strokes",
+                       "method":"Canny_edges_and_bilateral_dark_stroke_interiors_with_local_tangent_agreement",
+                       "support_measurement_version":"source-stroke-support-v2",
+                       "legacy_method":"Canny_stroke_distance_and_local_tangent_agreement_excluding_OCR_text_preserving_long_observed_strokes",
+                       "interior_evidence":{"maximum_half_width_working_px":2*self.near,
+                                            "maximum_gray_value_exclusive":170,
+                                            "opposing_gradient_dot_maximum":-.8,
+                                            "ocr_boxes_excluded":True},
                        "limitation":"Source strokes also contain dimension, hatch and construction lines; support is evidence, not verified boundary identity."}
 
-    def query(self, points):
+    def _query_evidence(self, points):
         points=np.asarray(points,float)
         p=np.rint(points*self.scale).astype(int)
         inside=(p[:,0]>=0)&(p[:,0]<self.edges.shape[1])&(p[:,1]>=0)&(p[:,1]<self.edges.shape[0])
@@ -117,15 +139,58 @@ class _StrokeEvidence:
         # Nearest edges already exclude glyphs. Testing the query pixel's OCR
         # box again would incorrectly reject points beside a preserved real
         # boundary that crosses that box.
-        supported=inside&(distances<=self.near/self.scale)&aligned
-        return distances,supported
+        edge_supported=inside&(distances<=self.near/self.scale)&aligned
+        # A thick drawn line has two Canny edges; its dark centre can be farther
+        # from both than the unchanged nearness tolerance. Admit that centre
+        # only when nearby opposite edges bracket contiguous actual ink, their
+        # normals agree with this path, and the point is outside every OCR box.
+        tangent_norm=np.linalg.norm(tangent,axis=1)
+        normal=np.c_[-tangent[:,1],tangent[:,0]]/np.maximum(tangent_norm[:,None],1e-10)
+        eligible=(inside&~edge_supported&(tangent_norm>1e-10)&
+                  (self.source_gray[y,x]<170)&(self.interior_text_mask[y,x]==0))
+        candidates=np.flatnonzero(eligible)
+        interior=np.zeros(len(points),bool)
+        if len(candidates):
+            centers=p[candidates];directions=normal[candidates]
+            side_gradients=[];side_valid=[]
+            for sign in (-1.,1.):
+                active=np.ones(len(candidates),bool)
+                accepted=np.zeros(len(candidates),bool)
+                gradients=np.zeros((len(candidates),2),float)
+                for offset in np.arange(.5,2*self.near+.01,.5):
+                    query=np.rint(centers+sign*offset*directions).astype(int)
+                    sx=np.clip(query[:,0],0,self.edges.shape[1]-1)
+                    sy=np.clip(query[:,1],0,self.edges.shape[0]-1)
+                    valid=(query[:,0]>=0)&(query[:,0]<self.edges.shape[1])&(query[:,1]>=0)&(query[:,1]<self.edges.shape[0])
+                    hit=active&valid&(self.edges[sy,sx]!=0)
+                    gradient=np.c_[self.edge_gx[sy,sx],self.edge_gy[sy,sx]]
+                    magnitude=np.linalg.norm(gradient,axis=1)
+                    unit=gradient/np.maximum(magnitude[:,None],1e-10)
+                    compatible=(magnitude>1e-10)&(np.abs(np.sum(unit*directions,axis=1))>=math.cos(math.radians(45)))
+                    accepted|=hit&compatible
+                    gradients[hit]=unit[hit]
+                    active&=valid&~hit&(self.source_gray[sy,sx]<170)
+                    if not active.any():break
+                side_gradients.append(gradients);side_valid.append(accepted)
+            opposed=np.sum(side_gradients[0]*side_gradients[1],axis=1)<=-.8
+            interior[candidates]=side_valid[0]&side_valid[1]&opposed
+        return distances,edge_supported,interior
+
+    def query(self, points):
+        distances,edge_supported,interior=self._query_evidence(points)
+        return distances,edge_supported|interior
 
     def summarize(self, points):
         samples=_sample_path(points,max(.5,1/self.scale))
-        distances,supported=self.query(samples)
-        return {"sample_count":len(samples),"edge_supported_fraction":float(supported.mean()),
+        distances,edge_supported,interior=self._query_evidence(samples)
+        legacy={"sample_count":len(samples),"edge_supported_fraction":float(edge_supported.mean()),
                 "mean_edge_distance_px":float(distances.mean()),"p90_edge_distance_px":float(np.quantile(distances,.9)),
                 "max_edge_distance_px":float(distances.max())}
+        return {**legacy,"support_measurement_version":"source-stroke-support-v2",
+                "stroke_supported_fraction":float((edge_supported|interior).mean()),
+                "ink_interior_supported_fraction":float(interior.mean()),
+                "legacy_edge_supported_fraction":legacy["edge_supported_fraction"],
+                "legacy_edge_only_metrics":dict(legacy)}
 
 
 def _grid_pitch(model, width, height):
@@ -167,8 +232,8 @@ def _repair_local_shortcuts(ring, evidence, grid):
             departure=float(_primitive_distance(part,replacement).max())
             if departure>24*grid:continue
             before=evidence.summarize(part);after=evidence.summarize([part[0],part[-1]])
-            gain=after["edge_supported_fraction"]-before["edge_supported_fraction"]
-            accept=(after["edge_supported_fraction"]>=.72 and gain>=.18 and
+            gain=stroke_support_fraction(after)-stroke_support_fraction(before)
+            accept=(stroke_support_fraction(after)>=.72 and gain>=.18 and
                     after["mean_edge_distance_px"]<before["mean_edge_distance_px"])
             record={"start_source_index":first,"end_source_index":last,"removed_vertex_count":last-first-1,
                     "source_bbox_px":[part.min(axis=0).tolist(),part.max(axis=0).tolist()],
@@ -262,7 +327,7 @@ def _repair_text_occlusions(ring, records, evidence, grid):
         first=int(indices[0])-1;last=int(indices[-1])+1;part=ring[first:last+1]
         if np.linalg.norm(np.diff(part,axis=0),axis=1).sum()>120*grid:continue
         before=evidence.summarize(part)
-        if before["edge_supported_fraction"]>=.72:continue
+        if stroke_support_fraction(before)>=.72:continue
         path,search=_local_edge_path(part,evidence,grid)
         record={"method":"source_edge_path_around_ocr_overlap","record_id":row.get("id"),
                 "source_bbox_px":[part.min(axis=0).tolist(),part.max(axis=0).tolist()],
@@ -274,8 +339,8 @@ def _repair_text_occlusions(ring, records, evidence, grid):
         after_length=float(np.linalg.norm(np.diff(path,axis=0),axis=1).sum())
         trial=_closed_ring(np.vstack([ring[:first],path,ring[last+1:]]))
         valid=Polygon(trial).is_valid and Polygon(trial).area>0
-        accept=(valid and after["edge_supported_fraction"]>=.75 and
-                after["edge_supported_fraction"]-before["edge_supported_fraction"]>=.2 and
+        accept=(valid and stroke_support_fraction(after)>=.75 and
+                stroke_support_fraction(after)-stroke_support_fraction(before)>=.2 and
                 after["mean_edge_distance_px"]<before["mean_edge_distance_px"] and after_length<=1.25*before_length)
         record.update(after=after,before_length_px=before_length,after_length_px=after_length,
                       accepted=accept,reason="source_supported_text_overlap_reroute" if accept else "insufficient_source_support_or_shape_validity",
@@ -397,7 +462,7 @@ def build_topology(image_path, document, model, output_dir):
             # the old mask tracing error, but cannot buy compactness by losing
             # substantial original stroke support or invalidating connectivity.
             eligible=(log["connected_simple_closed"] and
-                      log["source_stroke_support"]["edge_supported_fraction"]>=corrected_support["edge_supported_fraction"]-.035 and
+                      stroke_support_fraction(log["source_stroke_support"])>=stroke_support_fraction(corrected_support)-.035 and
                       log["source_stroke_support"]["p90_edge_distance_px"]<=corrected_support["p90_edge_distance_px"]+grid)
             log["eligible"]=eligible
             if eligible:candidates.append((len(entities),log["source_stroke_support"]["mean_edge_distance_px"],entities,log))

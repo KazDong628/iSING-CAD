@@ -86,6 +86,56 @@ def test_materialize_requires_unchanged_bundle_member_and_copies_overlay(tmp_pat
         materialize_selected_candidate(changed, bundle, output)
 
 
+def test_new_candidates_refit_original_mask_not_an_already_approximated_cad(tmp_path,monkeypatch):
+    from contour_agent import topology_candidates as module
+    path,document,model,base=_fixture(tmp_path)
+    expected=np.asarray(model["extraction"]["raw_polyline_px"])
+    original=module.fit_polyline
+    observations=[]
+    def measured(points,*args,**kwargs):
+        observations.append(np.asarray(points).copy())
+        return original(points,*args,**kwargs)
+    monkeypatch.setattr(module,"fit_polyline",measured)
+    bundle=generate_topology_candidates(path,document,model,base,max_candidates=3)
+    assert observations and all(np.array_equal(points,expected) for points in observations)
+    assert bundle["annotation_inventory_summary"]["boundary_observation_source"]=="initial_extraction_raw_polyline_px"
+    # The retained candidate is still the original CAD rollback, not a silent
+    # overwrite of baseline geometry with a different segmentation fit.
+    first=bundle["candidates"][0]["graph"]["entities"]
+    assert len(first)==len(base["entities"])
+    for old,new in zip(base["entities"],first):
+        assert old["type"]==new["type"]
+        assert old["start"]==pytest.approx(new["start"])
+
+
+def test_invalid_raw_observation_cannot_silently_fall_back_to_cad_samples(tmp_path):
+    path,document,model,base=_fixture(tmp_path)
+    model["extraction"]["raw_polyline_px"]=[[0,0],[20,20],[0,20],[20,0],[0,0]]
+    with pytest.raises(ValueError,match="immutable source mask"):
+        generate_topology_candidates(path,document,model,base,max_candidates=3)
+
+
+def test_constructed_radius_roundtrip_preserves_nominal_only_after_incidence_check():
+    from contour_agent.topology_candidates import _to_graph
+    center=np.array([1000.,1000.])
+    a=center+3*np.array([math.cos(.27),math.sin(.27)])
+    b=center+3*np.array([math.cos(1.3),math.sin(1.3)])
+    tip=center+np.array([6.,6.])
+    source=[{"type":"ARC","start":a.tolist(),"end":b.tolist(),"center":center.tolist(),
+             "radius":3.,"clockwise":False,"radius_binding":{"record_id":"r000","nominal":3.}},
+            {"type":"LINE","start":b.tolist(),"end":tip.tolist()},
+            {"type":"LINE","start":tip.tolist(),"end":a.tolist()}]
+    def convert():
+        return _to_graph(source,lambda points:points,1.,{"units":"mm"},"test","source","parent",1.,
+                         {"sampled_topology_valid":True},[],{"source_stroke_support":{}},{})
+    result=convert()["entities"][0]
+    assert result["radius"]==3.
+    assert result["dimension_bound"] is False  # Construction does not prove association.
+    source[1]["start"][0]+=.1
+    with pytest.raises(ValueError,match="incidence_failed"):
+        convert()
+
+
 def test_source_hash_gt_guard_and_candidate_bound_are_enforced(tmp_path):
     path, document, model, base = _fixture(tmp_path)
     changed = json.loads(json.dumps(base))

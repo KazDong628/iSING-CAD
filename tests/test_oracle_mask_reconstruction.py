@@ -153,6 +153,28 @@ def test_online_bundle_is_explicit_and_sanitized(tmp_path, monkeypatch):
     assert secret not in manifest_text and "api_key" not in manifest_text
 
 
+@pytest.mark.parametrize("published",[False,True])
+def test_partial_parametric_publication_is_distinct_from_retained_draft(tmp_path,monkeypatch,published):
+    _fake_inputs(monkeypatch)
+    monkeypatch.setattr("scripts.run_oracle_mask_reconstruction._providers",lambda *a,**k:({},{}))
+    def build(image,document,after,**kwargs):
+        after.mkdir()
+        (after/"drawing.dxf").write_bytes(b"initial")
+        return {"entities":[]}
+    def refine(image,document,model,after,**kwargs):
+        if published:(after/"drawing.dxf").write_bytes(b"partial-parametric")
+        return model,{"status":"completed_with_unresolved_radii","accepted":False,
+                      "constraint_subset_accepted":True,
+                      "publication":{"status":"committed" if published else "rolled_back","kind":"parametric"}}
+    monkeypatch.setattr("contour_agent.automatic.build_automatic",build)
+    monkeypatch.setattr("contour_agent.parametric_pipeline.refine_parametric",refine)
+    result=run_oracle_mask_case("case",tmp_path/"subset")
+    manifest=json.loads(result["manifest"].read_text())
+    assert manifest["status"]==("completed_with_unresolved_radii" if published else "completed_with_retained_draft")
+    assert manifest["constraint_subset_published"] is published
+    assert manifest["parameterization_accepted"] is False
+
+
 @pytest.mark.parametrize("parser_failure", [False, True])
 def test_dimension_parse_once_before_topology_preserves_source(tmp_path, monkeypatch, parser_failure):
     from contour_agent.provider import ProviderError

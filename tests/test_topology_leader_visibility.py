@@ -66,3 +66,36 @@ def test_topology_verified_arrow_takes_priority_over_closer_undirected_stroke(mo
     assert item["leader"]["arrowhead_verified"] is True
     assert item["leader"]["leader_id"]=="line001"
     assert item["leader_hypotheses_requiring_review"][0]["leader_id"]=="line000"
+
+
+def test_topology_crossing_hough_keeps_crossing_audit_and_requires_real_complete_ink(monkeypatch):
+    import cv2
+    gray = np.full((140,300), 255, np.uint8)
+    cv2.line(gray, (31,60), (180,60), 0, 2)
+    cv2.fillConvexPoly(gray, np.array([[180,60],[164,54],[164,66]],np.int32), 0)
+    row = {"id":"r000", "text":"R36", "parsed":{"kind":"radius","nominal":36.},
+           "box":[[10.,45.],[30.,45.],[30.,75.],[10.,75.]]}
+    line = np.array([[35.,60.],[180.,60.]])
+    monkeypatch.setattr(module,"_leaders",lambda *args:[line])
+    values,_ = module._annotation_inventory(gray,[row],rectangle_ring(),2.)
+    item = values[0]
+    assert item["leader_status"] == "directed_arrow_candidate"
+    assert item["leader"]["shaft_evidence"]["verified"]
+    assert item["leader"]["proposal_origin"] == "source_hough"
+    assert item["leader"]["contour_visibility"]["verified"] is False
+    gray[54:67, 120:145] = 255
+    values,_ = module._annotation_inventory(gray,[row],rectangle_ring(),2.)
+    assert values[0]["leader_status"] != "directed_arrow_candidate"
+
+
+def test_global_topology_hough_cannot_promote_repetitive_label_crossing(monkeypatch):
+    from test_source_arrow_localization import repetitive_label_source
+    gray, row, boundary = repetitive_label_source()
+    monkeypatch.setattr(module, "_leaders", lambda *args: [np.array([[229.,75.],[100.,75.]])])
+    monkeypatch.setattr(module, "native_radius_leader_segments", lambda *args: [])
+    values, _ = module._annotation_inventory(gray, [row], boundary, 2.)
+    assert values[0]["leader_status"] == "undirected_leader_candidate"
+    leader = values[0]["leader"]
+    assert not leader["arrowhead_verified"]
+    assert leader["source_label_association"]["repetitive_label_crossing"]
+    assert "repetitive_source_stroke_crosses_label_without_unique_leader_ownership" in leader["directed_verification_issues"]

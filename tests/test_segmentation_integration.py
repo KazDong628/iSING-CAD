@@ -100,7 +100,10 @@ def test_explicit_selection_uses_configured_checkpoint_through_export(integratio
         response = create_case(context, use_segmentation=True)
     assert response.status_code == 202
     job = response.json()
-    assert job["status"] == "completed" and job["use_segmentation"] is True
+    # Blank source pixels and no dimensions can yield a retained mask draft,
+    # but cannot certify that the requested parameterization completed.
+    assert job["status"] == "needs_review" and job["use_segmentation"] is True
+    assert job["parameterization"]["accepted"] is False
     assert len(context["calls"]["learned"]) == 1
     configured, source, evidence_dir = context["calls"]["learned"][0]
     assert configured == context["checkpoint"]

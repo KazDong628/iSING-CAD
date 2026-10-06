@@ -8,6 +8,7 @@ import re
 
 
 _STAGES = (
+    ("radius_targets", "半径箭头定位", "radius-targets.json"),
     ("planning", "规划", "topology-plan.json"),
     ("dimensions", "尺寸解析", "dimension-analysis.json"),
     ("binding", "约束绑定", "constraint-bindings.json"),
@@ -69,7 +70,9 @@ def _answer(stage_id, document, provider):
         if isinstance(excerpt, str) and excerpt:
             result["sanitized_response_excerpt"] = excerpt
         return result, "sanitized_failure_receipt"
-    if stage_id == "planning":
+    if stage_id == "radius_targets":
+        answer = _public_radius_targets(provider)
+    elif stage_id == "planning":
         answer = {
             "candidate_id": _value(provider, document, "selected_candidate_id"),
             "relation_ids": _value(provider, document, "relation_ids", []),
@@ -143,6 +146,83 @@ def _scalars(value, keys):
     return result
 
 
+def _identifiers(value, limit=128):
+    return list(dict.fromkeys(item for item in value[:limit] if _identifier(item))) if isinstance(value, list) else []
+
+
+def _pixel_point(value):
+    if (isinstance(value, list) and len(value) == 2 and
+            all(isinstance(item, (int, float)) and not isinstance(item, bool)
+                and math.isfinite(item) and item >= 0 for item in value)):
+        return value
+    return None
+
+
+def _public_radius_targets(provider):
+    """Only source-pixel hypotheses; nested provider evidence is never public."""
+    proposals = []
+    raw = provider.get("proposals")
+    for item in raw[:24] if isinstance(raw, list) else []:
+        if not isinstance(item, dict) or not _identifier(item.get("record_id")):
+            continue
+        tip, shaft = _pixel_point(item.get("tip_px")), _pixel_point(item.get("shaft_px"))
+        if tip is not None and shaft is not None:
+            proposals.append({"record_id": item["record_id"], "tip_px": tip, "shaft_px": shaft})
+    return {"proposals": proposals,
+            "unknown_record_ids": _identifiers(provider.get("unknown_record_ids")),
+            "omitted_record_ids": _identifiers(provider.get("omitted_record_ids")),
+            "arrowheads_verified": False, "dimensions_verified": False,
+            "missing_arrow_detection_is_exemption": False}
+
+
+def _public_radius_contract(contract, bindings, validation):
+    if not isinstance(contract, dict):
+        contract = {}
+    coverage = contract.get("coverage")
+    if not isinstance(coverage, dict):
+        coverage = (bindings or {}).get("radius_binding_coverage")
+    if not contract and not isinstance(coverage, dict):
+        return None
+    coverage = coverage if isinstance(coverage, dict) else {}
+    public = _scalars(contract, ("satisfied", "all_annotated_radii_verified", "candidate_satisfied",
+                                "current_dxf_verified", "publication_status"))
+    public["current_dxf_verified"] = contract.get("current_dxf_verified") is True
+    public["reasons"] = _identifiers(contract.get("reasons"), 32)
+    public["missing_arrow_detection_is_exemption"] = False
+    exposed = _scalars(coverage, ("recognized_count", "required_count", "bound_count", "unresolved_count",
+                                  "ambiguous_count", "unresolved_radius_text_count", "all_confirmed_arrows_bound", "all_radius_records_resolved"))
+    for key in ("recognized_radius_records", "confirmed_arrow_records", "unknown_arrow_records", "verified_absent_arrow_records", "unresolved_radius_text_records"):
+        exposed[key] = _identifiers(coverage.get(key))
+    exposed["confirmed_count"] = len(exposed["confirmed_arrow_records"])
+    exposed["unknown_count"] = len(exposed["unknown_arrow_records"])
+    exposed["unresolved"] = []
+    raw = coverage.get("unresolved")
+    for item in raw[:128] if isinstance(raw, list) else []:
+        if isinstance(item, dict):
+            row = _scalars(item, ("record_id", "nominal", "reason", "source_arrow_verified"))
+            row["candidate_entity_ids"] = _identifiers(item.get("candidate_entity_ids"), 16)
+            exposed["unresolved"].append(row)
+    public["coverage"] = exposed
+    exact = contract.get("exact_radius_validation")
+    final_exact = (validation or {}).get("exact_radius_validation")
+    if (public["current_dxf_verified"] and isinstance(final_exact, dict) and
+            final_exact.get("dxf_readback_performed") is True):
+        exact = final_exact
+    exact = exact if isinstance(exact, dict) else {}
+    public_exact = _scalars(exact, ("mode", "required_count", "passed", "dxf_readback_performed"))
+    public_exact["checks"] = []
+    checks = exact.get("checks")
+    for item in checks[:128] if isinstance(checks, list) else []:
+        if isinstance(item, dict):
+            row = _scalars(item, ("record_id", "entity_id", "nominal", "actual", "dxf_radius",
+                                  "absolute_residual", "tolerance", "enforcement", "passed"))
+            row["value"] = row.get("nominal")
+            public_exact["checks"].append(row)
+    public["exact_radius_validation"] = public_exact
+    public["reference_verified"] = False
+    return public
+
+
 def _public_feedback(feedback):
     if not isinstance(feedback, dict):
         return {}
@@ -202,9 +282,17 @@ def _public_iterations(document):
 def _public_parameterization(directory):
     solution = _read_object(directory, "parametric-solution.json")
     bindings = _read_object(directory, "constraint-bindings.json")
-    if not solution and not bindings:
+    stage = _read_object(directory, "parametric-stage.json")
+    contract = _read_object(directory, "radius-contract.json")
+    validation = _read_object(directory, "validation.json")
+    if not solution and not bindings and not contract and not stage:
         return None
     result = _scalars(solution, ("status", "accepted", "underconstrained"))
+    result["constraint_subset_accepted"] = (solution or {}).get("accepted") is True
+    result["pipeline_accepted"] = (stage or {}).get("accepted") is True
+    result["pipeline_status"] = _scalars(stage, ("status",)).get("status")
+    result["all_dimensions_verified"] = (stage or {}).get("all_dimensions_verified") is True
+    result["radius_contract"] = _public_radius_contract(contract, bindings, validation)
     result["counts"] = _scalars((bindings or {}).get("counts"),
                                 ("recognized_dimensions", "bound_source_records", "unbound_dimensions", "constraints",
                                  "structural_local_accepted", "structural_api_accepted"))
@@ -237,6 +325,13 @@ def build_model_transcript(job: dict, runtime_root: Path):
     for stage_id, label, filename in _STAGES:
         document = _read_object(directory, filename)
         provider = document.get("provider") if isinstance(document, dict) else None
+        if stage_id == "radius_targets" and isinstance(document, dict):
+            # This artifact stores the receipt directly. Its newly introduced
+            # stage never exposes arbitrary response excerpts or nested fields.
+            provider = {**_scalars(document, ("status", "http_status", "http_success", "schema_success",
+                                               "elapsed_seconds", "network_requests", "model", "protocol",
+                                               "total_timeout_seconds", "error_code", "reason")),
+                        **_public_radius_targets(document)}
         visible = isinstance(provider, dict) and not (
             not provider.get("network_requests") and
             provider.get("status") in {"disabled", "skipped", "not_configured"}

@@ -33,6 +33,21 @@ def fixture_model(tmp_path, units="mm"):
     return image,baseline
 
 
+def test_solver_observes_immutable_mask_in_design_units_not_modified_cad(tmp_path):
+    from contour_agent.parametric_pipeline import _solver_source_observation
+    _,baseline=fixture_model(tmp_path)
+    baseline["oracle_mask_conditioned"]=True
+    graph={"units":"mm","coordinate_system":baseline["coordinate_system"],
+           "entities":deepcopy(baseline["entities"])}
+    graph["entities"][2]["radius"]=999.
+    result=_solver_source_observation(baseline,graph)
+    observed=np.asarray(result["points"])
+    assert observed[:,0].max()==pytest.approx(5.,abs=.01)
+    assert result["units"]=="mm" and result["provenance"]=="input_mask_boundary"
+    assert result["oracle_mask_conditioned"] is True and result["reference_dxf_read"] is False
+    assert _solver_source_observation({},graph) is None
+
+
 @pytest.mark.parametrize("units",["mm","pixel"])
 def test_parametric_export_preserves_arc_branch_image_y_and_dxf_units(tmp_path,units):
     image,baseline=fixture_model(tmp_path,units)
@@ -183,7 +198,9 @@ def test_restart_checks_publication_preview_hashes_not_only_dxf_model(tmp_path,m
     service=recover(tmp_path,monkeypatch)
     try:
         recovered=service.store.get("persisted")
-        assert recovered["automatic_completion"] and recovered["status"]=="completed"
+        # A restored valid draft is downloadable; interrupted parameterization
+        # still requires review and must not become a completed CAD claim.
+        assert recovered["automatic_completion"] and recovered["status"]=="needs_review"
         assert recovered["parameterization"]["publication"]["status"]=="rolled_back"
         assert {name:(output/name).read_bytes() for name in CORE}==before
     finally:service.close()
@@ -367,7 +384,7 @@ def test_restart_partial_second_publication_restores_last_valid_topology(tmp_pat
     service=recover(tmp_path,monkeypatch)
     try:
         recovered=service.store.get("persisted")
-        assert recovered["status"]=="completed" and recovered["automatic_completion"]
+        assert recovered["status"]=="needs_review" and recovered["automatic_completion"]
         assert recovered["completion_class"]=="source_topology_draft"
         assert recovered["geometry"]["entities"]==graph["entities"]
         assert recovered["parameterization"]["topology_exported"] and not recovered["parameterization"]["accepted"]

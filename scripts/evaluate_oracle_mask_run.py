@@ -197,6 +197,56 @@ def _summarize(comparison: dict, *, case_id: str, prediction_sha256: str,
     }
 
 
+def _target_acceptance(comparison: dict, tolerance_mm: float, *, radius_contract: dict,
+                       parameter_stage: dict) -> dict:
+    """Supplemental user target; never rewrite the frozen strict result."""
+    score = comparison["physical_score"]
+    predicted, reference = comparison["prediction"], comparison["reference"]
+    correspondence = comparison["entity_correspondence"]
+    if tolerance_mm != STRICT_TOLERANCE_MM:
+        correspondence = next((row for row in comparison.get("supplemental_entity_correspondence", [])
+                               if row.get("parameter_tolerance_mm") == tolerance_mm), {})
+    matches = [row for row in correspondence.get("rows", [])
+               if row["status"] == "unique_full_parameter_agreement"]
+    physical = comparison["physical_units_available"] is True
+    count_equal = predicted["filtered_profile"]["types"] == reference["filtered_profile"]["types"]
+    complete = bool(physical and count_equal and len(matches) == predicted["filtered_profile"]["count"]
+                    and len(matches) == reference["filtered_profile"]["count"]
+                    and predicted["filtered_profile"]["count"] > 0)
+    adjacency = None
+    if complete:
+        mapping = {row["prediction_id"]: row["reference_id"] for row in matches}
+        adjacency = Counter(tuple(sorted(mapping[edge["entity_id"]] for edge in node["incidents"]))
+                            for node in predicted["connections"]["nodes"]) == Counter(
+                                tuple(sorted(edge["entity_id"] for edge in node["incidents"]))
+                                for node in reference["connections"]["nodes"])
+    def within(frame):
+        metrics = score.get(frame) or {}
+        return bool(physical and score.get("geometry_valid") and score.get("reference_scope") != "partial_profile"
+                    and metrics and metrics["conservative_max_error_mm"] <= tolerance_mm)
+    registered = score.get("registered_metrics") or {}
+    checks = {"registered_shape_within_target": within("registered_metrics"),
+              "native_coordinate_shape_within_target": within("direct_metrics"),
+              "contour_length_within_frozen_limit": bool(registered and
+                  registered["length_error_mm"] <= max(.2, .001 * registered["reference_length_mm"])),
+              "filtered_object_types_and_counts_equal": count_equal,
+              "complete_primitive_parameters_match": complete,
+              "matched_primitive_adjacency_equal": adjacency,
+              "both_endpoint_closed": predicted["connections"]["closed"] and reference["connections"]["closed"],
+              "all_annotated_radii_exact_in_current_dxf": bool(radius_contract.get("satisfied") is True
+                                                            and radius_contract.get("current_dxf_verified") is True),
+              "parameterized_result_published": (parameter_stage.get("publication") or {}).get("kind") == "parametric"}
+    return {"schema_version": "explicit-reconstruction-target-v1", "tolerance_mm": tolerance_mm,
+            "frozen_strict_tolerance_mm": STRICT_TOLERANCE_MM, "strict_results_preserved": True,
+            "annotated_radius_tolerance_mm": 0.0, "shape_only_success_is_full_reconstruction": False,
+            "primitive_matching": {"tolerance_mm": tolerance_mm, "matched_count": len(matches),
+                                   "status_counts": correspondence.get("counts", {}),
+                                   "unmatched_reference_count": len(correspondence.get("unmatched_reference_ids", []))},
+            "checks": checks, "all_requested_checks_passed": all(value is True for value in checks.values()),
+            "reference_accuracy_diagnostic_only": True, "held_out": False,
+            "ground_truth_scores_select_prediction": False}
+
+
 def _svg(comparison: dict, case_id: str) -> str:
     visual = comparison["visualization"]
     curves = [(side, row) for side in ("reference", "prediction") for row in visual[side]]
@@ -224,8 +274,13 @@ def _svg(comparison: dict, case_id: str) -> str:
 
 
 def evaluate_oracle_mask_run(run_dir: Path, *, dataset_root: Path = ROOT / "__dataset",
-                             case_id: str | None = None) -> dict:
+                             case_id: str | None = None, target_tolerance_mm: float = STRICT_TOLERANCE_MM) -> dict:
     """Write immutable-after-export evaluation files; never invoke generation."""
+    if type(target_tolerance_mm) not in (int, float) or not math.isfinite(target_tolerance_mm) or target_tolerance_mm <= 0:
+        raise ValueError("target_tolerance_mm_must_be_finite_positive")
+    target_tolerance_mm = float(target_tolerance_mm)
+    comparison_options = ({"additional_parameter_tolerances_mm": (target_tolerance_mm,)}
+                          if target_tolerance_mm != STRICT_TOLERANCE_MM else {})
     run_dir = Path(run_dir).resolve(strict=True)
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     declared_id = manifest.get("case_id")
@@ -282,7 +337,7 @@ def evaluate_oracle_mask_run(run_dir: Path, *, dataset_root: Path = ROOT / "__da
         _write(evaluation / "summary.json", report)
         return report
     try:
-        comparison = compare_dxf_entities(prediction, reference)
+        comparison = compare_dxf_entities(prediction, reference, **comparison_options)
     except Exception as error:
         report = {**prefix, "status": "comparison_failed", "reference_opened": True,
                   "reference_compared": False,
@@ -297,6 +352,14 @@ def evaluate_oracle_mask_run(run_dir: Path, *, dataset_root: Path = ROOT / "__da
                          oracle_mask_sha256=oracle_mask_sha,
                          mask_reference_hash_verified=True)
     summary["reference_source"] = source["reference_source"]
+    def receipt(relative):
+        path = run_dir / relative
+        if not path.is_file(): return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    summary["target_acceptance"] = _target_acceptance(
+        comparison, target_tolerance_mm, radius_contract=receipt("after/radius-contract.json"),
+        parameter_stage=receipt("after/parametric-stage.json"))
     _write(evaluation / "comparison.json", comparison)
     svg = _svg(comparison, case_id)
     if svg:
@@ -325,7 +388,7 @@ def evaluate_oracle_mask_run(run_dir: Path, *, dataset_root: Path = ROOT / "__da
             if stage_audit["filtered_profile"]["issues"]:
                 entry["status"] = "invalid_prediction"
                 continue
-            stage_comparison = comparison if stage_id == "published" else compare_dxf_entities(artifact, reference)
+            stage_comparison = comparison if stage_id == "published" else compare_dxf_entities(artifact, reference, **comparison_options)
             stage_summary = summary if stage_id == "published" else _summarize(
                 stage_comparison, case_id=case_id, prediction_sha256=stage_audit["sha256"],
                 reference_sha256=source["reference_sha256"], oracle_mask_sha256=oracle_mask_sha,
@@ -357,9 +420,12 @@ def main() -> None:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, default=ROOT / "__dataset")
     parser.add_argument("--case-id", type=str)
+    parser.add_argument("--target-tolerance-mm", type=float, default=STRICT_TOLERANCE_MM,
+                        help="Explicit supplemental target; keeps the original 0.1 mm result and exact annotated radii.")
     args = parser.parse_args()
-    report = evaluate_oracle_mask_run(args.run_dir, dataset_root=args.dataset, case_id=args.case_id)
-    print(json.dumps({key: report.get(key) for key in ("case_id", "status", "checks", "overlay")}, ensure_ascii=False))
+    report = evaluate_oracle_mask_run(args.run_dir, dataset_root=args.dataset, case_id=args.case_id,
+                                      target_tolerance_mm=args.target_tolerance_mm)
+    print(json.dumps({key: report.get(key) for key in ("case_id", "status", "checks", "target_acceptance", "overlay")}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

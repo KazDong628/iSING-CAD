@@ -1,6 +1,7 @@
 """Source-supported topology edits: numeric features, lineage and isolation."""
 import copy
 import hashlib
+import math
 
 import cv2
 import numpy as np
@@ -225,3 +226,98 @@ def test_junction_target_allows_explicit_adjacent_hypothesis_without_rewriting_i
     graph["annotation_support"][0]["source_evidence"] = {}
     with pytest.raises(ValueError, match="radius_annotation_not_supported_by_named_chain"):
         _radius_edit_evidence(graph, operation, inventory, ["g000"], transform)
+
+
+def _short_corner_fixture(tmp_path):
+    path, graph, baseline, candidate, bundle = _fixture(tmp_path)
+    points = [[20.,20.],[100.,20.],[120.,40.],[120.,110.],[20.,110.]]
+    graph["nodes"]=[{"id":f"v{i:03d}","source_px":p,"x":p[0],"y":-p[1]} for i,p in enumerate(points)]
+    graph["entities"]=[{"id":f"g{i:03d}","type":"LINE","start":[a[0],-a[1]],"end":[b[0],-b[1]],
+                        "start_node":f"v{i:03d}","end_node":f"v{(i+1)%len(points):03d}"}
+                       for i,(a,b) in enumerate(zip(points,points[1:]+points[:1]))]
+    graph["annotation_support"]=[{"record_id":"r001","kind":"radius","status":"candidate_supported",
+        "candidate_entity_id":"g001","arrowhead_verified":True,"target_gap_px":5.86,
+        "source_evidence":{"target_source_px":_binding()["target_source_px"]}}]
+    inventory=[{"record_id":"r001","kind":"radius","nominal":20.,"text":"R20"}]
+    return graph, baseline, inventory
+
+
+@pytest.mark.parametrize("ids",[["g000","g001"],["g001","g002"],["g001"]])
+def test_fillet_completes_both_supports_around_short_corner_without_changing_source(tmp_path,ids):
+    graph,baseline,inventory=_short_corner_fixture(tmp_path)
+    original=copy.deepcopy(graph)
+    operation={"action":"insert_annotated_fillet","entity_ids":ids,"record_id":"r001"}
+    entities,quality,detail=_apply_one(graph,baseline,operation,inventory)
+    assert detail["entity_ids"]==["g000","g001","g002"]
+    assert detail["requested_entity_ids"]==ids and detail["support_scope_expanded"]
+    assert detail["removed_entity_count"]==detail["replacement_count"]==3
+    assert [e["type"] for e in entities[:3]]==["LINE","ARC","LINE"]
+    assert entities[1]["radius"]==pytest.approx(20.,abs=1e-12) and detail["radius_binding_applied"]
+    assert entities[1]["radius_binding"]["nominal"]==20.
+    assert entities[0]["start"]==pytest.approx([20.,20.]) and entities[2]["end"]==pytest.approx([120.,110.])
+    assert quality["sampled_topology_valid"] and graph==original and operation["entity_ids"]==ids
+    proposals=propose_annotation_arc_edits(graph,inventory)
+    assert proposals[0]["action"]=="insert_annotated_fillet"
+    assert proposals[0]["entity_ids"]==["g000","g001","g002"]
+
+
+def test_fillet_scope_does_not_expand_without_verified_source_arrow(tmp_path):
+    from contour_agent.topology_editing import _complete_fillet_support_scope
+    graph,baseline,inventory=_short_corner_fixture(tmp_path)
+    graph["annotation_support"][0]["arrowhead_verified"]=False
+    operation={"action":"insert_annotated_fillet","entity_ids":["g000","g001"],"record_id":"r001"}
+    assert _complete_fillet_support_scope(graph,inventory,operation)==operation["entity_ids"]
+    with pytest.raises(ValueError):_apply_one(graph,baseline,operation,inventory)
+
+
+def test_combined_edits_detect_overlap_in_completed_fillet_support(tmp_path):
+    from contour_agent.topology_editing import _apply_combined
+    graph,baseline,inventory=_short_corner_fixture(tmp_path)
+    operations=[{"action":"insert_annotated_fillet","entity_ids":["g000","g001"],"record_id":"r001"},
+                {"action":"refit_entity_as_line","entity_ids":["g002"],"record_id":None}]
+    with pytest.raises(ValueError,match="combined_edit_chains_overlap"):
+        _apply_combined(graph,baseline,operations,inventory)
+
+
+def test_source_polyline_distance_is_independent_of_collinear_vertex_density():
+    from contour_agent.topology_editing import _source_polyline_distance
+    sparse=np.array([[0.,0.],[100.,0.],[100.,50.]])
+    dense=np.vstack([np.column_stack([np.linspace(0,100,201),np.zeros(201)]),
+                     np.column_stack([np.full(100,100.),np.linspace(.5,50.,100)])])
+    samples=np.array([[50.,0.],[50.,2.],[100.,25.],[103.,25.],[120.,70.]])
+    expected=[0.,2.,0.,3.,math.sqrt(800.)]
+    assert _source_polyline_distance(samples,sparse)==pytest.approx(expected,abs=1e-12)
+    assert _source_polyline_distance(samples,dense)==pytest.approx(expected,abs=1e-12)
+
+
+def test_source_path_localization_does_not_penalize_long_sparse_straight_edges():
+    from contour_agent.topology_editing import _ring_path
+    ring=np.array([[0.,0.],[100.,0.],[100.,50.],[0.,50.],[0.,0.]])
+    samples=np.vstack([np.column_stack([np.linspace(0,100,201),np.zeros(201)]),
+                       np.column_stack([np.full(100,100.),np.linspace(.5,50.,100)])])
+    selected,mismatch=_ring_path(ring,ring[0],ring[2],samples)
+    assert selected==pytest.approx(ring[:3])
+    assert mismatch==pytest.approx(.15,abs=1e-12)
+
+
+def test_sparse_straight_supports_do_not_create_artificial_holes_for_fillet():
+    from contour_agent.topology_editing import _refined_straight_fillet
+    parts=_corner_parts();arc=_sample_entities(parts[1:2],max_step_px=.5)[0]
+    sparse=np.vstack([parts[0]["start"],arc,parts[-1]["end"]])
+    result=_refined_straight_fillet(sparse,20.,.5,_binding())
+    assert result[1]["radius"]==20.
+    assert result[1]["source_refinement"]["maximum_reverse_error_px"]<.5
+    assert result[0]["start"]==parts[0]["start"] and result[-1]["end"]==parts[-1]["end"]
+    assert result[1]["source_refinement"]["outer_endpoints_fixed"]
+
+
+def test_fillet_refinement_cannot_accept_optimizer_nonconvergence(monkeypatch):
+    import contour_agent.topology_editing as editing
+    actual=editing.minimize
+    def exhausted(*args,**kwargs):
+        fit=actual(*args,**kwargs);fit.success=False
+        return fit
+    monkeypatch.setattr(editing,"minimize",exhausted)
+    source=_sample_entities(_corner_parts(),max_step_px=.5)[0]
+    with pytest.raises(ValueError,match="source_does_not_support_exact_annotated_fillet"):
+        editing._refined_straight_fillet(source,20.,.5,_binding())

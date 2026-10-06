@@ -15,10 +15,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
 from .ocr import canonical_records
-from .topology import _StrokeEvidence, _primitive_distance
+from .topology import _StrokeEvidence, _primitive_distance, stroke_support_fraction
 from .topology_candidates import (
     _affines, _annotation_inventory, _base_source_entities, _base_source_ring,
     _entity_annotation_support, _planner_fields, _read_image, _render_overlay,
@@ -36,7 +37,72 @@ def _edit_minimum(action):
     return 2 if action.startswith("merge_chain_") else 1
 
 
-def propose_annotation_arc_edits(graph, inventory, *, limit=4):
+def _source_endpoint_pair(graph, entity):
+    nodes = {row.get("id"): row for row in graph.get("nodes", []) if isinstance(row, dict)}
+    a = nodes.get(entity.get("start_node"), {}).get("source_px")
+    b = nodes.get(entity.get("end_node"), {}).get("source_px")
+    if a is None or b is None:
+        if graph.get("units") != "pixel":
+            return None
+        a, b = entity.get("start"), entity.get("end")
+    pair = np.asarray([a, b], float)
+    return pair if pair.shape == (2, 2) and np.isfinite(pair).all() else None
+
+
+def _complete_fillet_support_scope(graph, inventory, operation):
+    """Include the missing support beyond a short, source-targeted corner.
+
+    Only the two existing outermost primitives can trigger one-neighbor
+    expansion. This is a bounded edit hypothesis, never acceptance evidence.
+    """
+    requested = list(operation.get("entity_ids") or [])
+    if operation.get("action") != "insert_annotated_fillet" or graph.get("units") != "mm":
+        return requested
+    indices = _ordered_indices(graph, requested, minimum=1)
+    entities = graph["entities"]
+    record = next((r for r in inventory if r.get("record_id") == operation.get("record_id")), {})
+    nominal = record.get("nominal")
+    if isinstance(nominal, bool) or not isinstance(nominal, (int, float)) or not math.isfinite(nominal) or nominal <= 0:
+        return requested
+    support = next((r for r in graph.get("annotation_support", [])
+                    if r.get("record_id") == operation.get("record_id") and r.get("arrowhead_verified") is True
+                    and r.get("candidate_entity_id") in requested), None)
+    if support is None:
+        return requested
+    target = (support.get("source_evidence") or {}).get("target_source_px")
+    if target is None:
+        target = (record.get("leader") or {}).get("target_source_px")
+    target = np.asarray(target, float)
+    if target.shape != (2,) or not np.isfinite(target).all():
+        return requested
+    expanded = list(indices)
+    for endpoint, step in ((indices[0], -1), (indices[-1], 1)):
+        if len(expanded) >= min(8, len(entities)-1):
+            break
+        entity = entities[endpoint]
+        pair = _source_endpoint_pair(graph, entity)
+        if pair is None or entity.get("type") not in {"LINE", "ARC"}:
+            continue
+        if not all(isinstance(entity.get(key), (list, tuple)) and len(entity[key]) == 2
+                   for key in ("start", "end")):
+            continue
+        length = math.dist(entity["start"], entity["end"])
+        source_length = float(np.linalg.norm(pair[1]-pair[0]))
+        if length <= 1e-9 or source_length <= 1e-9 or length > 2*nominal:
+            continue
+        radius_px = nominal*source_length/length
+        if float(np.linalg.norm(pair-target, axis=1).min()) > 2*radius_px:
+            continue
+        neighbor = (endpoint+step) % len(entities)
+        other = entities[neighbor]
+        if (neighbor in expanded or other.get("type") not in {"LINE", "ARC"}
+                or math.dist(other["start"], other["end"]) <= 1.5*length):
+            continue
+        expanded = [neighbor, *expanded] if step < 0 else [*expanded, neighbor]
+    return [entities[index]["id"] for index in expanded]
+
+
+def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius_record_ids=None):
     """Create bounded source hypotheses; the executor/evaluator still validate.
 
     Reserve room for a directed small fillet and a shallow unlabelled ARC->LINE
@@ -55,17 +121,8 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4):
         by_entity.setdefault(row["candidate_entity_id"], []).append(row)
     ranked, fillets = [], []
     ordered_entities = list(entities.values())
-    nodes = {row.get("id"): row for row in graph.get("nodes", []) if isinstance(row, dict)}
-
     def source_endpoints(entity):
-        a = nodes.get(entity.get("start_node"), {}).get("source_px")
-        b = nodes.get(entity.get("end_node"), {}).get("source_px")
-        if a is None or b is None:
-            if graph.get("units") != "pixel":
-                return None
-            a, b = entity.get("start"), entity.get("end")
-        pair = np.asarray([a, b], float)
-        return pair if pair.shape == (2, 2) and np.isfinite(pair).all() else None
+        return _source_endpoint_pair(graph, entity)
 
     def propose_endpoint_fillet(entity_id, support, record, mismatch, primitive_conflict):
         # Two labels may name different small features at opposite ends of a
@@ -84,13 +141,27 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4):
         gaps = np.linalg.norm(endpoints - target, axis=1)
         near = int(np.argmin(gaps))
         chord = float(np.linalg.norm(endpoints[1] - endpoints[0]))
-        if float(gaps[near]) > max(8 * float(graph.get("source_grid_pitch_px") or 1.), .30 * chord):
+        # Legacy graphs may only carry node IDs/source-pixel endpoints.  Only
+        # native millimetre endpoints can justify the radius-based reach here.
+        native_endpoints = np.asarray([
+            entities[entity_id].get("start"), entities[entity_id].get("end")
+        ], dtype=float)
+        corner_transition = (
+            graph.get("units") == "mm"
+            and native_endpoints.shape == (2, 2)
+            and np.isfinite(native_endpoints).all()
+            and math.dist(*native_endpoints) <= 2 * float(record["nominal"])
+        )
+        reach = chord if corner_transition else .30*chord
+        if float(gaps[near]) > max(8 * float(graph.get("source_grid_pitch_px") or 1.), reach):
             return
         position = next(i for i, row in enumerate(ordered_entities) if row["id"] == entity_id)
         pair = ([ordered_entities[(position - 1) % len(ordered_entities)]["id"], entity_id]
                 if near == 0 else [entity_id, ordered_entities[(position + 1) % len(ordered_entities)]["id"]])
-        fillets.append((mismatch, {"action": "insert_annotated_fillet", "entity_ids": pair,
-            "record_id": record["record_id"], "evidence_tags": ["annotation_target", "source_boundary"]}))
+        operation = {"action": "insert_annotated_fillet", "entity_ids": pair,
+            "record_id": record["record_id"], "evidence_tags": ["annotation_target", "source_boundary"]}
+        operation["entity_ids"] = _complete_fillet_support_scope(graph, inventory, operation)
+        fillets.append((mismatch, operation))
 
     for entity_id, rows in by_entity.items():
         entity = entities[entity_id]
@@ -159,6 +230,46 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4):
             "evidence_tags": ["source_boundary", "collinear_support"]}))
     reserved = [row[1] for row in sorted(fillets, key=lambda row: row[0], reverse=True)[:1]]
     reserved.extend(row[1] for row in sorted(straight, key=lambda row: row[0], reverse=True)[:1])
+    # A verified radius can land on a primitive containing two true source
+    # arcs. Reserve a partition hypothesis before repeatedly forcing either
+    # annotation onto that whole primitive. The executor still checks every
+    # target, exact radius, source sample and whole-contour acceptance gate.
+    positions={row["id"]:i for i,row in enumerate(ordered_entities)}
+    verified=sorted([row for row in supports if row.get("arrowhead_verified") is True],
+                    key=lambda row:positions[row["candidate_entity_id"]])
+    unresolved=set(unresolved_radius_record_ids or [])
+    partitions=[]
+    for first,second in zip(verified,verified[1:]):
+        lo,hi=positions[first["candidate_entity_id"]],positions[second["candidate_entity_id"]]
+        if (hi-lo>2 or first["record_id"]==second["record_id"] or
+                records[first["record_id"]].get("nominal")==records[second["record_id"]].get("nominal")):
+            continue
+        # Start with the smallest named span containing both observed targets;
+        # adding unlabelled neighbors can introduce a straight tail or another
+        # fillet outside this exact-radius partition's declared scope.
+        indices=range(lo,hi+1)
+        ids=[ordered_entities[index]["id"] for index in indices]
+        included={row["record_id"] for row in verified if row["candidate_entity_id"] in ids}
+        if 2<=len(included)<=3 and 1<=len(ids)<=8:
+            # A target on an *outer* endpoint needs the neighbor on its other
+            # side. Prefer enclosing it at an internal joint, and avoid
+            # repeatedly consuming the sole partition slot on an already
+            # constructed radius merely because it occurs first in the cycle.
+            first_pair=source_endpoints(ordered_entities[lo]);last_pair=source_endpoints(ordered_entities[hi])
+            outer_targets=0
+            if first_pair is not None and last_pair is not None:
+                outer=np.asarray([first_pair[0],last_pair[1]])
+                for support in (row for row in verified if row["record_id"] in included):
+                    target=(support.get("source_evidence") or {}).get("target_source_px")
+                    if target is None:target=(records[support["record_id"]].get("leader") or {}).get("target_source_px")
+                    if target is not None and np.asarray(target).shape==(2,):
+                        outer_targets+=int(np.linalg.norm(outer-np.asarray(target,float),axis=1).min()<=2.25*float(graph.get("source_grid_pitch_px") or 1.))
+            protected_count=sum(bool(entities[entity_id].get("radius_binding")) for entity_id in ids)
+            priority=(len(included&unresolved),-outer_targets,-protected_count,-len(ids))
+            partitions.append((priority,{"action":"split_chain_at_source_features","entity_ids":ids,"record_id":None,
+                                          "evidence_tags":["annotation_target","source_boundary","continuity"]}))
+    if partitions:
+        reserved.insert(0,max(partitions,key=lambda row:row[0])[1])
     return [*reserved[:limit], *[operation for _, operation in ranked[:max(0, limit - len(reserved))]]]
 
 
@@ -213,7 +324,7 @@ def _ring_path(ring, start, end, chain_samples):
         if len(candidate) < 2:
             return math.inf
         first_distance = cKDTree(chain_samples).query(candidate, workers=1)[0]
-        second_distance = cKDTree(candidate).query(chain_samples, workers=1)[0]
+        second_distance = _source_polyline_distance(chain_samples, candidate)
         # P95 is less sensitive to the exact endpoint rasterization; the small
         # length term prevents selecting the rest of the closed profile.
         return float(np.percentile(first_distance, 95) + np.percentile(second_distance, 95)
@@ -427,7 +538,83 @@ def _split_source_chain(points, tolerance, *, maximum_pieces=4):
     raise ValueError("source_features_exceed_bounded_replacement_budget")
 
 
-def _annotated_line_fillet(points, radius, tolerance, binding):
+def _source_polyline_distance(samples, points):
+    """Exact point-to-segment distance; sparse contour vertices are not holes."""
+    samples=np.asarray(samples,float);points=np.asarray(points,float)
+    starts=points[:-1];vectors=np.diff(points,axis=0);lengths=np.sum(vectors*vectors,axis=1)
+    valid=lengths>1e-20;starts=starts[valid];vectors=vectors[valid];lengths=lengths[valid]
+    if not len(starts):return np.linalg.norm(samples-points[0],axis=1)
+    distances=[]
+    for offset in range(0,len(samples),128):
+        relative=samples[offset:offset+128,None,:]-starts[None,:,:]
+        fraction=np.clip(np.sum(relative*vectors[None,:,:],axis=2)/lengths[None,:],0.,1.)
+        distances.extend(np.min(np.linalg.norm(relative-fraction[:,:,None]*vectors[None,:,:],axis=2),axis=1))
+    return np.asarray(distances)
+
+
+def _refined_straight_fillet(points, radius, tolerance, binding):
+    """Jointly adjust two source support directions with fixed outer endpoints.
+
+    The circle is constructed from the annotation at every trial. Only two
+    support angles and a minimax epigraph variable are optimized; no free
+    radius, source points, outer endpoints or acceptance budgets are changed.
+    """
+    a,b=points[0],points[-1];target=np.asarray(binding["target_source_px"],float)
+    stations=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(points,axis=0),axis=1))]
+    if stations[-1]<=1e-8:raise ValueError("source_does_not_support_exact_annotated_fillet")
+    def station_point(fraction):
+        return np.array([np.interp(fraction*stations[-1],stations,points[:,axis]) for axis in range(2)])
+    directions=[station_point(.1)-a,b-station_point(.9)]
+    angles=np.array([math.atan2(d[1],d[0]) for d in directions])
+    angle_scale=tolerance/max(radius,float(np.linalg.norm(b-a)),tolerance)
+    def construct(vector):
+        headings=angles+vector[:2]*angle_scale
+        u=np.array([math.cos(headings[0]),math.sin(headings[0])]);v=np.array([math.cos(headings[1]),math.sin(headings[1])])
+        turn=math.atan2(float(u[0]*v[1]-u[1]*v[0]),float(u@v))
+        if not math.radians(5)<=abs(turn)<=math.radians(160):return None
+        try:lengths=np.linalg.solve(np.column_stack([u,v]),b-a)
+        except np.linalg.LinAlgError:return None
+        distance=radius*math.tan(abs(turn)/2)
+        if min(lengths)<=distance+tolerance:return None
+        corner=a+lengths[0]*u;first=corner-distance*u;last=corner+distance*v
+        center=first+np.array([-u[1],u[0]])*math.copysign(radius,turn)
+        return [{"type":"LINE","start":a.tolist(),"end":first.tolist()},
+                {"type":"ARC","start":first.tolist(),"end":last.tolist(),"center":center.tolist(),"radius":float(radius),"clockwise":turn<0},
+                {"type":"LINE","start":last.tolist(),"end":b.tolist()}]
+    def errors(vector):
+        candidate=construct(vector)
+        if candidate is None:return np.full(len(points)+1,1e6)
+        distance=np.min(np.asarray([_primitive_distance(points,e) for e in candidate]),axis=0)/tolerance
+        target_gap=float(_primitive_distance(target[None,:],candidate[1])[0])/max(1.,tolerance)
+        return np.r_[distance,target_gap]
+    initial=np.array([0.,0.,max(1.,float(errors(np.zeros(3)).max()))])
+    if initial[2]>1e5:raise ValueError("source_does_not_support_exact_annotated_fillet")
+    fit=minimize(lambda x:x[2]+1e-9*float(x[:2]@x[:2]),initial,method="SLSQP",
+                 bounds=[(-8.,8.),(-8.,8.),(0.,max(8.,initial[2]+1.))],
+                 constraints=[{"type":"ineq","fun":lambda x:x[2]-errors(x)}],
+                 options={"maxiter":120,"ftol":1e-10})
+    candidate=construct(fit.x)
+    if not fit.success or candidate is None or float(errors(fit.x).max())>1.+1e-10:
+        raise ValueError("source_does_not_support_exact_annotated_fillet")
+    distances=np.asarray([_primitive_distance(points,e) for e in candidate]);assignments=np.argmin(distances,axis=0)
+    if np.count_nonzero(assignments==1)<3 or np.any(np.diff(assignments)<0):
+        raise ValueError("source_does_not_support_exact_annotated_fillet")
+    sampled=_sample_entities(candidate,max_step_px=max(.25,min(1.,tolerance/2)))[0]
+    forward=float(cKDTree(sampled).query(points,workers=1)[0].max())
+    reverse=float(_source_polyline_distance(sampled,points).max())
+    if max(forward,reverse)>max(tolerance*1.5,1.):
+        raise ValueError("source_does_not_support_exact_annotated_fillet")
+    for index,e in enumerate(candidate):
+        assigned=distances[index,assignments==index]
+        e["fit_error_px"]=float(assigned.max()) if len(assigned) else 0.
+    candidate[1].update(radius_binding=copy.deepcopy(binding),radius_annotation_evidence=copy.deepcopy(binding),
+        radius_binding_status="applied",fillet_construction="source_support_joint_angle_minimax",
+        source_refinement={"outer_endpoints_fixed":True,"radius_exact":True,"optimizer_iterations":int(fit.nit),
+                           "maximum_source_error_px":float(distances.min(axis=0).max()),"maximum_reverse_error_px":reverse})
+    return candidate
+
+
+def _annotated_straight_fillet(points, radius, tolerance, binding):
     """Construct an exact tangent LINE/ARC/LINE corner from source evidence.
 
     Outer endpoints are fixed. Internal tangent points are constructed locally
@@ -493,7 +680,7 @@ def _annotated_line_fillet(points, radius, tolerance, binding):
             # Local bidirectional check prevents an analytic tangent arc from
             # taking an unsupported shortcut between valid endpoints.
             forward = float(cKDTree(sampled).query(points, workers=1)[0].max())
-            reverse = float(cKDTree(points).query(sampled, workers=1)[0].max())
+            reverse = float(_source_polyline_distance(sampled, points).max())
             if max(forward, reverse) > max(tolerance * 1.5, 1.):
                 continue
             choices.append((max(forward, reverse), sum(p["fit_error_px"] for p in candidate), candidate))
@@ -502,10 +689,173 @@ def _annotated_line_fillet(points, radius, tolerance, binding):
     return min(choices, key=lambda row: row[:2])[2]
 
 
+def _fillet_offset_loci(primitive, radius):
+    """Possible fillet-center loci for a locally source-fitted support."""
+    if primitive["type"] == "LINE":
+        a, b = np.asarray(primitive["start"]), np.asarray(primitive["end"])
+        direction = (b-a)/np.linalg.norm(b-a)
+        normal = np.array([-direction[1], direction[0]])
+        return [{"type": "LINE", "point": a+sign*radius*normal, "direction": direction}
+                for sign in (-1, 1)]
+    center = np.asarray(primitive["center"])
+    return [{"type": "CIRCLE", "center": center, "radius": distance}
+            for distance in (primitive["radius"]+radius, abs(primitive["radius"]-radius))
+            if distance > 1e-8]
+
+
+def _fillet_locus_intersections(first, second):
+    if first["type"] == second["type"] == "LINE":
+        try:
+            distance = np.linalg.solve(np.column_stack([first["direction"], -second["direction"]]),
+                                       second["point"]-first["point"])[0]
+            return [first["point"]+distance*first["direction"]]
+        except np.linalg.LinAlgError:
+            return []
+    if first["type"] == "LINE" or second["type"] == "LINE":
+        line, circle = (first, second) if first["type"] == "LINE" else (second, first)
+        projection = float((circle["center"]-line["point"]) @ line["direction"])
+        nearest = line["point"]+projection*line["direction"]
+        height_squared = circle["radius"]**2-float(np.sum((nearest-circle["center"])**2))
+        if height_squared < -1e-9:
+            return []
+        height = math.sqrt(max(0., height_squared))
+        return [nearest+sign*height*line["direction"] for sign in (-1, 1)]
+    delta = second["center"]-first["center"]
+    distance = float(np.linalg.norm(delta))
+    r1, r2 = first["radius"], second["radius"]
+    # Coincident offset circles do not establish a unique source-supported
+    # fillet center. Reject the underdetermined family rather than invent one.
+    if distance <= 1e-8 or distance > r1+r2+1e-9 or distance < abs(r1-r2)-1e-9:
+        return []
+    along = (r1*r1-r2*r2+distance*distance)/(2*distance)
+    height_squared = r1*r1-along*along
+    if height_squared < -1e-9:
+        return []
+    unit = delta/distance; middle = first["center"]+along*unit
+    normal = np.array([-unit[1], unit[0]])
+    return [middle+sign*math.sqrt(max(0., height_squared))*normal for sign in (-1, 1)]
+
+
+def _fillet_contact(primitive, center, radius):
+    if primitive["type"] == "LINE":
+        a, b = np.asarray(primitive["start"]), np.asarray(primitive["end"])
+        unit = (b-a)/np.linalg.norm(b-a)
+        return [a+float((center-a) @ unit)*unit]
+    source_center = np.asarray(primitive["center"])
+    distance = float(np.linalg.norm(center-source_center))
+    if distance <= 1e-8:
+        return []
+    unit = (center-source_center)/distance
+    return [point for sign in (-1, 1)
+            if abs(float(np.linalg.norm((point := source_center+sign*primitive["radius"]*unit)-center))-radius)
+            <= max(1e-7, radius*1e-10)]
+
+
+def _fillet_tangent(primitive, endpoint):
+    if primitive["type"] == "LINE":
+        tangent = np.asarray(primitive["end"])-primitive["start"]
+    else:
+        radial = np.asarray(primitive[endpoint])-primitive["center"]
+        tangent = np.array([-radial[1], radial[0]])*(-1 if primitive["clockwise"] else 1)
+    return tangent/max(float(np.linalg.norm(tangent)), 1e-12)
+
+
+def _annotated_curved_fillet(points, radius, tolerance, binding):
+    """Construct exact tangent fillets with one or two circular supports.
+
+    Only source-fitted side circles determine the offset loci. Their outer
+    endpoints remain fixed; no model coordinates or guessed support centers
+    enter construction. The existing whole-chain gates remain authoritative.
+    """
+    target = np.asarray(binding["target_source_px"], float)
+    landmarks = _source_landmarks(points, maximum=26)
+    prefixes, suffixes = {}, {}
+    for index in landmarks[1:-1]:
+        for table, part in ((prefixes, points[:index+1]), (suffixes, points[index:])):
+            if np.linalg.norm(part[-1]-part[0]) <= max(tolerance*2., radius*.1):
+                continue
+            primitive = _line(part, tolerance) or _arc(part, tolerance)
+            if primitive is not None:
+                table[index] = primitive
+    choices = []
+    for i, before in prefixes.items():
+        for j, after in suffixes.items():
+            if j <= i or before["type"] == after["type"] == "LINE":
+                continue
+            for first_locus in _fillet_offset_loci(before, radius):
+                for last_locus in _fillet_offset_loci(after, radius):
+                    for center in _fillet_locus_intersections(first_locus, last_locus):
+                        for first in _fillet_contact(before, center, radius):
+                            for last in _fillet_contact(after, center, radius):
+                                prefix, suffix = copy.deepcopy(before), copy.deepcopy(after)
+                                prefix["end"], suffix["start"] = first.tolist(), last.tolist()
+                                if any(np.linalg.norm(np.asarray(p["end"])-p["start"]) <= tolerance
+                                       for p in (prefix, suffix)):
+                                    continue
+                                for clockwise in (False, True):
+                                    arc = {"type": "ARC", "start": first.tolist(), "end": last.tolist(),
+                                           "center": center.tolist(), "radius": float(radius), "clockwise": clockwise}
+                                    if (_fillet_tangent(prefix, "end") @ _fillet_tangent(arc, "start") < 1-1e-8 or
+                                            _fillet_tangent(arc, "end") @ _fillet_tangent(suffix, "start") < 1-1e-8):
+                                        continue
+                                    start_angle = math.atan2(first[1]-center[1], first[0]-center[0])
+                                    end_angle = math.atan2(last[1]-center[1], last[0]-center[0])
+                                    sweep = ((start_angle-end_angle) if clockwise else (end_angle-start_angle)) % (2*math.pi)
+                                    if not math.radians(5) <= sweep <= math.radians(160):
+                                        continue
+                                    candidate = [prefix, arc, suffix]
+                                    distances = np.asarray([_primitive_distance(points, item) for item in candidate])
+                                    assignments = np.argmin(distances, axis=0)
+                                    if (np.count_nonzero(assignments == 1) < 3 or np.any(np.diff(assignments) < 0) or
+                                            float(distances.min(axis=0).max()) > tolerance or
+                                            float(_primitive_distance(target[None, :], arc)[0]) > max(1., tolerance)):
+                                        continue
+                                    try:
+                                        sampled, _, _ = _sample_entities(candidate, max_step_px=max(.25, min(1., tolerance/2)))
+                                    except ValueError:
+                                        continue
+                                    forward = float(cKDTree(sampled).query(points, workers=1)[0].max())
+                                    reverse = float(_source_polyline_distance(sampled, points).max())
+                                    if max(forward, reverse) > max(tolerance*1.5, 1.):
+                                        continue
+                                    for index, primitive in enumerate(candidate):
+                                        assigned = distances[index, assignments == index]
+                                        primitive["fit_error_px"] = float(assigned.max()) if len(assigned) else math.inf
+                                    arc.update(radius_binding=copy.deepcopy(binding), radius_annotation_evidence=copy.deepcopy(binding),
+                                               radius_binding_status="applied", fillet_construction="source_support_offset_loci")
+                                    choices.append((max(forward, reverse), sum(p["fit_error_px"] for p in candidate), candidate))
+    if not choices:
+        raise ValueError("source_does_not_support_exact_annotated_fillet")
+    return min(choices, key=lambda row: row[:2])[2]
+
+
+def _annotated_line_fillet(points, radius, tolerance, binding):
+    """Historical entry point, now supporting LINE or ARC on either side."""
+    try:
+        return _annotated_straight_fillet(points, radius, tolerance, binding)
+    except ValueError as error:
+        if str(error) != "source_does_not_support_exact_annotated_fillet":
+            raise
+        try:
+            return _annotated_curved_fillet(points, radius, tolerance, binding)
+        except ValueError as curved_error:
+            if str(curved_error) != "source_does_not_support_exact_annotated_fillet":
+                raise
+            return _refined_straight_fillet(points, radius, tolerance, binding)
+
+
 def _replacement_chain(support, action, tolerance, selected_entities, *, force_arc=False,
-                       annotated_radius_px=None, radius_binding=None):
+                       annotated_radius_px=None, radius_binding=None, radius_targets=None, candidate_scorer=None):
     if action == "split_chain_at_source_features":
-        replacements = _split_source_chain(support, tolerance)
+        if radius_targets and len(radius_targets)>=2:
+            from .annotated_arc_resegmentation import resegment_annotated_arcs
+            partition=resegment_annotated_arcs(support,radius_targets,tolerance,source_entity_count=len(selected_entities),
+                                              candidate_scorer=candidate_scorer)
+            replacements=partition["entities"]
+            for entity in replacements:
+                entity["source_partition_evidence"]={key:value for key,value in partition.items() if key!="entities"}
+        else:
+            replacements = _split_source_chain(support, tolerance)
     elif action == "insert_annotated_fillet":
         replacements = _annotated_line_fillet(support, annotated_radius_px, tolerance, radius_binding)
     else:
@@ -547,11 +897,33 @@ def _replacement_chain(support, action, tolerance, selected_entities, *, force_a
     return replacements
 
 
-def _apply_one(graph, baseline, operation, inventory):
+def _verified_partition_targets(graph, inventory, entity_ids, design_to_source, support=None):
+    targets=[];seen=set()
+    for row in graph.get("annotation_support",[]):
+        if (row.get("kind")!="radius" or row.get("arrowhead_verified") is not True or
+                row.get("candidate_entity_id") not in entity_ids or row.get("record_id") in seen):
+            continue
+        _,radius,binding=_radius_edit_evidence(graph,{"action":"refit_chain_as_annotated_arc",
+                                                     "record_id":row["record_id"]},inventory,entity_ids,design_to_source)
+        if binding and binding.get("arrowhead_verified") is True and binding.get("target_source_px") is not None:
+            if support is not None and min(math.dist(binding["target_source_px"],support[index]) for index in (0,-1))<=1e-6:
+                # A target exactly at the open chain boundary does not locate
+                # an interior arc: its feature may start in the neighboring
+                # chain. Keep that record unresolved in the global inventory,
+                # rather than inventing a zero-length final radius segment.
+                continue
+            targets.append({"record_id":row["record_id"],"radius_px":radius,"nominal":binding["nominal"],
+                            "source_arrow_verified":True,"target_source_px":binding["target_source_px"],"binding":binding})
+            seen.add(row["record_id"])
+    return targets
+
+
+def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
     action = operation.get("action")
     if action not in EDIT_ACTIONS:
         raise ValueError("unsupported_topology_edit_action")
-    entity_ids = operation.get("entity_ids")
+    requested_entity_ids = operation.get("entity_ids")
+    entity_ids = _complete_fillet_support_scope(graph, inventory, operation)
     minimum = _edit_minimum(action)
     indices = _ordered_indices(graph, entity_ids, minimum=minimum)
     if action == "refit_entity_as_line" and len(indices) != 1:
@@ -571,8 +943,11 @@ def _apply_one(graph, baseline, operation, inventory):
     end = np.asarray(selected_entities[-1]["end"], float)
     support, localization_mismatch = _ring_path(ring, start, end, chain_samples)
     tolerance = max(.25, float(graph.get("proposal_tolerance_px") or grid))
+    radius_targets=(_verified_partition_targets(graph,inventory,entity_ids,design_to_source,support)
+                    if action=="split_chain_at_source_features" else None)
     replacements = _replacement_chain(support, action, tolerance, selected_entities, force_arc=force_arc,
-                                      annotated_radius_px=annotated_radius_px, radius_binding=radius_binding)
+                                      annotated_radius_px=annotated_radius_px, radius_binding=radius_binding,
+                                      radius_targets=radius_targets,candidate_scorer=candidate_scorer)
 
     start_index = indices[0]
     rotated = source_entities[start_index:] + source_entities[:start_index]
@@ -593,6 +968,8 @@ def _apply_one(graph, baseline, operation, inventory):
         raise ValueError("edited_boundary_deviation_exceeds_budget")
     return updated, quality, {
         "action": action, "entity_ids": list(entity_ids),
+        "requested_entity_ids": list(requested_entity_ids),
+        "support_scope_expanded": list(entity_ids) != list(requested_entity_ids),
         "record_id": operation.get("record_id"),
         "evidence_tags": list(operation.get("evidence_tags") or []),
         "removed_entity_count": len(indices), "replacement_count": len(replacements),
@@ -600,7 +977,10 @@ def _apply_one(graph, baseline, operation, inventory):
         "replacement_types": [row["type"] for row in replacements],
         "net_entity_reduction": len(indices) - len(replacements),
         "replacement_fit_error_px": max(float(row.get("fit_error_px", 0.)) for row in replacements),
-        "annotation_guided": bool(radius_binding),
+        "annotation_guided": bool(radius_binding) or bool(radius_targets and len(radius_targets)>=2),
+        "resegmentation_applied": any(bool(row.get("source_partition_evidence")) for row in replacements),
+        "bound_record_ids": sorted({row["radius_binding"]["record_id"] for row in replacements
+                                    if row.get("radius_binding") and row["radius_binding"].get("record_id")}),
         "radius_binding_applied": any(bool(row.get("radius_binding")) for row in replacements),
         "radius_binding": next((row["radius_binding"] for row in replacements if row.get("radius_binding")), None),
         "radius_binding_status": ("applied" if any(row.get("radius_binding") for row in replacements)
@@ -614,7 +994,7 @@ def _apply_one(graph, baseline, operation, inventory):
     }
 
 
-def _apply_combined(graph, baseline, operations, inventory):
+def _apply_combined(graph, baseline, operations, inventory, *, candidate_scorer=None):
     """Apply non-overlapping, non-wrapping edits against the same source cycle."""
     if len(operations) < 2:
         raise ValueError("combined_edit_requires_multiple_operations")
@@ -632,7 +1012,8 @@ def _apply_combined(graph, baseline, operations, inventory):
         if action not in EDIT_ACTIONS:
             raise ValueError("unsupported_topology_edit_action")
         minimum = _edit_minimum(action)
-        indices = _ordered_indices(graph, operation.get("entity_ids"), minimum=minimum)
+        effective_ids = _complete_fillet_support_scope(graph, inventory, operation)
+        indices = _ordered_indices(graph, effective_ids, minimum=minimum)
         # A chain crossing the cycle origin is still valid as a standalone
         # candidate.  Keeping combined edits non-wrapping makes the splice
         # auditable and prevents ambiguous remapping of the original IDs.
@@ -641,7 +1022,7 @@ def _apply_combined(graph, baseline, operations, inventory):
         if occupied.intersection(indices):
             raise ValueError("combined_edit_chains_overlap")
         occupied.update(indices)
-        individual, _, detail = _apply_one(graph, baseline, operation, inventory)
+        individual, _, detail = _apply_one(graph, baseline, operation, inventory,candidate_scorer=candidate_scorer)
         # _apply_one rotates the named replacement to the beginning of its
         # standalone cycle, and explicitly reports how many pieces it emitted.
         replacements[indices[0]] = (len(indices), individual[:detail["replacement_count"]])
@@ -676,6 +1057,9 @@ def _apply_combined(graph, baseline, operations, inventory):
         "removed_entity_count": int(sum(row["removed_entity_count"] for row in details)),
         "replacement_count": sum(row["replacement_count"] for row in details),
         "net_entity_reduction": int(sum(row["net_entity_reduction"] for row in details)),
+        "annotation_guided": any(row["annotation_guided"] for row in details),
+        "resegmentation_applied": any(row["resegmentation_applied"] for row in details),
+        "bound_record_ids": sorted({record for row in details for record in row["bound_record_ids"]}),
         "radius_binding_applied": any(row["radius_binding_applied"] for row in details),
         "feature_restoration_validated": any(row["feature_restoration_validated"] for row in details),
         "base_source_deviation_upper_px": float(base_upper),
@@ -712,6 +1096,11 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
     stroke = _StrokeEvidence(gray, records, grid)
     candidates, audit, accepted_operations = [], [], []
 
+    def candidate_scorer(entities):
+        sampled, _, _ = _sample_entities(entities,max_step_px=max(.5,min(2.,grid/2)))
+        measured=stroke.summarize(sampled)
+        return stroke_support_fraction(measured)
+
     def materialize(source_entities, quality, execution, candidate_id, strategy_description):
         sampled, _, _ = _sample_entities(source_entities, max_step_px=max(.5, min(2., grid / 2)))
         stroke_support = stroke.summarize(sampled)
@@ -719,7 +1108,7 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
         support_summary["source_stroke_support"] = stroke_support
         before = graph.get("source_evidence", {}).get("proposal_stroke_support") or stroke_support
         support_gate = bool(
-            float(stroke_support["edge_supported_fraction"]) >= float(before.get("edge_supported_fraction", 0.))-.035 and
+            stroke_support_fraction(stroke_support,against=before) >= stroke_support_fraction(before,against=stroke_support)-.035 and
             float(stroke_support["p90_edge_distance_px"]) <= float(before.get("p90_edge_distance_px", math.inf))+grid)
         if not support_gate:
             raise ValueError("edited_source_stroke_support_degraded")
@@ -759,7 +1148,7 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
                "ground_truth_used": False}
         try:
             source_entities, quality, execution = _apply_one(
-                graph, baseline, operation, bundle.get("annotation_inventory", []))
+                graph, baseline, operation, bundle.get("annotation_inventory", []),candidate_scorer=candidate_scorer)
             suffix = {"merge_chain_as_line": "line", "merge_chain_as_arc": "arc",
                       "merge_chain_best_fit": "best",
                       "refit_chain_as_annotated_arc": "annotated-arc",
@@ -772,7 +1161,7 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
                 "Agent proposed one entity-ID edit; the local source-only geometry kernel executed and refit it.")
             row.update(status="accepted_as_candidate", candidate_id=candidate_id, execution=execution,
                        entity_counts=counts)
-            accepted_operations.append((index, operation))
+            accepted_operations.append((index, {**operation,"entity_ids":execution["entity_ids"]}))
         except (ValueError, ArithmeticError, KeyError, TypeError) as error:
             row["reason"] = str(error)[:160]
         audit.append(row)
@@ -792,7 +1181,8 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
                "excluded_accepted_operation_indices": excluded}, "status": "rejected", "ground_truth_used": False}
         try:
             source_entities, quality, execution = _apply_combined(
-                graph, baseline, [operation for _, operation in subset], bundle.get("annotation_inventory", []))
+                graph, baseline, [operation for _, operation in subset], bundle.get("annotation_inventory", []),
+                candidate_scorer=candidate_scorer)
             candidate_id = "cand-edit-all"
             counts = materialize(
                 source_entities, quality, execution, candidate_id,

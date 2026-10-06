@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .binding_provider import validate_selection
 from .dimension_evidence import _axis_lines, _linear_witnesses
 from .ocr import canonical_records, parse_dimension
-from .structural_evidence import structural_evidence
+from .structural_evidence import structural_evidence, source_ink, _ink_trace
 
 
 def _write(path, value):
@@ -114,6 +114,143 @@ def _samples(entity, transform):
     return transform(center + float(entity["radius"]) * np.c_[np.cos(theta), np.sin(theta)])
 
 
+def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band, relations):
+    """Inspect source boundary joints without using fitted curve tangency as proof.
+
+    The immutable extraction boundary locates two exterior paths. Its quadratic
+    derivatives must agree at three scales before original ink is measured on
+    those paths. A mask alone, a fitted arc or a model verdict cannot admit a
+    tangent constraint. Existing source-verified relations stay unchanged.
+    """
+    raw = (model.get("extraction") or {}).get("raw_polyline_px")
+    if raw is None:
+        return relations
+    try:
+        ring = np.asarray(raw, float)
+        if ring.ndim != 2 or ring.shape[1] != 2 or len(ring) < 12 or not np.isfinite(ring).all():
+            return relations
+        if np.linalg.norm(ring[-1] - ring[0]) >= 1e-7:
+            return relations
+        ring = ring[:-1]
+        ring = ring[np.r_[True, np.linalg.norm(np.diff(ring, axis=0), axis=1) > 1e-7]]
+        delta = np.roll(ring, -1, axis=0) - ring
+        length = np.linalg.norm(delta, axis=1)
+        if len(ring) < 12 or np.any(length <= 1e-7):
+            return relations
+        cumulative = np.r_[0., np.cumsum(length)]
+        perimeter = float(cumulative[-1])
+        grid = float(graph.get("source_grid_pitch_px", 1.))
+        if not math.isfinite(grid) or grid <= 0:
+            return relations
+    except (ValueError, TypeError, IndexError):
+        return relations
+    closed = np.vstack([ring, ring[0]])
+    incident = defaultdict(list)
+    for entity in graph.get("entities", []):
+        for node in {entity.get("start_node"), entity.get("end_node")} - {None}:
+            incident[node].append(entity)
+    result = list(relations)
+    by_joint = {(frozenset(row["entities"]), tuple(row.get("nodes", []))): index
+                for index, row in enumerate(result) if row["type"] == "tangent"}
+    used_ids = {row["id"] for row in result}
+    ink = None
+    for node, adjacent in incident.items():
+        if len(adjacent) != 2 or len({entity["id"] for entity in adjacent}) != 2:
+            continue
+        if not any(entity.get("type") == "ARC" for entity in adjacent):
+            continue
+        shared = ({adjacent[0].get("start_node"), adjacent[0].get("end_node")} &
+                  {adjacent[1].get("start_node"), adjacent[1].get("end_node")}) - {None}
+        if shared != {node}:
+            continue
+        key = frozenset(entity["id"] for entity in adjacent), (node,)
+        index = by_joint.get(key)
+        if index is not None and result[index].get("local_reliable"):
+            continue
+        samples = [_samples(entity, transform) for entity in adjacent]
+        spans = [float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum()) for points in samples]
+        span = min(96., min(spans) * .45, perimeter * .05)
+        if span < max(24., 4 * band, 8 * grid):
+            continue
+        entity = adjacent[0]
+        endpoint = entity["end"] if entity.get("end_node") == node else entity["start"]
+        point = transform([endpoint])[0]
+        fraction = np.clip(np.sum((point - ring) * delta, axis=1) / length ** 2, 0., 1.)
+        projections = ring + fraction[:, None] * delta
+        gaps = np.linalg.norm(projections - point, axis=1)
+        segment = int(np.argmin(gaps))
+        if float(gaps[segment]) > band:
+            continue
+        station = float(cumulative[segment] + fraction[segment] * length[segment])
+        def path(direction, distances):
+            positions = (station + direction * distances) % perimeter
+            return np.c_[np.interp(positions, cumulative, closed[:, 0]),
+                         np.interp(positions, cumulative, closed[:, 1])]
+        directions, mask_sides = [], []
+        for side in (-1., 1.):
+            fits = []
+            for ratio in (.5, .75, 1.):
+                distances = np.linspace(0., span * ratio, 49)
+                points = path(side, distances)
+                parameter = distances / (span * ratio)
+                coefficients = np.polynomial.polynomial.polyfit(parameter, points, 2)
+                predicted = np.polynomial.polynomial.polyval(parameter, coefficients).T
+                vector = coefficients[1]
+                norm = float(np.linalg.norm(vector))
+                if norm < 1e-8:
+                    break
+                fits.append((vector / norm, float(np.percentile(np.linalg.norm(points - predicted, axis=1), 90))))
+            if len(fits) != 3:
+                break
+            disagreement = max(math.degrees(math.acos(float(np.clip(a[0] @ b[0], -1., 1.))))
+                               for a, b in product(fits, fits))
+            residual = max(item[1] for item in fits)
+            mask_sides.append({"scale_disagreement_degrees": disagreement,
+                               "fit_residual_p90_px": residual, "span_px": span})
+            if disagreement > 2. or residual > max(1.25, grid * .75):
+                break
+            directions.append(fits[-1][0])
+        if len(directions) != 2:
+            continue
+        mask_angle = math.degrees(math.acos(float(np.clip(-directions[0] @ directions[1], -1., 1.))))
+        if mask_angle > 3.:
+            continue
+        if ink is None:
+            _, ink = source_ink(gray, records)
+        traces = [_ink_trace(ink, path(side, np.linspace(0., span / .45, 129)), band)
+                  for side in (-1., 1.)]
+        ink_angle = None
+        verified = False
+        if all(trace.get("verified") for trace in traces):
+            ink_angle = math.degrees(math.acos(float(np.clip(-np.dot(
+                traces[0]["tangent_direction_px"], traces[1]["tangent_direction_px"]), -1., 1.))))
+            verified = ink_angle <= 3.
+        evidence = {"method": "raw_mask_multiscale_and_two_sided_source_ink_tangent_v1",
+                    "verified": verified, "shared_node": node, "sides": traces,
+                    "mask_sides": mask_sides, "mask_observed_deviation_degrees": mask_angle,
+                    "observed_deviation_degrees": ink_angle, "tolerance_degrees": 3.,
+                    "boundary_observation": "immutable_extraction_raw_polyline_px",
+                    "ground_truth_geometry_used": False,
+                    "reason": None if verified else "source_tangent_evidence_insufficient"}
+        if index is not None:
+            item = dict(result[index])
+            evidence["previous_geometry_seeded_evidence"] = item.get("evidence")
+        else:
+            number = len(result)
+            while f"rel{number:03d}" in used_ids:
+                number += 1
+            item = {"id": f"rel{number:03d}", "type": "tangent",
+                    "entities": [entity["id"] for entity in adjacent], "nodes": [node],
+                    "source": "source_boundary_hypothesis", "required": False}
+            used_ids.add(item["id"])
+        item.update(local_reliable=verified, evidence=evidence)
+        if index is None:
+            result.append(item)
+        else:
+            result[index] = item
+    return result
+
+
 def _leaders(gray, records):
     """Detected source strokes, not model-claimed arrows. OCR boxes are removed."""
     ratio = min(1., 1600/max(gray.shape))
@@ -141,7 +278,7 @@ def _label_ray_entry(point, away_from_target, low, high, maximum_gap):
         a=(low[axis]-point[axis])/velocity;b=(high[axis]-point[axis])/velocity
         enter=max(enter,min(a,b));leave=min(leave,max(a,b))
         if leave<enter:return None
-    return enter
+    return float(enter)
 
 
 def _arrowhead_evidence(gray, endpoint, direction, label_size, band, target_points=None):
@@ -194,7 +331,7 @@ def _arrowhead_evidence(gray, endpoint, direction, label_size, band, target_poin
                 ahead_ink.append(bool(np.any(gray[y[valid],x[valid]]<170)))
             forward_ink=float(np.mean(ahead_ink))
             if forward_ink>1/3:continue
-            score=body/max(shaft,1.) + body/max(narrow,1.)-abs(shift)/max(length,1.)
+            score=float(body/max(shaft,1.) + body/max(narrow,1.)-abs(shift)/max(length,1.))
             item={"method":"directed_source_ink_taper_and_shaft","tip_px":tip.tolist(),
                   "direction_px":direction.tolist(),"length_px":length,"cross_section_widths_px":widths,
                   "forward_ink_fraction":forward_ink,"score":score,"verified":True}
@@ -206,9 +343,9 @@ def _leader_contour_visibility(label_point, target_point, contours, band):
     """Check the directed label-to-tip path against the current source contour.
 
     A hatch stroke can pass the local arrow taper test at the opposite material
-    boundary. Such a stroke must not bind an arc beyond the first boundary it
-    crosses. The existing coarse target band allows adjacent primitives at the
-    same junction; it does not allow a separate intervening material boundary.
+    boundary. The first crossing remains an independent observation; callers
+    may admit a farther arrow only with complete source shaft and label proof.
+    The target band itself never hides a separate intervening boundary.
     """
     start, end = np.asarray(label_point, float), np.asarray(target_point, float)
     ray = end-start
@@ -276,20 +413,37 @@ def _leader_evidence(box, arc, center, lines, band, gray=None, contours=None, re
             if arrow is None:continue
             arrow_gap=float(np.min(np.linalg.norm(arc-np.asarray(arrow["tip_px"]),axis=1)))
             if arrow_gap>max(10.,band*1.7):continue
+            from .source_arrow_localization import source_label_shaft_ownership
+            ownership = source_label_shaft_ownership(gray, {"parsed": {"kind": "radius"}, "box": box.tolist()},
+                                                     arrow["tip_px"], unit)
+            if ownership["repetitive_label_crossing"]:
+                if rejections is not None and len(rejections) < 3:
+                    rejections.append({"leader_id": f"line{index:03d}", "reason": ownership["reason"],
+                                       "source_label_association": ownership})
+                continue
             visibility = _leader_contour_visibility(label_end-unit*ray_gap,arrow["tip_px"],
                                                      contours if contours is not None else [arc],band)
+            full = None
             if not visibility["verified"]:
-                if rejections is not None and len(rejections)<3:
-                    rejections.append({"leader_id":f"line{index:03d}",
-                                       "reason":"earlier_source_contour_intersection",**visibility})
-                continue
+                from .source_arrow_localization import verify_source_hough_leader
+                full = verify_source_hough_leader(gray,
+                    {"id": "source-hough", "parsed": {"kind": "radius"}, "box": box.tolist()},
+                    [label_end, target_end], arc, band, contours if contours is not None else [arc])
+                if full is None:
+                    if rejections is not None and len(rejections)<3:
+                        rejections.append({"leader_id":f"line{index:03d}",
+                                           "reason":"earlier_source_contour_intersection",**visibility})
+                    continue
             score = tip_gap + label_gap*.2 + (1-radial_alignment)*band*3
             item = {"method": "detected_source_leader_to_arc", "leader_id": f"line{index:03d}",
                     "segment_px": segment.tolist(), "label_gap_px": label_gap,
                     "arc_endpoint_gap_px": tip_gap, "radial_alignment": radial_alignment, "score": score,
                     "label_ray_intersection_gap_px":ray_gap,"arrowhead_verified":True,
                     "arrow_tip_to_arc_gap_px":arrow_gap,"arrowhead":arrow,
-                    "contour_visibility":visibility}
+                    "contour_visibility":visibility,"source_label_association":ownership}
+            if full is not None:
+                item.update({key: full[key] for key in ("method", "shaft_evidence", "crossing_source_contour",
+                             "crossing_admission", "proposal_origin", "model_proposal_used")})
             if best is None or score < best["score"]:
                 best = item
     return best
@@ -315,6 +469,455 @@ def _annotation_leader_segments(graph, record_id):
     return result
 
 
+def verify_source_arrow_proposal(gray, record, proposal, boundary_points, band, contours=None):
+    """Locally verify a provider's source-pixel hypothesis, never its verdict.
+
+    Radius leaders may cross material before reaching their real arrowhead.
+    Crossing admission requires the entire shaft, label ray and a filled
+    source arrow. Source Hough callers may use this identical proof; the
+    proposal origin does not substitute for or weaken any pixel check.
+    """
+    if record.get("parsed", {}).get("kind") != "radius" or not isinstance(proposal, dict):
+        return None
+    if proposal.get("record_id", record.get("id")) != record.get("id"):
+        return None
+    box = _box(record)
+    try:
+        shaft = np.asarray(proposal.get("shaft_px"), float)
+        tip = np.asarray(proposal.get("tip_px"), float)
+        boundary = np.asarray(boundary_points, float)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if (box is None or shaft.shape != (2,) or tip.shape != (2,) or
+            not np.isfinite([shaft, tip]).all() or boundary.ndim != 2 or
+            boundary.shape[1] != 2 or not len(boundary) or not np.isfinite(boundary).all()):
+        return None
+    if any(not (0 <= point[0] < gray.shape[1] and 0 <= point[1] < gray.shape[0]) for point in (shaft, tip)):
+        return None
+    lo, hi = box.min(axis=0), box.max(axis=0)
+    size = max(12., float(np.linalg.norm(hi-lo)))
+    delta = tip-shaft
+    length = float(np.linalg.norm(delta))
+    if length < 6.:
+        return None
+    direction = delta/length
+    ray_gap = _label_ray_entry(shaft, -direction, lo-2., hi+2., max(18., size*.75))
+    if ray_gap is None:
+        return None
+    arrow = _arrowhead_evidence(gray, tip, direction, size, band, boundary)
+    if arrow is None:
+        return None
+    actual_tip = np.asarray(arrow["tip_px"], float)
+    from .source_arrow_localization import source_label_shaft_ownership
+    ownership = source_label_shaft_ownership(gray, record, actual_tip, direction)
+    if ownership["repetitive_label_crossing"]:
+        return None
+    # A provider cannot point at one object and gain a stronger arrow far away.
+    if math.dist(actual_tip, tip) > max(10., .55*float(arrow["length_px"])):
+        return None
+    target_gap = float(np.min(np.linalg.norm(boundary-actual_tip, axis=1)))
+    if target_gap > max(10., band*1.7):
+        return None
+    label_exit = shaft-direction*ray_gap
+    path_length = float(np.linalg.norm(actual_tip-label_exit))
+    if path_length < 6.:
+        return None
+    points = np.linspace(label_exit, actual_tip, max(8, int(math.ceil(path_length))+1))
+    normal = np.array([-direction[1], direction[0]])
+    pixels = points[:, None, :]+np.arange(-2., 3.)[None, :, None]*normal
+    x = np.rint(pixels[:, :, 0]).astype(int); y = np.rint(pixels[:, :, 1]).astype(int)
+    valid = (x >= 0) & (x < gray.shape[1]) & (y >= 0) & (y < gray.shape[0])
+    ink = np.zeros(x.shape, bool); ink[valid] = gray[y[valid], x[valid]] < 170
+    support = np.any(ink, axis=1)
+    longest = running = 0
+    for present in support:
+        running = 0 if present else running+1
+        longest = max(longest, running)
+    maximum_gap = max(5., min(12., size*.10))
+    shaft_evidence = {"method": "full_source_shaft_pixel_support", "sample_count": len(points),
+                      "supported_fraction": float(np.mean(support)), "maximum_unobserved_run_px": longest,
+                      "maximum_allowed_gap_px": maximum_gap,
+                      "verified": bool(np.mean(support) >= .88 and longest <= maximum_gap)}
+    if not shaft_evidence["verified"]:
+        return None
+    visibility = _leader_contour_visibility(label_exit, actual_tip,
+                                           contours if contours is not None else [boundary], band)
+    return {"method": "agent_proposed_source_arrow_locally_verified",
+            "segment_px": [shaft.tolist(), tip.tolist()], "label_gap_px": ray_gap,
+            "label_ray_intersection_gap_px": ray_gap, "arrowhead_verified": True,
+            "arrowhead": arrow, "target_source_px": actual_tip.tolist(),
+            "arrow_tip_to_arc_gap_px": target_gap, "arc_endpoint_gap_px": target_gap,
+            "contour_visibility": visibility, "shaft_evidence": shaft_evidence,
+            "source_label_association": ownership,
+            "crossing_source_contour": not visibility["verified"],
+            "crossing_admission": "explicit_directed_proposal_with_full_source_shaft_and_arrow",
+            "score": target_gap+.2*ray_gap, "nominal_used_to_rank": False}
+
+
+def _radius_source_observations(gray, records, graph, transform, leaders, band, rejections=None, ownership_audit=None):
+    """Observe directed arrows before deciding whether their target is an ARC.
+
+    A LINE at a radius arrow is a topology defect, not an absent dimension.
+    Neither upstream entity IDs nor upstream arrow verdicts are accepted here;
+    only their source segment coordinates are reused and checked in the image.
+    """
+    paths = []
+    for entity in graph.get("entities", []):
+        coarse = _samples(entity, transform)
+        # Include interiors of long LINEs when checking an arrow tip. Existing
+        # arc samples are already in source coordinates; this is only sampling,
+        # not a geometry repair or a nominal-radius fit.
+        dense = [np.linspace(a, b, max(2, int(math.ceil(np.linalg.norm(b-a)/2.))+1))
+                 for a, b in zip(coarse[:-1], coarse[1:])]
+        if dense:
+            paths.append((entity, np.vstack(dense)))
+    if not paths:
+        return []
+    boundary = np.vstack([points for _, points in paths])
+    contours = [points for _, points in paths]
+    target_band = max(10., band*1.7)
+    observations = []
+    for row in records:
+        if row.get("parsed", {}).get("kind") != "radius":
+            continue
+        box = _box(row)
+        if box is None:
+            continue
+        lo, hi = box.min(axis=0), box.max(axis=0)
+        size = max(12., float(np.linalg.norm(hi-lo)))
+        found, seen = [], set()
+        from .source_arrow_localization import native_radius_leader_segments, verify_source_hough_leader
+        global_segments = leaders + _annotation_leader_segments(graph, row["id"])
+        native_segments = native_radius_leader_segments(gray, row, records)
+        for segment_index, segment in enumerate(global_segments + native_segments):
+            native_segment = segment_index >= len(global_segments)
+            key = tuple(np.round(np.asarray(segment).ravel(), 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            for label_end, target_end in (segment, segment[::-1]):
+                gap = float(np.linalg.norm(np.maximum(lo-label_end, 0)+np.minimum(hi-label_end, 0)))
+                if gap > max(18., size*.75):
+                    continue
+                delta = target_end-label_end
+                length = float(np.linalg.norm(delta))
+                if length < 1e-8:
+                    continue
+                direction = delta/length
+                ray_gap = _label_ray_entry(label_end, -direction, lo-2., hi+2., max(18., size*.75))
+                if ray_gap is None:
+                    continue
+                distances = np.linalg.norm(boundary-target_end, axis=1)
+                if float(distances.min()) > target_band:
+                    continue
+                local_boundary = boundary[distances <= max(120., size)]
+                arrow = _arrowhead_evidence(gray, target_end, direction, size, band, local_boundary)
+                if arrow is None:
+                    continue
+                tip = np.asarray(arrow["tip_px"], float)
+                from .source_arrow_localization import source_label_shaft_ownership
+                ownership = source_label_shaft_ownership(gray, row, tip, direction)
+                if ownership["repetitive_label_crossing"]:
+                    if rejections is not None and len(rejections) < 128:
+                        rejections.append({"record_id": row["id"], "reason": ownership["reason"],
+                                           "tip_px": tip.tolist(), "segment_px": np.asarray(segment).tolist(),
+                                           "source_label_association": ownership})
+                    continue
+                visibility = _leader_contour_visibility(label_end-direction*ray_gap, tip, contours, band)
+                # The first contour intersection and a local taper do not
+                # establish that the complete shaft belongs to this text.
+                # Every detection channel uses the same original-pixel proof.
+                full = verify_source_hough_leader(gray, row, [label_end, target_end], local_boundary,
+                                                 band, contours, verifier=verify_source_arrow_proposal)
+                if full is None:
+                    continue
+                arrow = full["arrowhead"]
+                tip = np.asarray(arrow["tip_px"], float)
+                visibility = full["contour_visibility"]
+                targets = [{"entity_id": entity["id"], "entity_type": entity["type"],
+                            "tip_gap_px": float(np.min(np.linalg.norm(points-tip, axis=1)))}
+                           for entity, points in paths]
+                targets = sorted((target for target in targets if target["tip_gap_px"] <= target_band),
+                                 key=lambda target: (target["tip_gap_px"], target["entity_id"]))
+                if not targets:
+                    continue
+                item = {"record_id": row["id"], "nominal": row["parsed"].get("nominal"),
+                        "method": "source_arrow_rechecked_independent_of_primitive_type",
+                        "segment_px": np.asarray(segment).tolist(), "arrowhead": arrow,
+                        "arrowhead_verified": True, "contour_visibility": visibility,
+                        "target_candidates": targets, "nominal_used_to_rank": False,
+                        "source_label_association": ownership}
+                if full is not None:
+                    item.update({key: full[key] for key in ("method", "label_gap_px", "label_ray_intersection_gap_px",
+                                 "shaft_evidence", "crossing_source_contour",
+                                 "crossing_admission", "proposal_origin", "model_proposal_used")})
+                    item["detection_resolution"] = "native_local" if native_segment else "global_scaled"
+                # Physical-arrow deduplication is global and checks direction
+                # and shaft alignment as well as tip proximity. A local tip-
+                # only merge can erase neighboring genuine parallel arrows
+                # before the ownership audit sees the competing evidence.
+                found.append(item)
+        for proposal in (row.get("source_arrow_proposals") or [])[:2]:
+            from .source_arrow_localization import localize_source_arrow_proposal
+            verified = localize_source_arrow_proposal(gray, row, proposal, boundary, band, contours,
+                                                      verifier=verify_source_arrow_proposal)
+            if verified is None:
+                continue
+            tip = np.asarray(verified["arrowhead"]["tip_px"], float)
+            targets = [{"entity_id": entity["id"], "entity_type": entity["type"],
+                        "tip_gap_px": float(np.min(np.linalg.norm(points-tip, axis=1)))}
+                       for entity, points in paths]
+            targets = sorted((target for target in targets if target["tip_gap_px"] <= target_band),
+                             key=lambda target: (target["tip_gap_px"], target["entity_id"]))
+            if not targets:
+                continue
+            item = {**verified, "record_id": row["id"], "nominal": row["parsed"].get("nominal"),
+                    "target_candidates": targets}
+            # A provider proposal is another independently verified source
+            # observation, never a reason to overwrite a nearby detected tip.
+            found.append(item)
+        observations.extend(found)
+    from .source_arrow_localization import resolve_source_arrow_ownership
+    observations, ownership_rejections, audit = resolve_source_arrow_ownership(
+        gray, records, observations, band=band)
+    if rejections is not None:
+        rejections.extend(ownership_rejections)
+    if ownership_audit is not None:
+        ownership_audit.update(audit)
+    return observations
+
+
+def _radius_text_audit(record):
+    """Keep plausible source R labels even when numeric parsing is unresolved.
+
+    This detects a radius marker, not a guessed number or a verified arrow.
+    Surface finish Ra and ordinary alphabetic notes are separate text kinds.
+    """
+    parsed = record.get("parsed") or {}
+    text = "".join(unicodedata.normalize("NFKC", str(record.get("text", ""))).split())
+    marker_text = text.lstrip("(").rstrip(")")
+    suffix = marker_text[1:] if marker_text[:1].lower() == "r" else None
+    marker = bool(suffix is not None and not marker_text.lower().startswith("ra") and
+                  (not suffix or not suffix[0].isalpha() or
+                   suffix.lower() in {"o", "i", "l", "nan", "inf", "infinity"}))
+    if not marker and parsed.get("kind") != "radius":
+        return None
+    source = parse_dimension(record.get("text", ""))
+    def positive(value):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool) and
+                math.isfinite(value) and value > 0)
+    if source.get("kind") != "radius" or not positive(source.get("nominal")):
+        issue = "source_radius_text_invalid_or_nonpositive"
+    elif (parsed.get("kind") != "radius" or not positive(parsed.get("nominal")) or
+          parsed.get("nominal") != source["nominal"]):
+        issue = "source_radius_parsed_metadata_mismatch"
+    else:
+        issue = None
+    return {"valid": issue is None, "issue": issue,
+            "nominal": source["nominal"] if issue is None else None}
+
+
+def radius_binding_coverage(inventory, graph, constraints=(), decisions=()):
+    """Audit the complete radius denominator; missing detection is not absence.
+
+    This certifies association coverage only. Exact numeric satisfaction must
+    still be checked after solving and again after DXF export/readback.
+    """
+    text_audits = {row["id"]: _radius_text_audit(row) for row in inventory.get("all_records", [])}
+    records = [row for row in inventory.get("all_records", []) if text_audits[row["id"]] is not None]
+    entities = {row["id"]: row for row in graph.get("entities", [])}
+    candidates = defaultdict(list)
+    observations = defaultdict(list)
+    ownership_rejections = defaultdict(list)
+    for row in inventory.get("all_candidates", []):
+        if row.get("kind") == "radius":
+            candidates[row["record_id"]].append(row)
+    for row in inventory.get("radius_source_observations", []):
+        if row.get("arrowhead_verified"):
+            observations[row["record_id"]].append(row)
+    for row in inventory.get("radius_source_rejections", []):
+        ownership_rejections[row.get("record_id")].append(row)
+    required, bound, unresolved, ambiguous, unknown, confirmed = [], [], [], [], [], []
+    unresolved_text = []
+    for record in records:
+        record_id = record["id"]
+        text_audit = text_audits[record_id]
+        if not text_audit["valid"]:
+            unresolved_text.append(record_id)
+            unresolved.append({"record_id": record_id, "text": record.get("text"), "nominal": None,
+                               "reason": "unresolved_radius_text", "text_parse_issue": text_audit["issue"],
+                               "candidate_entity_ids": []})
+            continue
+        nominal = text_audit["nominal"]
+        directed = [row for row in candidates[record_id]
+                    if (row.get("evidence", {}).get("leader") or {}).get("arrowhead_verified")]
+        supported = [row for row in directed if row.get("local_reliable")]
+        repartition = [row for row in directed if row.get("evidence", {}).get("whole_primitive_radius", {}).get("status") == "requires_topology_repartition"]
+        observed = observations[record_id]
+        targets = sorted({entity_id for row in directed for entity_id in row.get("entities", [])} |
+                         {target["entity_id"] for row in observed for target in row.get("target_candidates", [])})
+        base = {"record_id": record_id, "text": record.get("text"), "nominal": nominal}
+        if not directed and not observed:
+            unknown.append(record_id)
+            rejected_claims = ownership_rejections[record_id]
+            conflict = next((row for row in rejected_claims if row.get("reason") in {
+                "shared_source_arrow_ownership_ambiguous", "source_arrow_claim_owned_by_other_label"}), None)
+            unresolved.append({**base, "reason": conflict["reason"] if conflict else "source_arrow_not_verified",
+                               "candidate_entity_ids": [],
+                               "source_arrow_ownership_rejection_reasons": sorted({
+                                   row["reason"] for row in rejected_claims if row.get("reason")})})
+            continue
+        confirmed.append(record_id)
+        chosen_ids = supported[0].get("entities", []) if len(supported) == 1 else []
+        chosen = chosen_ids[0] if len(chosen_ids) == 1 else None
+        mapping = {**base, "entity_id": chosen,
+                   "entity_type": entities.get(chosen, {}).get("type"),
+                   "candidate_entity_ids": targets, "required": True,
+                   "enforcement": "exact", "source_arrow_verified": True,
+                   "source_evidence": [{"method": row.get("method"), "segment_px": row.get("segment_px"),
+                                         "arrowhead": row.get("arrowhead")} for row in observed] or
+                                      [row["evidence"]["leader"] for row in directed]}
+        required.append(mapping)
+        accepted = [row for row in constraints if row.get("kind") == "radius"
+                    and row.get("record_id") == record_id and row.get("value") == nominal
+                    and row.get("entities") == [chosen] and entities.get(chosen, {}).get("type") == "ARC"]
+        # Equivalent OCR records may describe the very same equation. Preserve
+        # their coverage without adding duplicate equations to the solver.
+        if not accepted and chosen is not None:
+            equivalent = any(row.get("record_id") == record_id and
+                             row.get("reason") == "duplicate_equivalent_constraint" for row in decisions)
+            if equivalent:
+                accepted = [row for row in constraints if row.get("kind") == "radius"
+                            and row.get("value") == nominal and row.get("entities") == [chosen]]
+        if accepted:
+            bound.append({**mapping, "constraint_id": accepted[0]["id"], "numeric_satisfaction_verified": False})
+            continue
+        if repartition:
+            reason = "requires_topology_repartition"
+            mapping["status"] = reason
+            mapping["whole_primitive_radius"] = [row["evidence"]["whole_primitive_radius"] for row in repartition]
+        elif (len(observed) > 1 and len({target["entity_id"] for row in observed
+                                       for target in row.get("target_candidates", [])}) > 1) or (len(directed) > 1 and not supported):
+            reason = "ambiguous_source_arrow_targets"
+            ambiguous.append({**base, "candidate_entity_ids": targets, "reason": reason})
+        elif targets and all(entities.get(target, {}).get("type") == "LINE" for target in targets):
+            reason = "radius_target_is_line_requires_topology_edit"
+        elif chosen is None:
+            reason = "source_arrow_target_mapping_unresolved"
+        else:
+            reasons = sorted({row.get("reason") for row in decisions if row.get("record_id") == record_id and row.get("reason")})
+            reason = reasons[0] if reasons else "radius_constraint_not_admitted"
+        unresolved.append({**base, "reason": reason, "candidate_entity_ids": targets,
+                           "source_arrow_verified": True})
+    return {"schema_version": "source-radius-binding-coverage-v1",
+            "recognized_radius_records": [row["id"] for row in records],
+            "confirmed_arrow_records": confirmed, "required_mappings": required,
+            "bound_mappings": bound, "unresolved": unresolved, "ambiguous": ambiguous,
+            "unknown_arrow_records": unknown, "verified_absent_arrow_records": [],
+            "unresolved_radius_text_records": unresolved_text, "unresolved_radius_text_count": len(unresolved_text),
+            "radius_text_scope": "All supplied OCR records with parsed or plausible raw radius markers; full-image OCR recall is not certified.",
+            "recognized_count": len(records), "required_count": len(required), "bound_count": len(bound),
+            "unresolved_count": len(unresolved), "ambiguous_count": len(ambiguous),
+            "all_confirmed_arrows_bound": len(required) == len(bound),
+            "all_radius_records_resolved": not unresolved,
+            "numeric_satisfaction_verified": False, "ground_truth_used": False,
+            "scope": "Source association only. Undetected arrows remain unresolved, never a no-arrow exemption; solver and DXF readback must separately prove exact radii."}
+
+
+def _radius_primitive_feasibility(entity, nominal, leader, model, graph, transform, band):
+    """Check the whole observed source interval after arrow-only target choice.
+
+    A point on a coarse ARC does not prove that its full interval is one circle.
+    Hold the OCR radius fixed and fit only its centre to the source segmentation
+    interval, without modifying geometry or ranking alternative entities. The
+    existing source deviation budget is retained. This bounded feasibility
+    search is an admission screen, not a proof of global solve feasibility.
+    """
+    from scipy.optimize import least_squares, minimize
+    from scipy.spatial import cKDTree
+    from .topology import _sample_path
+
+    result = {"method": "fixed_nominal_radius_source_interval_v1", "entity_id": entity["id"],
+              "nominal": float(nominal), "checked": False, "passed": False,
+              "status": "source_boundary_observation_unavailable", "ground_truth_used": False,
+              "nominal_used_to_rank": False, "geometry_modified": False,
+              "scope": "Admission feasibility only; joint solve and source/DXF validation remain required."}
+    raw = (model.get("extraction") or {}).get("raw_polyline_px")
+    try:
+        ring = np.asarray(raw, float)
+        if ring.ndim != 2 or ring.shape[1] != 2 or len(ring) < 3 or not np.isfinite(ring).all():
+            return result
+        if np.linalg.norm(ring[-1]-ring[0]) > 1e-8:
+            ring = np.vstack([ring, ring[0]])
+        ring = _sample_path(ring, .5)[:-1]
+        if len(ring) < 3:
+            return result
+        radius_px = float(nominal)*float(np.linalg.norm(transform([[1., 0.], [0., 0.]])[0]-transform([[1., 0.], [0., 0.]])[1]))
+        budget = (model.get("curve_fit") or {}).get("total_deviation_budget_px", band)
+        if isinstance(budget, bool) or not isinstance(budget, (float, int)) or not math.isfinite(budget) or budget <= 0 or radius_px <= 0:
+            return result
+        primitive = _samples(entity, transform)
+        indices = cKDTree(ring).query(primitive)[1]
+        unwrapped = np.unwrap(indices*2*np.pi/len(ring))*len(ring)/(2*np.pi)
+        start, end = int(round(unwrapped[0])), int(round(unwrapped[-1]))
+        step = 1 if end >= start else -1
+        interval = np.arange(start, end+step, step)
+        if len(interval) < 3 or len(interval) >= len(ring):
+            result["status"] = "source_boundary_interval_unresolved"
+            return result
+        observed = ring[interval % len(ring)]
+        samples = observed[np.unique(np.rint(np.linspace(0, len(observed)-1, min(256, len(observed)))).astype(int))]
+        center = transform([entity["center"]])[0]
+        starts = [center, 2*samples.mean(axis=0)-center]
+        fits = []
+        for initial in starts:
+            fit = least_squares(lambda xy: np.linalg.norm(samples-xy, axis=1)-radius_px,
+                                initial, max_nfev=150)
+            residual = np.abs(np.linalg.norm(samples-fit.x, axis=1)-radius_px)
+            maximum = minimize(lambda x: x[2], np.r_[fit.x, residual.max()], method="SLSQP",
+                               constraints=[{"type": "ineq", "fun": lambda x: x[2]-np.abs(np.linalg.norm(samples-x[:2], axis=1)-radius_px)}],
+                               options={"maxiter": 150, "ftol": 1e-8})
+            for fitted_center in (fit.x, maximum.x[:2]):
+                full_residual = np.abs(np.linalg.norm(observed-fitted_center, axis=1)-radius_px)
+                if np.isfinite(full_residual).all():
+                    fits.append((float(full_residual.max()), fitted_center, full_residual))
+        if not fits:
+            result["status"] = "fixed_radius_feasibility_search_failed"
+            return result
+        residual, center, residuals = min(fits, key=lambda row: row[0])
+        sampling_bound = float(np.max(np.linalg.norm(np.diff(observed, axis=0), axis=1))/2)
+        arrow = leader.get("arrowhead") or {}
+        radial = np.asarray(arrow.get("tip_px"), float)-center
+        direction = np.asarray(arrow.get("direction_px"), float)
+        alignment = abs(float(np.dot(radial, direction)/np.linalg.norm(radial)))
+        passed = bool(residual+sampling_bound <= budget and alignment >= .88)
+        a, b = transform([entity["start"], entity["end"]])
+        chord = float(np.linalg.norm(b-a))
+        fixed_endpoint_residual = None
+        if 0 < chord <= 2*radius_px:
+            normal = np.array([-(b-a)[1], (b-a)[0]])/chord
+            offset = math.sqrt(max(0., radius_px**2-(chord/2)**2))
+            fixed_endpoint_residual = min(float(np.max(np.abs(np.linalg.norm(observed-((a+b)/2+sign*offset*normal), axis=1)-radius_px)))
+                                          for sign in (-1., 1.))
+        result.update(checked=True, passed=passed,
+                      status="feasible_pending_joint_solve" if passed else "requires_topology_repartition",
+                      observation="initial_extraction_raw_polyline_px", sample_count=len(observed),
+                      source_interval_px=[observed[0].tolist(), observed[-1].tolist()],
+                      radius_source_px=radius_px, center_source_px=center.tolist(),
+                      max_radial_residual_px=residual, p90_radial_residual_px=float(np.quantile(residuals, .9)),
+                      sampling_bound_px=sampling_bound, conservative_max_residual_px=residual+sampling_bound,
+                      source_deviation_budget_px=float(budget),
+                      budget_source="initial_curve_fit_total_deviation_budget_px" if "total_deviation_budget_px" in (model.get("curve_fit") or {}) else "proposal_tolerance_px",
+                      nominal_circle_arrow_alignment=alignment, minimum_arrow_alignment=.88,
+                      fixed_endpoints_chord_feasible=chord <= 2*radius_px,
+                      fixed_endpoints_max_radial_residual_px=fixed_endpoint_residual,
+                      endpoints_may_move_in_joint_solve=True)
+        return result
+    except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
+        result["status"] = "fixed_radius_feasibility_search_failed"
+        return result
+
+
 def _annotation_issues(graph, records, candidates):
     """Describe unresolved semantics separately from a successful graph edit."""
     by_record = defaultdict(list)
@@ -328,6 +931,7 @@ def _annotation_issues(graph, records, candidates):
         record_id, nominal = record["id"], record["parsed"]["nominal"]
         proposals = by_record[record_id]
         reliable = [p for p in proposals if p.get("local_reliable")]
+        repartition = [p for p in proposals if p.get("evidence", {}).get("whole_primitive_radius", {}).get("status") == "requires_topology_repartition"]
         supports = [s for s in graph.get("annotation_support", []) if s.get("record_id") == record_id]
         targets = []
         for support in supports:
@@ -342,10 +946,10 @@ def _annotation_issues(graph, records, candidates):
                               fixed_endpoints_radius_feasible=math.dist(entity["start"], entity["end"]) <= 2 * float(nominal) + 1e-8)
             targets.append(target)
         issues.append({"record_id": record_id, "kind": "radius", "nominal": nominal,
-                       "status": "binding_candidate_requires_solve" if reliable else "unresolved_source_association",
+                       "status": "requires_topology_repartition" if repartition else "binding_candidate_requires_solve" if reliable else "unresolved_source_association",
                        "candidate_count": len(proposals), "upstream_target_hypotheses": targets,
                        "geometry_edit_is_not_numeric_binding": True,
-                       "reason": ("radius_target_is_line_requires_topology_edit" if any(t["entity_type"] == "LINE" for t in targets)
+                       "reason": ("requires_topology_repartition" if repartition else "radius_target_is_line_requires_topology_edit" if any(t["entity_type"] == "LINE" for t in targets)
                                   else "radius_requires_joint_or_topology_edit" if any(t.get("fixed_endpoints_radius_feasible") is False for t in targets)
                                   else None),
                        "dimensions_verified": False})
@@ -557,7 +1161,8 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
     if gray is None:
         raise ValueError("source image unreadable")
     all_records = canonical_records(document)
-    records = [{"id":r["id"],"text":str(r.get("text","")),"parsed":r["parsed"],"box":r.get("box")} for r in all_records]
+    records = [{"id":r["id"],"text":str(r.get("text","")),"parsed":r["parsed"],"box":r.get("box"),
+                "source_arrow_proposals":r.get("source_arrow_proposals", [])} for r in all_records]
     text_evidence={row["id"]:_source_text_evidence(gray,row) for row in records}
     for row in records:row["source_text_evidence"]=text_evidence[row["id"]]
     eligible = [r for r in records if r["parsed"].get("kind") in {"radius","length","diameter","angle"}
@@ -569,7 +1174,11 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
     arcs = [(entity,_samples(entity,transform),transform([entity["center"]])[0])
             for entity in graph.get("entities",[]) if entity.get("type")=="ARC"]
     contours = [_samples(entity,transform) for entity in graph.get("entities",[])]
-    leaders = _leaders(gray,eligible) if arcs else []
+    leaders = _leaders(gray,eligible)
+    radius_rejections = []
+    arrow_ownership = {}
+    radius_observations = _radius_source_observations(gray, eligible, graph, transform, leaders, band,
+                                                      radius_rejections, arrow_ownership)
     for row in eligible:
         if row["parsed"]["kind"] != "radius":
             continue
@@ -581,13 +1190,36 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
                 continue
             inherited = _annotation_leader_segments(graph, row["id"])
             occluded = []
-            leader = _leader_evidence(box,points,center,leaders + inherited,band,gray,contours,occluded)
+            # Keep rejected legacy paths for review, but only observations
+            # admitted by the complete global source-arrow ownership audit
+            # may establish a fresh binding. Per-arc detection cannot bypass
+            # a different label's claim to the same physical arrow.
+            legacy_leader = _leader_evidence(box,points,center,leaders + inherited,band,gray,contours,occluded)
+            leader = None
+            for observed in radius_observations:
+                if observed["record_id"] != row["id"]:
+                    continue
+                target = next((target for target in observed["target_candidates"]
+                               if target["entity_id"] == entity["id"]), None)
+                if target is None:
+                    continue
+                direction = np.asarray(observed["arrowhead"]["direction_px"], float)
+                radial = np.asarray(observed["arrowhead"]["tip_px"], float)-center
+                radial_length = float(np.linalg.norm(radial))
+                alignment = abs(float(np.dot(direction, radial)/radial_length)) if radial_length else 0.
+                if alignment < .88:
+                    continue
+                verified = {**observed, "radial_alignment": alignment,
+                            "score": target["tip_gap_px"]+.2*observed["label_gap_px"]+(1-alignment)*band*3}
+                if leader is None or verified["score"] < leader["score"]:
+                    leader = verified
             evidence = {"method":"source_label_proximity", "label_to_arc_px":distance,
                         "coarse_proposal_band_px":band, "fitted_radius":entity["radius"],
                         "nominal_difference":float(entity["radius"])-row["parsed"]["nominal"],
                         "leader":leader,"nominal_used_to_rank":False,
                         "occluded_leader_hypotheses":occluded,
                         "upstream_leader_hypotheses_rechecked":len(inherited),
+                        "legacy_leader_not_an_ownership_certificate":legacy_leader is not None and leader is None,
                         "evidence_chain":["source_ocr_box","observed_leader","verified_directed_arrow","current_primitive"],
                         "numeric_constraint_applied":False}
             score = leader["score"] if leader else 100000+distance
@@ -602,9 +1234,15 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
             review_paths=[{"entity_id":option["entities"][0],**path}
                           for option in options for path in option["evidence"]["occluded_leader_hypotheses"]][:6]
             best = options[0]
-            independent = best["evidence"]["leader"] is not None and (
-                len(options)==1 or options[1]["_score"]-best["_score"] > max(5.,band*.5))
+            independent = bool(best["evidence"]["leader"] is not None and (
+                len(options)==1 or options[1]["_score"]-best["_score"] > max(5.,band*.5)))
             best["local_reliable"] = independent
+            if independent:
+                entity = next(entity for entity, _, _ in arcs if entity["id"] == best["entities"][0])
+                feasibility = _radius_primitive_feasibility(entity, row["parsed"]["nominal"], best["evidence"]["leader"],
+                                                             model, graph, transform, band)
+                best["evidence"]["whole_primitive_radius"] = feasibility
+                best["local_reliable"] = bool(feasibility["passed"])
             for candidate in options[:3]:
                 candidate["evidence"]["uniquely_supported_leader"] = bool(independent and candidate is best)
                 candidate["evidence"]["alternative_arcs"] = len(options)
@@ -621,12 +1259,22 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
         candidate["evidence"]["source_text"]=text_evidence[candidate["record_id"]]
         if text_evidence[candidate["record_id"]]["symbol_confusion"]:
             candidate["local_reliable"]=False
+        if candidate["kind"] == "radius":
+            observed = [row for row in radius_observations if row["record_id"] == candidate["record_id"]]
+            candidate["evidence"]["directed_source_target_count"] = len(observed)
+            distinct_targets = {target["entity_id"] for row in observed for target in row.get("target_candidates", [])}
+            candidate["evidence"]["source_arrow_ownership_rejection_reasons"] = sorted({
+                row["reason"] for row in radius_rejections if row.get("record_id") == candidate["record_id"] and row.get("reason")})
+            if len(observed) > 1 and len(distinct_targets) > 1:
+                candidate["local_reliable"] = False
+                candidate["evidence"]["multiple_directed_source_targets_require_review"] = True
     reliable_counts=Counter(c["record_id"] for c in candidates if c["local_reliable"])
     for candidate in candidates:
         if reliable_counts[candidate["record_id"]]>1:
             candidate["local_reliable"]=False
             candidate["evidence"]["record_has_multiple_supported_bindings"]=True
     relations=structural_evidence(gray,records,graph,transform,_samples,band)
+    relations=_raw_boundary_tangent_relations(gray,records,model,graph,transform,band,relations)
     # Prioritize supported records, then keep alternatives together in the packet.
     by_record=defaultdict(list)
     for candidate in candidates: by_record[candidate["record_id"]].append(candidate)
@@ -647,8 +1295,12 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
                          "structural_candidates":len(relations),
                          "source_verified_relations":sum(r["local_reliable"] for r in relations)},
                "annotation_diagnostics":_annotation_issues(graph,eligible,candidates),
+               "radius_source_observations":radius_observations,
+               "radius_source_rejections":radius_rejections,
+               "source_arrow_ownership":arrow_ownership,
                "constructed_radius_priors":_constructed_radius_priors(graph,records),
                "ground_truth_used":False,"issues":[],"proposal_tolerance_px":band}
+    inventory["radius_binding_coverage"] = radius_binding_coverage(inventory, graph)
     _write(out/"binding-candidates.json",inventory)
     return inventory
 
@@ -659,9 +1311,13 @@ def _disabled(status="disabled",reason=None):
 
 
 def _constraint(candidate, source):
-    return {"id":"k"+candidate["id"],"kind":candidate["kind"],"record_id":candidate["record_id"],
+    result = {"id":"k"+candidate["id"],"kind":candidate["kind"],"record_id":candidate["record_id"],
             "entities":candidate["entities"],"nodes":candidate["nodes"],"value":candidate["value"],"source":source,
             "candidate_id":candidate["id"]}
+    if candidate["kind"] == "radius":
+        result.update(required=True, enforcement="exact", nominal_source="source_ocr",
+                      source_arrow_verified=True)
+    return result
 
 
 def analyze_constraint_bindings(image_path, document, model, graph, output_dir, *, provider=None, use_api=False):
@@ -720,6 +1376,9 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
         if any(e not in graph_entities for e in candidate["entities"]) or any(n not in graph_nodes for n in candidate["nodes"]):return "unknown_graph_id"
         if candidate["kind"]=="radius" and (len(candidate["entities"])!=1 or graph_entities[candidate["entities"][0]]["type"]!="ARC"):return "entity_type_mismatch"
         if candidate.get("evidence",{}).get("source_text",{}).get("symbol_confusion"):return "source_symbol_confusion_requires_confirmation"
+        feasibility = candidate.get("evidence", {}).get("whole_primitive_radius")
+        if feasibility is not None and feasibility.get("passed") is not True:
+            return feasibility.get("status", "whole_primitive_radius_unverified")
         if not candidate["local_reliable"]:return "ambiguous_or_insufficient_independent_source_evidence"
         if candidate["kind"]=="radius" and not (candidate.get("evidence",{}).get("leader") or {}).get("arrowhead_verified"):
             return "source_arrowhead_not_verified"
@@ -838,6 +1497,7 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
             "units":inventory["units"],"inventory_artifact":inventory["artifacts"]["inventory"],"topology_artifact":inventory["artifacts"]["topology"],
             "issues":sorted({row["reason"] for row in rejected}),"ground_truth_used":False,"dimensions_verified":False,
             "annotation_diagnostics":inventory.get("annotation_diagnostics",[]),
+            "radius_binding_coverage":radius_binding_coverage(inventory, graph, constraints, decisions),
             "constructed_radius_priors":constructed_priors,
             "scope":"Only independently supported source bindings; unbound dimensions and global constraint completeness remain unverified."}
     _write(Path(output_dir)/"constraint-bindings.json",result)
