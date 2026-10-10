@@ -11,7 +11,7 @@ from contour_agent.reconstruction_feedback import geometry_fingerprint, reconstr
 from test_parametric_pipeline import prepared, supported_graph
 
 
-def setup_case(tmp_path, monkeypatch, *, changed_evidence=False):
+def setup_case(tmp_path, monkeypatch, *, changed_evidence=False, elapsed_seconds_change=False):
     image, baseline, output = prepared(tmp_path)
     graph = supported_graph(image, baseline)
     graph["candidate_id"] = "frozen-synthetic"
@@ -38,7 +38,9 @@ def setup_case(tmp_path, monkeypatch, *, changed_evidence=False):
         (checkpoint / name).write_text(json.dumps(data))
     inventory = {"units": "mm", "source_image_sha256": graph["source_sha256"],
                  "all_records": [{"id": "r1", "parsed": {"kind": "radius", "nominal": 5.}}],
-                 "all_candidates": [{"id": "c1", "record_id": "r1", "entities": ["g002"], "local_reliable": True}]}
+                 "all_candidates": [{"id": "c1", "record_id": "r1", "entities": ["g002"], "local_reliable": True}],
+                 "source_arrow_ownership": {"ocr_local_candidate_searches": [
+                     {"record_id": "r1", "status": "completed", "time_limit_seconds": 8., "elapsed_seconds": .172}]}}
     calls = []
     def binding(image, doc, base, current_graph, directory, **kwargs):
         calls.append(kwargs.get("use_api"))
@@ -46,6 +48,8 @@ def setup_case(tmp_path, monkeypatch, *, changed_evidence=False):
         current = deepcopy(inventory)
         if kwargs.get("use_api") and changed_evidence:
             current["all_candidates"][0]["local_reliable"] = False
+        if kwargs.get("use_api") and elapsed_seconds_change:
+            current["source_arrow_ownership"]["ocr_local_candidate_searches"][0]["elapsed_seconds"] = .187
         (directory / "binding-candidates.json").write_text(json.dumps(current))
         if not kwargs.get("use_api"):
             result=deepcopy(bindings)
@@ -212,3 +216,18 @@ def test_final_model_abstention_preserves_certified_subset_but_new_source_counte
     selected_inventory=json.loads((output/"binding-candidates.json").read_text())
     assert selected_inventory["all_candidates"][0]["local_reliable"] is not changed_evidence
     assert json.loads((output/"constraint-bindings.json").read_text())["inventory_artifact"]==str(output/"binding-candidates.json")
+
+
+def test_elapsed_wall_time_change_does_not_revoke_an_independently_certified_preflight(tmp_path, monkeypatch):
+    image, baseline, graph, output, saved, calls = setup_case(tmp_path, monkeypatch, elapsed_seconds_change=True)
+    model, stage = refine_parametric(image, {}, baseline, output, use_api=True,
+                                    frozen_topology=graph, trusted_preflight_dir=saved)
+    guard = json.loads((output/"binding-publication-guard.json").read_text())["replacement_gate"]
+    assert calls == [False, True]
+    assert guard["retain_checkpoint"] and not guard["replace_checkpoint"]
+    assert "independent_source_evidence_changed" not in guard["reasons"]
+    assert stage["binding_selection"]["status"] == "certified_preflight_retained"
+    assert stage["constraint_subset_accepted"]
+    assert model["validation"]["exact_radius_validation"]["checks"][0]["dxf_radius"] == 5.
+    latest = json.loads((output/"final-binding-attempt/constraint-bindings.json").read_text())
+    assert latest["constraints"] == []  # Timing normalization never promotes the abstaining attempt.
