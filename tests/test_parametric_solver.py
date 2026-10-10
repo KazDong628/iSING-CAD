@@ -596,6 +596,25 @@ def test_source_budget_search_moves_shared_joints_while_radius_remains_exact():
     assert not result["engineering_verified"] and not result["all_dimensions_verified"]
 
 
+def test_optional_source_restart_changes_only_the_bounded_initial_guess():
+    graph=rectangle();before=copy.deepcopy(graph)
+    points=[[0.,0.],[10.,0.],[10.,5.],[0.,5.],[0.,0.]]
+    observation=_budgeted_mask(points,.1,.02)
+    constraint={"id":"width","kind":"distance_x","nodes":["v0","v1"],"entities":[],
+                "record_id":"r0","value":10.,"source":"ocr_local_binding"}
+    with pytest.raises(ValueError,match="offset exceeds"):
+        solve_parametric(graph,[constraint],source_observation=observation,
+                         seed_node_offsets={"v0":[.05,0.]})
+    with pytest.raises(ValueError,match="unknown graph node"):
+        solve_parametric(graph,[constraint],source_observation=observation,
+                         seed_node_offsets={"missing":[.01,0.]})
+    result=solve_parametric(graph,[constraint],source_observation=observation,
+                            seed_node_offsets={"v0":[.01,0.]})
+    assert result["diagnostics"]["source_seed"]["ground_truth_used"] is False
+    assert result["diagnostics"]["source_budget_search"]["maximum_deviation"]==.1
+    assert graph==before and all(check["passed"] for check in result["constraints"])
+
+
 def test_incompatible_source_budget_keeps_fallback_without_claiming_infeasibility():
     graph=rectangle();points=[[0.,0.],[11.,0.],[11.,5.],[0.,5.],[0.,0.]]
     constraints=[{"id":"width","kind":"distance_x","nodes":["v0","v1"],"entities":[],
@@ -639,15 +658,15 @@ def test_source_budget_evaluation_exhaustion_is_bounded_and_retains_original_gra
 def test_feasible_checkpoint_survives_RMS_wall_exhaustion_after_complete_revalidation(monkeypatch,tmp_path):
     import contour_agent.parametric_solver as solver
     actual_minimize=solver.minimize;actual_clock=solver.time.monotonic
-    elapsed=[0.];calls=[0]
+    elapsed=[0.];feasibility_returned=[False]
     monkeypatch.setattr(solver.time,"monotonic",lambda:actual_clock()+elapsed[0])
     def exhaust_optional_refinement(*args,**kwargs):
-        calls[0]+=1
+        # Expire only when optional RMS starts after feasibility. The solver
+        # has already independently certified and persisted its checkpoint.
+        if feasibility_returned[0] and args[0].__name__ == "scalar_objective":
+            elapsed[0]=121.
         result=actual_minimize(*args,**kwargs)
-        # Warm RMS fails maximum-distance certification; the next optimizer
-        # finds a source-feasible checkpoint. Expire wall budget before the
-        # optional RMS refinement, as a slow online preflight could do.
-        if calls[0]==2:elapsed[0]=121.
+        if args[0].__name__ == "feasibility_objective":feasibility_returned[0]=True
         return result
     monkeypatch.setattr(solver,"minimize",exhaust_optional_refinement)
     graph=rectangle();points=[[0.,0.],[10.,0.],[10.4,5.],[0.,5.],[0.,0.]]

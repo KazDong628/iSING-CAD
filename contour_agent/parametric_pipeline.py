@@ -13,6 +13,7 @@ import math
 import inspect
 from pathlib import Path
 import shutil
+import time
 
 import cv2
 import ezdxf
@@ -95,6 +96,7 @@ def _write_workflow_provenance(output, stage, context):
     kind=("parametric" if version=="source-topology-bound-parametric-v1" else
           "topology" if version=="source-topology-draft-v1" else "initial_pixel_fit_draft")
     actual_stage=model.get("parameterization") or {}
+    fillet=actual_stage.get("fillet_tangent_contract") or {}
     contract=copy.deepcopy(validation.get("annotation_radius_contract") or
                            stage.get("annotation_radius_contract"))
     if contract:
@@ -107,6 +109,9 @@ def _write_workflow_provenance(output, stage, context):
                         all_annotated_radii_verified=bool(current_verified and contract.get("satisfied")))
     accepted=bool(integrity and actual_stage.get("accepted") and
                   contract and contract.get("satisfied"))
+    current_parametric_constraints=bool(integrity and kind=="parametric" and
+        actual_stage.get("constraint_subset_accepted") and contract and
+        contract.get("current_dxf_verified") and fillet.get("solver_accepted") is True)
     provenance={"schema_version":"cad-reconstruction-provenance-v1",**context,
                 "reference_dxf_used_as_prediction_geometry":False,"reference_geometry_sent_to_provider":False,
                 "initial_geometry":"local_mask_to_LINE_ARC_fitting",
@@ -125,6 +130,13 @@ def _write_workflow_provenance(output, stage, context):
                 "parameterization_accepted":accepted,
                 "constraint_subset_accepted":bool(integrity and actual_stage.get("constraint_subset_accepted") and
                                                     contract and contract.get("current_dxf_verified")),
+                "source_verified_fillet_tangency_satisfied":bool(current_parametric_constraints and
+                    fillet.get("all_source_verified_joints_satisfied")),
+                "source_bound_design_fillet_tangency_satisfied":bool(current_parametric_constraints and
+                    fillet.get("all_design_constructed_joints_satisfied")),
+                "all_fillet_line_joints_certified":bool(current_parametric_constraints and
+                    fillet.get("all_line_arc_joints_certified")),
+                "fillet_tangency_cohort":fillet.get("cohort", "bound_arrow_verified_radius_arcs"),
                 "all_dimensions_verified":False,"reference_verified":False,
                 "prediction_dxf_sha256":hashes.get("drawing.dxf")}
     _write(output/"workflow-provenance.json",provenance)
@@ -396,14 +408,216 @@ def _solved_source_validation(image_path, document, baseline, graph, entities):
             "reference_verified":False}
 
 
+def _verified_angle_line_growth(selected, candidate, previous_feedback):
+    """Narrow offline-selection exception for a newly solved finite OCR LINE.
+
+    The topology editor and the independent source/solver preflight must have
+    accepted the candidate already. This only admits a one-LINE increase where
+    a previously unbound angle is now solved; it never bypasses the normal
+    branch score, source, regression or independent reference gates.
+    """
+    base = (selected.get("graph") or {}).get("entities") or []
+    graph = candidate.get("graph") or {}
+    entities = graph.get("entities") or []
+    source = (graph.get("source_evidence") or {}).get("topology_edit") or {}
+    after = candidate.get("constraint_feedback") or {}
+    record_id = source.get("record_id")
+    if (source.get("action") != "restore_annotated_line_support" or
+            source.get("resegmentation_applied") is not True or
+            source.get("net_entity_reduction") != -1 or
+            not isinstance(record_id, str) or
+            record_id not in (source.get("angle_support_record_ids") or []) or
+            record_id in (previous_feedback.get("bound_record_ids") or []) or
+            record_id not in (after.get("satisfied_record_ids") or []) or
+            (after.get("source_validation") or {}).get("passed") is not True or
+            (after.get("topology_source_validation") or {}).get("passed") is not True or
+            (candidate.get("constraint_regression_gate") or {}).get("passed") is not True or
+            len(entities) != len(base) + 1 or
+            sum(row.get("type") == "LINE" for row in entities) !=
+            sum(row.get("type") == "LINE" for row in base) + 1 or
+            sum(row.get("type") == "ARC" for row in entities) !=
+            sum(row.get("type") == "ARC" for row in base)):
+        return False
+    grid = float(graph.get("source_grid_pitch_px") or 1.)
+    for entity in entities:
+        evidence = entity.get("angle_support_evidence") or {}
+        if (entity.get("type") != "LINE" or evidence.get("record_id") != record_id or
+                evidence.get("requires_angle_binding_and_solve") is not True or
+                evidence.get("ground_truth_used") is not False):
+            continue
+        ends = np.asarray(evidence.get("source_interval_endpoints_px"), float)
+        if ends.shape == (2, 2) and np.isfinite(ends).all() and grid > 0 and math.isfinite(grid) and \
+                float(np.linalg.norm(ends[1] - ends[0])) >= 4. * grid:
+            return True
+    return False
+
+
+def _offline_edit_selection_eligible(selected, candidate, previous_feedback, base_eval, edit_eval):
+    if (candidate.get("constraint_regression_gate") or {}).get("passed", True) is not True:
+        return False
+    score = edit_eval.get("score", 0)
+    baseline_score = base_eval.get("score", 1)
+    ordinary = (score >= baseline_score and
+                (len(candidate["graph"]["entities"]) < len(selected["graph"]["entities"]) or
+                 (candidate.get("constraint_feedback") or {}).get("issue_count", 10**9) <
+                 previous_feedback.get("issue_count", 0)))
+    restored = (score >= baseline_score - .02 and
+                _verified_angle_line_growth(selected, candidate, previous_feedback))
+    return ordinary or restored
+
+
+def _source_verified_unmet_angle_line(graph, inventory, feedback, operation):
+    """Reserve work only for an unmet, independently witnessed finite line."""
+    if operation.get("action") != "restore_annotated_line_support":
+        return False
+    satisfied = (feedback or {}).get("satisfied_record_ids")
+    record_id = operation.get("record_id")
+    if not isinstance(satisfied, list) or not isinstance(record_id, str) or record_id in satisfied:
+        return False
+    from .annotation_line_support import angle_edit_evidence
+    try:
+        observation = angle_edit_evidence(graph, inventory, operation)
+        grid = float(graph.get("source_grid_pitch_px") or 1.)
+    except (ValueError, TypeError, KeyError):
+        return False
+    # A single broad ARC can carry angle ink without leaving room for both
+    # neighboring curves. The source kernel can certify this restoration only
+    # after two separately arrow-backed ARC tails meet at the observed joint.
+    if (len(operation.get("entity_ids") or []) != 2 or
+            observation.get("joint_radius_arrow_verified") is not True or
+            not math.isfinite(grid) or grid <= 0):
+        return False
+    requested = set(operation.get("entity_ids") or [])
+    return any(row.get("entity_id") in requested and
+               row.get("whole_line_supported") is not True and
+               type(row.get("supported_span_px")) in (int, float) and
+               math.isfinite(row["supported_span_px"]) and
+               row["supported_span_px"] >= 4. * grid
+               for row in observation.get("target_candidates", []))
+
+
+def _ordered_topology_operations(agent_operations, local_operations, graph, inventory,
+                                  feedback, operation_filter=None):
+    """Keep provider order while guaranteeing one source-witnessed line trial."""
+    reserved = next((row for row in local_operations
+                     if _source_verified_unmet_angle_line(graph, inventory, feedback, row)), None)
+    agent = list(agent_operations)
+    if reserved is not None:
+        signature = lambda row: (row.get("action"), tuple(row.get("entity_ids") or []), row.get("record_id"))
+        if not any(signature(row) == signature(reserved) for row in agent[:5]):
+            agent.insert(4, reserved)
+    operations, seen, skipped_visited = [], set(), []
+    for operation in [*agent, *local_operations]:
+        ids = tuple(operation.get("entity_ids") or [])
+        key = (operation.get("action"), ids, operation.get("record_id"))
+        if key in seen:
+            continue
+        if operation_filter is not None and not operation_filter(operation):
+            skipped_visited.append({"operation": operation, "status": "skipped",
+                                    "reason": "visited_parent_operation"})
+            seen.add(key)
+            continue
+        operations.append(operation)
+        seen.add(key)
+        if len(operations) >= 5:
+            break
+    return operations, skipped_visited
+
+
+def _local_edit_branch_gate(selected, candidate, base_eval, edit_eval, *, online_evaluator=False):
+    """Apply the same source-only local improvement gate during scheduling and selection."""
+    base_metrics=base_eval.get("metrics",{});edit_metrics=edit_eval.get("metrics",{})
+    edit_execution=((candidate.get("graph") or {}).get("source_evidence") or {}).get("topology_edit") or {}
+    edit_actions=[edit_execution.get("action")]
+    edit_actions.extend(row.get("action") for row in edit_execution.get("operations",[]) if isinstance(row,dict))
+    validated_partition=bool(edit_execution.get("resegmentation_applied") and
+                             edit_execution.get("radius_binding_applied") and
+                             len(edit_execution.get("bound_record_ids") or [])>=2)
+    annotation_guided=bool(set(edit_actions)&{"refit_chain_as_annotated_arc","insert_annotated_fillet","restore_annotated_line_support"} or
+                           validated_partition)
+    count_improved=edit_metrics.get("entity_count",10**9) < base_metrics.get("entity_count",0)
+    count_preserved_for_annotation=bool(
+        annotation_guided and edit_metrics.get("entity_count",10**9) <= base_metrics.get("entity_count",0))
+    growth_operations=[row for row in (edit_execution.get("operations") or [edit_execution])
+                       if isinstance(row,dict) and row.get("net_entity_reduction",0)<0]
+    satisfied_records=set((candidate.get("constraint_feedback") or {}).get("satisfied_record_ids") or [])
+    feature_restored=bool(growth_operations) and all(
+        (row.get("radius_binding_applied") and (row.get("feature_restoration_validated") or
+            (row.get("resegmentation_applied") and len(row.get("bound_record_ids") or [])>=2))) or
+        (row.get("action")=="restore_annotated_line_support" and row.get("resegmentation_applied") is True
+         and row.get("record_id") in (row.get("angle_support_record_ids") or [])
+         and row.get("record_id") in satisfied_records)
+        for row in growth_operations)
+    type_corrected=bool("refit_entity_as_line" in edit_actions and
+                        edit_metrics.get("source_boundary_support",0)>=base_metrics.get("source_boundary_support",0) and
+                        edit_metrics.get("entity_count")==base_metrics.get("entity_count"))
+    regression=candidate.get("constraint_regression_gate",{"passed":True})
+    accepted=bool(
+        edit_eval.get("score") is not None and base_eval.get("score") is not None and
+        edit_eval["score"] >= base_eval["score"]-.02 and
+        edit_metrics.get("source_boundary_support",0.) >= base_metrics.get("source_boundary_support",0.)-.02 and
+        edit_metrics.get("unsupported_primitive_count",10**9) <= base_metrics.get("unsupported_primitive_count",0)+1 and
+        (count_improved or count_preserved_for_annotation or feature_restored or type_corrected) and
+        regression.get("passed") is True)
+    return {"accepted":accepted,
+            "reason":None if accepted else "edited_candidate_failed_local_improvement_gate",
+            "proposed_candidate_id":candidate.get("id"),"base_candidate_id":selected.get("id"),
+            "minimum_local_score":round(float(base_eval.get("score",0.))-.02,9),
+            "minimum_source_boundary_support":max(0.,float(base_metrics.get("source_boundary_support",0.))-.02),
+            "maximum_unsupported_primitive_count":int(base_metrics.get("unsupported_primitive_count",0))+1,
+            "must_reduce_entity_count":not (annotation_guided or feature_restored or type_corrected),
+            "annotation_guided_primitive_correction":annotation_guided,
+            "source_validated_feature_restoration":feature_restored,
+            "constraint_regression":regression,
+            "selection_source":"online_evaluator" if online_evaluator else "strict_local_improvement"}
+
+
+def _source_verified_primary_progress(selected, candidate, previous_feedback):
+    """Only a fully preflighted, nondegenerate improvement may reserve the next round."""
+    from .planning_provider import evaluate_candidates
+    from .topology_search import preflight_admissible
+    report=candidate.get("constraint_feedback") or {}
+    if (not preflight_admissible(report) or report.get("solver_accepted") is not True or
+            report.get("post_solve_source_accepted") is not True or
+            (report.get("source_validation") or {}).get("passed") is not True or
+            (report.get("topology_source_validation") or {}).get("passed") is not True or
+            (candidate.get("constraint_regression_gate") or {}).get("passed") is not True or
+            geometry_fingerprint(candidate["graph"])==geometry_fingerprint(selected["graph"])):
+        return False
+    before=set(previous_feedback.get("satisfied_record_ids") or [])
+    after=set(report.get("satisfied_record_ids") or [])
+    record_gained=bool(after>before)
+    base_count=len((selected.get("graph") or {}).get("entities") or [])
+    candidate_count=len((candidate.get("graph") or {}).get("entities") or [])
+    simpler=bool(candidate_count<base_count and
+                 type(previous_feedback.get("issue_count")) is int and
+                 type(report.get("issue_count")) is int and
+                 report["issue_count"]<previous_feedback["issue_count"])
+    if not (record_gained or simpler):
+        return False
+    local=evaluate_candidates([selected,candidate],max_candidates=2)
+    admissible=set(local.get("admissible_candidate_ids") or [])
+    if selected["id"] not in admissible or candidate["id"] not in admissible:
+        return False
+    evaluated={row["candidate_id"]:row for row in local.get("evaluated",[]) if row.get("admissible")}
+    return _local_edit_branch_gate(selected,candidate,
+                                   evaluated[selected["id"]],evaluated[candidate["id"]])["accepted"]
+
+
 def _topology_edit_stage(image_path, document, baseline, selected, bundle, output, *,
-                         editor_provider=None, evaluator_provider=None, use_api=False,
-                         round_index=1, feedback=None, verifier=None, operation_filter=None,
-                         candidate_namespace=None, provider_guard=None):
+                          editor_provider=None, evaluator_provider=None, use_api=False,
+                          round_index=1, feedback=None, verifier=None, operation_filter=None,
+                          candidate_namespace=None, provider_guard=None,
+                          defer_after_primary_progress=False):
     """Propose, execute and independently evaluate bounded local topology edits."""
     from .planning_provider import evaluate_candidates
     from .topology_editing import execute_topology_edits, propose_annotation_arc_edits
+    from .topology_search import preflight_order
 
+    # The current candidate was preflighted without the newly discovered
+    # source coordinates. They may suggest edits on this temporary parent,
+    # whose children still require their own full source/numeric preflight.
+    edit_parent=_edit_observation_parent(selected)
     editor_receipt={"status":"disabled" if not use_api else "not_configured",
                     "reason":"topology_edit_disabled" if not use_api else "topology_edit_provider_missing",
                     "schema_success":False,"network_requests":0,"operations":[],"confidence":"abstain",
@@ -425,7 +639,7 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
             if remaining is not None:
                 if "request_timeout_seconds" in inspect.signature(editor_provider.propose).parameters:
                     options["request_timeout_seconds"]=remaining
-                editor_receipt=editor_provider.propose(image_path,overlay,selected,bundle.get("annotation_inventory",[]),**options)
+                editor_receipt=editor_provider.propose(image_path,overlay,edit_parent,bundle.get("annotation_inventory",[]),**options)
             else:
                 editor_receipt.update(status="skipped",reason="topology_search_provider_budget_exhausted")
         except InterruptedError:
@@ -437,25 +651,15 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
                       if editor_receipt.get("schema_success") is True else [])
     unresolved=((feedback or {}).get("radius_binding_coverage") or {}).get("unresolved",[])
     local_annotation_operations=propose_annotation_arc_edits(
-        selected.get("graph") or {},bundle.get("annotation_inventory",[]),limit=4,
+        edit_parent.get("graph") or {},bundle.get("annotation_inventory",[]),limit=4,
         unresolved_radius_record_ids={row["record_id"] for row in unresolved
                                       if isinstance(row,dict) and isinstance(row.get("record_id"),str)})
-    operations=[];seen=set();skipped_visited=[]
-    # Explicit agent edits get the bounded operation budget before deterministic
-    # hints; a failed generic R-refit must not starve a requested fillet/split.
-    for operation in [*agent_operations,*local_annotation_operations]:
-        ids=tuple(operation.get("entity_ids") or [])
-        signature=(operation.get("action"),ids,operation.get("record_id"))
-        if signature in seen:continue
-        if operation_filter is not None and not operation_filter(operation):
-            skipped_visited.append({"operation":operation,"status":"skipped","reason":"visited_parent_operation"})
-            seen.add(signature)
-            continue
-        operations.append(operation);seen.add(signature)
-        if len(operations)>=5:break
+    operations,skipped_visited=_ordered_topology_operations(
+        agent_operations,local_annotation_operations,edit_parent.get("graph") or {},
+        bundle.get("annotation_inventory",[]),feedback,operation_filter)
     if operations:
         try:
-            edited,execution=execute_topology_edits(image_path,document,baseline,selected,bundle,operations,output)
+            edited,execution=execute_topology_edits(image_path,document,baseline,edit_parent,bundle,operations,output)
         except InterruptedError:
             raise
         except Exception:
@@ -471,16 +675,72 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
                 row["graph"]["entity_identity"]["display_id_scope"]=row["id"]
         for row in execution.get("operations",[]):
             if row.get("candidate_id") in mapping:row["candidate_id"]=mapping[row["candidate_id"]]
+    preflight_queue=[]
+    deferred_preflight_candidate_ids=[]
+    progress_candidate_id=None
     if verifier:
-        for row in edited:
-            row["constraint_feedback"]=verifier(row)
-            row["constraint_regression_gate"]=constraint_regression(feedback or {},row["constraint_feedback"])
+        # Source checks are bounded by the edit kernel's five operations plus
+        # one combined candidate. Check all before costly binding and solving,
+        # so materialization order cannot hide the angular or combined repair.
+        source_checks={row["id"]:_topology_source_validation(image_path,baseline,row["graph"])
+                       for row in edited}
+        queued=preflight_order(edited,source_checks)
+        def source_valid_primary(row, action):
+            edit=(((row.get("graph") or {}).get("source_evidence") or {}).get("topology_edit") or {})
+            return (source_checks[row["id"]].get("passed") is True and
+                    edit.get("action")==action and
+                    (action!="restore_annotated_line_support" or
+                     (edit.get("resegmentation_applied") is True and edit.get("angle_support_record_ids"))))
+        primary_ids=set()
+        for action in ("restore_annotated_line_support","apply_nonoverlapping_edits"):
+            primary=next((row for row in queued if source_valid_primary(row,action)),None)
+            if primary is not None:primary_ids.add(primary["id"])
+        completed_primary_ids=set()
+        accepts_source_check="source_validation" in inspect.signature(verifier).parameters
+        for row in queued:
+            source_check=source_checks[row["id"]]
+            deferred=bool(defer_after_primary_progress and primary_ids and
+                          primary_ids<=completed_primary_ids and progress_candidate_id and
+                          source_check.get("passed") is True)
+            if deferred:
+                reason="topology_preflight_deferred_for_next_round"
+                report=reconstruction_feedback(row["graph"])
+                report.update(solver_status="preflight_not_run",preflight_status="deferred_not_run",
+                              preflight_skip_reason=reason,binding_status="not_run",constraint_count=0,
+                              solver_accepted=False,post_solve_source_accepted=False,
+                              source_validation={"status":"not_run","passed":None,"reasons":[]},
+                              topology_source_validation=source_check)
+                row["constraint_feedback"]=report
+                row["constraint_regression_gate"]={"passed":False,"reasons":[reason],
+                                                    "comparison_status":"not_run"}
+                deferred_preflight_candidate_ids.append(row["id"])
+                queue_status="deferred_not_run"
+            else:
+                row["constraint_feedback"]=(verifier(row,source_validation=source_check)
+                    if accepts_source_check else verifier(row))
+                report=row["constraint_feedback"]
+                if report.get("solver_status")=="preflight_not_run":
+                    row["constraint_regression_gate"]={"passed":False,
+                        "reasons":[report.get("preflight_skip_reason") or "topology_search_preflight_not_run"]}
+                    queue_status="not_run_budget"
+                else:
+                    row["constraint_regression_gate"]=constraint_regression(feedback or {},report)
+                    queue_status="passed" if row["constraint_regression_gate"]["passed"] else "rejected"
+                if row["id"] in primary_ids:
+                    completed_primary_ids.add(row["id"])
+                    if (defer_after_primary_progress and
+                            _source_verified_primary_progress(selected,row,feedback or {})):
+                        progress_candidate_id=row["id"]
+            preflight_queue.append({"candidate_id":row["id"],"source_validation_passed":source_check.get("passed") is True,
+                                     "status":queue_status,"reasons":row["constraint_regression_gate"]["reasons"]})
         by_candidate={row["id"]:row for row in edited}
         for operation in execution.get("operations",[]):
             row=by_candidate.get(operation.get("candidate_id"))
             if row is None:continue
             report=row["constraint_feedback"]
-            operation["preflight_status"]="passed" if row["constraint_regression_gate"]["passed"] else "rejected"
+            operation["preflight_status"]=("deferred_not_run" if report.get("preflight_status")=="deferred_not_run" else
+                "not_run_budget" if report.get("solver_status")=="preflight_not_run" else
+                "passed" if row["constraint_regression_gate"]["passed"] else "rejected")
             operation["preflight_reasons"]=row["constraint_regression_gate"]["reasons"]
             operation["source_validation"]=report.get("source_validation",{})
             operation["local_source_diagnostics"]=report.get("local_source_diagnostics",{})
@@ -512,10 +772,7 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
         # merely the most plausible model-selected hypothesis.
         base_eval=evaluated.get(selected.get("id"),{})
         eligible=[row for row in edited if row["id"] in admissible and
-                  row.get("constraint_regression_gate",{}).get("passed",True) and
-                  evaluated[row["id"]].get("score",0)>=base_eval.get("score",1) and
-                  (len(row["graph"]["entities"])<len(selected["graph"]["entities"]) or
-                   row.get("constraint_feedback",{}).get("issue_count",10**9)<(feedback or {}).get("issue_count",0))]
+                  _offline_edit_selection_eligible(selected,row,feedback or {},base_eval,evaluated[row["id"]])]
         if eligible:
             proposed_id=max(eligible,key=lambda row:evaluated[row["id"]]["score"])["id"]
     gate={"accepted":False,"reason":"evaluator_did_not_select_an_edit",
@@ -526,52 +783,32 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
         if candidate_id==selected.get("id") or candidate_id not in by_id:continue
         base_eval=evaluated.get(selected.get("id"),{})
         edit_eval=evaluated.get(candidate_id,{})
-        base_metrics=base_eval.get("metrics",{});edit_metrics=edit_eval.get("metrics",{})
-        edit_execution=((by_id[candidate_id].get("graph") or {}).get("source_evidence") or {}).get("topology_edit") or {}
-        edit_actions=[edit_execution.get("action")]
-        edit_actions.extend(row.get("action") for row in edit_execution.get("operations",[]) if isinstance(row,dict))
-        validated_partition=bool(edit_execution.get("resegmentation_applied") and
-                                 edit_execution.get("radius_binding_applied") and
-                                 len(edit_execution.get("bound_record_ids") or [])>=2)
-        annotation_guided=bool(set(edit_actions)&{"refit_chain_as_annotated_arc","insert_annotated_fillet"} or
-                               validated_partition)
-        count_improved=edit_metrics.get("entity_count",10**9) < base_metrics.get("entity_count",0)
-        count_preserved_for_annotation=bool(
-            annotation_guided and edit_metrics.get("entity_count",10**9) <= base_metrics.get("entity_count",0))
-        growth_operations=[row for row in (edit_execution.get("operations") or [edit_execution])
-                           if isinstance(row,dict) and row.get("net_entity_reduction",0)<0]
-        feature_restored=bool(growth_operations) and all(
-            row.get("radius_binding_applied") and (row.get("feature_restoration_validated") or
-                (row.get("resegmentation_applied") and len(row.get("bound_record_ids") or [])>=2))
-            for row in growth_operations)
-        type_corrected=bool("refit_entity_as_line" in edit_actions and
-                            edit_metrics.get("source_boundary_support",0)>=base_metrics.get("source_boundary_support",0) and
-                            edit_metrics.get("entity_count")==base_metrics.get("entity_count"))
-        regression=by_id[candidate_id].get("constraint_regression_gate",{"passed":True})
-        accepted=bool(
-            edit_eval.get("score") is not None and base_eval.get("score") is not None and
-            edit_eval["score"] >= base_eval["score"]-.02 and
-            edit_metrics.get("source_boundary_support",0.) >= base_metrics.get("source_boundary_support",0.)-.02 and
-            edit_metrics.get("unsupported_primitive_count",10**9) <= base_metrics.get("unsupported_primitive_count",0)+1 and
-            (count_improved or count_preserved_for_annotation or feature_restored or type_corrected) and
-            regression.get("passed") is True
-        )
-        branch_gates[candidate_id]={"accepted":accepted,
-              "reason":None if accepted else "edited_candidate_failed_local_improvement_gate",
-              "proposed_candidate_id":candidate_id,"base_candidate_id":selected.get("id"),
-              "minimum_local_score":round(float(base_eval.get("score",0.))-.02,9),
-              "minimum_source_boundary_support":max(0.,float(base_metrics.get("source_boundary_support",0.))-.02),
-              "maximum_unsupported_primitive_count":int(base_metrics.get("unsupported_primitive_count",0))+1,
-              "must_reduce_entity_count":not (annotation_guided or feature_restored or type_corrected),
-              "annotation_guided_primitive_correction":annotation_guided,
-              "source_validated_feature_restoration":feature_restored,
-              "constraint_regression":regression,
-              "selection_source":"online_evaluator" if evaluator_receipt.get("schema_success") else "strict_local_improvement"}
+        branch_gates[candidate_id]=_local_edit_branch_gate(
+            selected,by_id[candidate_id],base_eval,edit_eval,
+            online_evaluator=bool(evaluator_receipt.get("schema_success")))
     if proposed_id==selected.get("id") and proposed_id in admissible:
         gate.update(reason="evaluator_preserved_base")
     elif proposed_id in branch_gates:
         gate=branch_gates[proposed_id]
         if gate["accepted"]:final=by_id[proposed_id]
+    # An online preference cannot erase a newly solved, source-witnessed OCR
+    # LINE after the same source, exact-radius and regression gates have passed.
+    protected=[row for row in edited if row["id"] in admissible and
+               branch_gates.get(row["id"],{}).get("accepted") is True and
+               _verified_angle_line_growth(selected,row,feedback or {})]
+    missing=[row for row in protected
+             if (((row["graph"].get("source_evidence") or {}).get("topology_edit") or {})
+                 .get("record_id") not in
+                 ((final.get("constraint_feedback") or (feedback if final is selected else {}))
+                  .get("satisfied_record_ids") or []))]
+    if missing:
+        restored=max(missing,key=lambda row:evaluated[row["id"]]["score"])
+        provider_selected=proposed_id
+        proposed_id=restored["id"]
+        final=restored
+        gate={**branch_gates[proposed_id],
+              "selection_source":"source_verified_required_ocr_topology",
+              "provider_selected_candidate_id":provider_selected}
     from .topology_search import preflight_admissible
     trusted=[row for row in pool if (row["id"]==selected.get("id") or branch_gates.get(row["id"],{}).get("accepted")) and
              preflight_admissible(row.get("constraint_feedback") or (feedback if row["id"]==selected.get("id") else {}) or {})]
@@ -586,7 +823,10 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
             "base_candidate_id":selected.get("id"),"final_candidate_id":final.get("id"),
             "editor":editor_receipt,"execution":execution,"local_evaluation":local,
             "evaluator":evaluator_receipt,"acceptance_gate":gate,
-            "local_annotation_operations":local_annotation_operations,
+             "local_annotation_operations":local_annotation_operations,
+             "preflight_queue":preflight_queue,
+             "deferred_preflight_candidate_ids":deferred_preflight_candidate_ids,
+             "deferred_for_next_round_after_candidate_id":progress_candidate_id if deferred_preflight_candidate_ids else None,
             "executed_operation_count":len(operations),
              "edited_candidate_ids":[row["id"] for row in edited],"ground_truth_used":False,
              "trusted_candidate_ids":[row["id"] for row in trusted],"branch_acceptance_gates":branch_gates,
@@ -627,7 +867,8 @@ def _solver_source_observation(baseline, graph):
     return observation
 
 
-def _solve_with_source_observation(solver, graph, constraints, baseline, output, *, budget_seconds=None):
+def _solve_with_source_observation(solver, graph, constraints, baseline, output, *, budget_seconds=None,
+                                   budget_evaluations=None, seed_node_offsets=None):
     # Explicit signature compatibility keeps external solver adapters usable;
     # the production solver always declares the observation argument.
     options={"output_dir":output}
@@ -636,13 +877,473 @@ def _solve_with_source_observation(solver, graph, constraints, baseline, output,
         observation=options["source_observation"]
         if budget_seconds is not None and observation and "boundary_error_budget" in observation:
             observation["boundary_error_budget"]["max_wall_seconds"]=min(120.,float(budget_seconds))
+        if budget_evaluations is not None and observation and "boundary_error_budget" in observation:
+            observation["boundary_error_budget"]["max_objective_evaluations"]=min(30000,int(budget_evaluations))
+    if seed_node_offsets is not None:
+        if "seed_node_offsets" not in inspect.signature(solver).parameters:
+            raise ValueError("Source restart requires a solver with bounded seed support")
+        options["seed_node_offsets"]=seed_node_offsets
     return solver(graph,constraints,**options)
+
+
+def _source_restart_offsets(image_path, document, baseline, graph, entities, sampling_step):
+    """Two deterministic, local starting offsets from the immutable inputs.
+
+    The largest source-mask discrepancy identifies the first joint to probe;
+    original-image stroke evidence is the fallback. Neither supplies a new
+    dimension or an acceptance verdict. The solver keeps the same graph and
+    exact constraints for both starts.
+    """
+    from .reconstruction_feedback import source_mask_interval_diagnostics
+    from .source_support_diagnostics import source_support_diagnostics
+    by_id={entity["id"]:entity for entity in entities}
+    entity_id=None;quarter=None;direction=None;basis=None
+    try:
+        local=source_mask_interval_diagnostics(baseline,graph,entities)
+        for row in local.get("entities",[]):
+            if row.get("entity_id") not in by_id:continue
+            source=np.asarray(row.get("worst_source_point_px"),float)
+            candidate=np.asarray(row.get("closest_candidate_point_px"),float)
+            if source.shape!=(2,) or candidate.shape!=(2,) or not np.isfinite(source).all() or not np.isfinite(candidate).all():
+                continue
+            from .topology_candidates import _affines
+            _,source_to_design,_=_affines(graph,baseline)
+            direction=source_to_design(source[None,:])[0]-source_to_design(candidate[None,:])[0]
+            if np.linalg.norm(direction)>1e-12:
+                entity_id=row["entity_id"];quarter=int(row["worst_source_interval_quarter"])
+                basis="largest_immutable_input_mask_interval_deviation"
+                break
+    except (KeyError,TypeError,ValueError,IndexError,ArithmeticError):
+        pass
+    if entity_id is None:
+        diagnostic=source_support_diagnostics(image_path,document,baseline,{**graph,"entities":entities})
+        if diagnostic.get("status")!="measured":return [],{"status":"unavailable"}
+        candidates=[]
+        for row in diagnostic.get("entities",[]):
+            entity=by_id.get(row.get("entity_id"))
+            if entity is None:continue
+            for part in row.get("quarters",[]):
+                candidates.append((float(part["stroke_supported_fraction"]),
+                                   -float(part["p90_edge_distance_px"]),entity["id"],int(part["quarter"])))
+        if not candidates:return [],{"status":"no_source_quarters"}
+        _,_,entity_id,quarter=min(candidates)
+        basis="lowest_original_image_stroke_supported_quarter"
+    entity=by_id[entity_id]
+    if direction is None:
+        chord=np.asarray(entity["end"],float)-np.asarray(entity["start"],float)
+        direction=np.array([-chord[1],chord[0]])
+    length=float(np.linalg.norm(direction))
+    if not math.isfinite(length) or length<=1e-12:return [],{"status":"degenerate_weak_primitive"}
+    normal=direction/length
+    shift=min(2*float(sampling_step),.25 if graph["units"]=="mm" else 2.)
+    if not math.isfinite(shift) or shift<=0:return [],{"status":"invalid_source_step"}
+    node=entity["start_node"] if quarter<=2 else entity["end_node"]
+    offsets=[{node:(polarity*shift*normal).tolist()} for polarity in (1.,-1.)]
+    return offsets,{"status":"prepared","basis":basis,
+                    "entity_id":entity_id,"quarter":quarter,"node_id":node,"offset_magnitude":shift,
+                    "units":graph["units"],"ground_truth_used":False}
+
+
+def _source_solution_score(source_check):
+    """Compare admissible candidates without opening a reference DXF."""
+    before=source_check["before"];after=source_check["after"]
+    mask=source_check["oracle_mask_validation"]
+    return {"mask_max_deviation_px":float(mask["conservative_max_deviation_px"]),
+            "stroke_supported_fraction":stroke_support_fraction(after,against=before),
+            "p90_edge_distance_px":float(after["p90_edge_distance_px"])}
+
+
+def _source_score_improves(candidate,incumbent):
+    """Demand a source-evidence Pareto improvement; never trade a failed gate."""
+    mask=candidate["mask_max_deviation_px"]-incumbent["mask_max_deviation_px"]
+    support=candidate["stroke_supported_fraction"]-incumbent["stroke_supported_fraction"]
+    p90=candidate["p90_edge_distance_px"]-incumbent["p90_edge_distance_px"]
+    return (mask<=1e-6 and support>=-1e-6 and p90<=1e-6 and
+            (mask< -1e-4 or support>1e-4 or p90< -1e-4))
+
+
+def _final_source_multistart(image_path,document,baseline,graph,constraints,output,*,solver,
+                             budget_seconds=None):
+    """Opt-in final solve: keep the canonical result unless source evidence improves.
+
+    At most three solves share the existing 120-second/30000-objective budget.
+    The topology beam never calls this helper.  Any restart must independently
+    satisfy the unchanged solver, original-image, mask and DXF-readback gates.
+    """
+    output=Path(output);output.mkdir(parents=True,exist_ok=True)
+    observation=_solver_source_observation(baseline,graph)
+    ceiling=min(120.,float(budget_seconds)) if budget_seconds is not None else 120.
+    deadline=time.monotonic()+ceiling
+    remaining_evaluations=30000
+    receipt={"schema_version":"final-source-multistart-v1","status":"running",
+             "maximum_wall_seconds":ceiling,"maximum_objective_evaluations":30000,
+             "maximum_optional_restart_wall_seconds":15.,
+             "maximum_optional_restart_objective_evaluations":3000,
+             "attempts":[],"selected_seed":"canonical","ground_truth_used":False,
+             "acceptance_thresholds_changed":False}
+    def run(seed,offsets=None):
+        nonlocal remaining_evaluations
+        remaining_time=deadline-time.monotonic()
+        evaluation_limit=remaining_evaluations
+        if seed!="canonical":
+            # Optional searches cannot consume the canonical solver's entire
+            # remaining allowance.  Keep time for source/DXF audits too.
+            remaining_time=min(15.,remaining_time-5.)
+            evaluation_limit=min(3000,evaluation_limit)
+        if remaining_time<=0 or remaining_evaluations<=0:return None
+        directory=output/"source-multistart"/seed;directory.mkdir(parents=True,exist_ok=True)
+        started=time.monotonic()
+        try:
+            result=_solve_with_source_observation(solver,graph,constraints,baseline,directory,
+                budget_seconds=remaining_time,budget_evaluations=evaluation_limit,
+                seed_node_offsets=offsets)
+        except (ValueError,TypeError,ArithmeticError,OverflowError) as error:
+            # A raised solver has no trustworthy evaluation receipt; spend
+            # the remaining allowance instead of launching another restart.
+            remaining_evaluations=0
+            receipt["attempts"].append({"seed":seed,"elapsed_seconds":time.monotonic()-started,
+                "solver_status":"failed","error_type":type(error).__name__,
+                "solver_accepted":False,"source_gate_passed":False,"dxf_readback_passed":False})
+            return None
+        consumed=int(((result.get("diagnostics") or {}).get("source_budget_search") or {}).get("objective_evaluations") or 0)
+        remaining_evaluations=max(0,remaining_evaluations-consumed)
+        row={"seed":seed,"elapsed_seconds":time.monotonic()-started,"objective_evaluations":consumed,
+             "solver_status":result.get("status"),"solver_accepted":result.get("accepted") is True,
+             "source_gate_passed":False,"dxf_readback_passed":None if seed=="canonical" else False}
+        receipt["attempts"].append(row)
+        _write(directory/"parametric-solution.json",result)
+        return result
+    incumbent=run("canonical")
+    if incumbent is None:
+        raise ValueError("Final source solve budget was exhausted before the canonical attempt")
+    if observation is None or "boundary_error_budget" not in observation or incumbent.get("accepted") is not True:
+        receipt["status"]="not_applicable";_write(output/"source-multistart.json",receipt)
+        return incumbent
+    canonical_check=_solved_source_validation(image_path,document,baseline,graph,incumbent["entities"])
+    receipt["attempts"][0]["source_gate_passed"]=canonical_check["passed"] is True
+    if canonical_check.get("passed") is not True or incumbent.get("underconstrained") is not True:
+        receipt["status"]="canonical_retained_no_refinement";_write(output/"source-multistart.json",receipt)
+        return incumbent
+    incumbent_score=_source_solution_score(canonical_check)
+    receipt["attempts"][0]["source_score"]=incumbent_score
+    step=observation["boundary_error_budget"]["sampling_step"]
+    try:
+        seeds,seed_evidence=_source_restart_offsets(image_path,document,baseline,graph,incumbent["entities"],step)
+    except (OSError,ValueError,TypeError,KeyError,IndexError,ArithmeticError):
+        seeds,seed_evidence=[],{"status":"unavailable"}
+    receipt["seed_evidence"]=seed_evidence
+    selected=incumbent
+    for index,offsets in enumerate(seeds[:2],start=1):
+        if deadline-time.monotonic()<2. or remaining_evaluations<100:
+            receipt["stop_reason"]="shared_solve_budget_remaining_too_small";break
+        seed=f"source-normal-{index}"
+        candidate=run(seed,offsets)
+        if candidate is None:break
+        row=receipt["attempts"][-1]
+        if candidate.get("accepted") is not True:continue
+        if {row.get("id") for row in candidate.get("constraints") or []}!={row.get("id") for row in constraints} or not all(
+                check.get("passed") is True for check in candidate["constraints"]):
+            row["reason"]="constraint_receipts_incomplete";continue
+        try:
+            source_check=_solved_source_validation(image_path,document,baseline,graph,candidate["entities"])
+        except InterruptedError:
+            raise
+        except (OSError,ValueError,TypeError,KeyError,IndexError,ArithmeticError):
+            row["reason"]="optional_source_check_unavailable";continue
+        row["source_gate_passed"]=source_check.get("passed") is True
+        if not row["source_gate_passed"]:
+            row["reason"]="unchanged_source_gate_failed";continue
+        try:
+            model=export_parametric(image_path,baseline,
+                {**candidate,"constraints":copy.deepcopy(constraints)},
+                output/"source-multistart"/seed/"export")
+            exact=model["validation"]["exact_radius_validation"]
+            row["dxf_readback_passed"]=exact.get("passed") is True and exact.get("dxf_readback_performed") is True
+        except (OSError,ValueError,KeyError,TypeError,ArithmeticError):
+            row["reason"]="candidate_export_or_readback_failed";continue
+        if not row["dxf_readback_passed"]:
+            row["reason"]="candidate_exact_radius_readback_failed";continue
+        score=_source_solution_score(source_check);row["source_score"]=score
+        if _source_score_improves(score,incumbent_score):
+            incumbent_score=score;selected=candidate;receipt["selected_seed"]=seed
+            row["reason"]="source_evidence_pareto_improved"
+        else:row["reason"]="source_evidence_not_improved"
+    receipt["status"]="selected_source_refinement" if selected is not incumbent else "canonical_retained"
+    receipt["elapsed_seconds"]=max(0.,ceiling-(deadline-time.monotonic()))
+    receipt["objective_evaluations"]=30000-remaining_evaluations
+    _write(output/"source-multistart.json",receipt)
+    selected.setdefault("diagnostics",{})["final_source_multistart"]={
+        "status":receipt["status"],"selected_seed":receipt["selected_seed"],
+        "receipt_path":str(output/"source-multistart.json"),"ground_truth_used":False}
+    return selected
+
+
+def _radius_segment_hypotheses(bindings, inherited=()):
+    """Carry the latest source-arrow coordinates, never a verdict or target ID."""
+    rows = ((bindings.get("radius_binding_coverage") or {}).get("required_mappings") or [])
+    result, seen, counts, fresh_records = [], set(), {}, set()
+
+    def add(record_id, evidence):
+        if not isinstance(record_id, str) or not isinstance(evidence, dict):
+            return False
+        try:
+            segment = np.asarray(evidence.get("segment_px"), float)
+        except (TypeError, ValueError):
+            return False
+        if segment.shape != (2, 2) or not np.isfinite(segment).all():
+            return False
+        key = (record_id, tuple(np.round(segment.ravel(), 4)))
+        if key in seen:
+            return True
+        if counts.get(record_id, 0) >= 4:
+            return False
+        seen.add(key)
+        counts[record_id] = counts.get(record_id, 0) + 1
+        result.append({"record_id": record_id, "kind": "radius",
+                       "source_evidence": {"segment_px": segment.tolist()}})
+        return True
+
+    for mapping in rows:
+        if not isinstance(mapping, dict):
+            continue
+        record_id = mapping.get("record_id")
+        evidence_rows = mapping.get("source_evidence")
+        for evidence in (evidence_rows[:4] if isinstance(evidence_rows, list) else ()):
+            if add(record_id, evidence):
+                fresh_records.add(record_id)
+    # A failed observation on one edited graph does not make a previously
+    # observed pixel location untrue. Keep it as a coordinate-only hypothesis
+    # for the next graph, where the full source verifier must run again.
+    if isinstance(inherited, (list, tuple)):
+        for row in inherited[:1000]:
+            if not isinstance(row, dict) or row.get("kind") != "radius":
+                continue
+            record_id = row.get("record_id")
+            if record_id not in fresh_records:
+                add(record_id, row.get("source_evidence"))
+    return result
+
+
+def _edit_observation_parent(candidate):
+    """Offer fresh source coordinates to edits without changing a certified graph."""
+    observations = candidate.get("edit_source_observations")
+    if not isinstance(observations, dict):
+        return candidate
+    parent = copy.deepcopy(candidate)
+    for field in ("angle_source_observations", "radius_source_segment_hypotheses"):
+        if field in observations:
+            parent["graph"][field] = copy.deepcopy(observations[field])
+    return parent
+
+
+def _source_joint_bootstrap(image_path, document, baseline, selected, bundle, output,
+                            feedback, *, remaining_seconds, edit_time_reserve):
+    """Build one source-only radius+angle compound, before numerical preflight.
+
+    The intermediate refit is never a beam member. Both operations use the
+    ordinary edit kernel and source gate; only a freshly witnessed two-radius
+    joint may become a candidate for the shared numerical search budget.
+    """
+    from .topology_editing import execute_topology_edits
+    from .topology_search import (near_nominal_joint_bootstrap_refits,
+                                  refresh_source_angle_observations,
+                                  unmet_source_angle_joint_operations)
+
+    output=Path(output);output.mkdir(parents=True,exist_ok=True)
+    audit={"status":"skipped","reason":None,"parent_candidate_id":selected["id"],
+           "operations":[],"ground_truth_used":False}
+    def save():
+        _write(output/"source-joint-bootstrap-audit.json",audit)
+    if remaining_seconds() <= edit_time_reserve+30.:
+        audit["reason"]="source_joint_bootstrap_edit_time_reserved";save();return None,audit,None
+    edit_parent=_edit_observation_parent(selected)
+    refits=near_nominal_joint_bootstrap_refits(
+        edit_parent.get("graph") or {},bundle.get("annotation_inventory",[]),feedback,limit=1)
+    if not refits:
+        audit["reason"]="no_unresolved_arrow_verified_near_nominal_joint_refit";save();return None,audit,None
+    first=refits[0];audit["operations"].append(first);save()
+    try:
+        intermediate_rows,first_execution=execute_topology_edits(
+            image_path,document,baseline,edit_parent,bundle,[first],output/"radius-refit")
+    except InterruptedError:
+        raise
+    except (OSError,ValueError,KeyError,TypeError,ArithmeticError):
+        audit["reason"]="source_joint_bootstrap_radius_execution_failed";save();return None,audit,None
+    audit["radius_execution"]=first_execution
+    if not intermediate_rows:
+        audit["reason"]="source_joint_bootstrap_radius_candidate_rejected";save();return None,audit,None
+    intermediate=intermediate_rows[0]
+    intermediate_source=_topology_source_validation(image_path,baseline,intermediate["graph"])
+    audit["intermediate"]={"candidate_id":intermediate["id"],
+                           "geometry_sha256":geometry_fingerprint(intermediate["graph"]),
+                           "source_validation_passed":intermediate_source.get("passed") is True,
+                           "source_validation_reasons":intermediate_source.get("reasons",[])}
+    _write(output/"intermediate-topology.json",intermediate["graph"])
+    _write(output/"intermediate-source-validation.json",intermediate_source)
+    save()
+    if intermediate_source.get("passed") is not True:
+        audit["reason"]="source_joint_bootstrap_intermediate_source_failed";save();return None,audit,None
+    if remaining_seconds() <= edit_time_reserve+15.:
+        audit["reason"]="source_joint_bootstrap_edit_time_reserved";save();return None,audit,None
+    try:
+        observations=refresh_source_angle_observations(
+            image_path,document,baseline,intermediate["graph"])
+    except InterruptedError:
+        raise
+    except (OSError,ValueError,KeyError,TypeError,ArithmeticError):
+        audit["reason"]="source_joint_bootstrap_angle_observation_failed";save();return None,audit,None
+    audit["fresh_angle_observation_count"]=len(observations)
+    joint_ops=unmet_source_angle_joint_operations(
+        intermediate,feedback,bundle.get("annotation_inventory",[]),limit=1)
+    if not joint_ops:
+        audit["reason"]="source_joint_bootstrap_missing_verified_two_radius_joint";save();return None,audit,None
+    joint=joint_ops[0];audit["operations"].append(joint)
+    audit["joint_witness"]={"angle_record_id":joint["record_id"],
+                            "entity_ids":joint["entity_ids"],"source_verified":True}
+    _write(output/"intermediate-topology.json",intermediate["graph"])
+    save()
+    if remaining_seconds() <= edit_time_reserve+15.:
+        audit["reason"]="source_joint_bootstrap_edit_time_reserved";save();return None,audit,None
+    try:
+        compound_rows,joint_execution=execute_topology_edits(
+            image_path,document,baseline,intermediate,bundle,[joint],output/"joint-line")
+    except InterruptedError:
+        raise
+    except (OSError,ValueError,KeyError,TypeError,ArithmeticError):
+        audit["reason"]="source_joint_bootstrap_joint_execution_failed";save();return None,audit,None
+    audit["joint_execution"]=joint_execution
+    if not compound_rows:
+        audit["reason"]="source_joint_bootstrap_joint_candidate_rejected";save();return None,audit,None
+    compound=compound_rows[0]
+    edit=(((compound.get("graph") or {}).get("source_evidence") or {}).get("topology_edit") or {})
+    if (edit.get("replacement_types")!=["ARC","LINE","ARC"] or
+            len(set(edit.get("bound_record_ids") or []))!=2 or
+            edit.get("angle_support_record_ids")!=[joint["record_id"]]):
+        audit["reason"]="source_joint_bootstrap_compound_evidence_incomplete";save();return None,audit,None
+    compound_source=_topology_source_validation(image_path,baseline,compound["graph"])
+    audit["compound"]={"candidate_id":compound["id"],
+                       "geometry_sha256":geometry_fingerprint(compound["graph"]),
+                       "source_validation_passed":compound_source.get("passed") is True,
+                       "source_validation_reasons":compound_source.get("reasons",[]),
+                       "bound_radius_record_ids":edit["bound_record_ids"]}
+    _write(output/"compound-topology.json",compound["graph"])
+    _write(output/"compound-source-validation.json",compound_source)
+    save()
+    if compound_source.get("passed") is not True:
+        audit["reason"]="source_joint_bootstrap_compound_source_failed";save();return None,audit,None
+    if remaining_seconds() <= edit_time_reserve:
+        audit["reason"]="source_joint_bootstrap_edit_time_reserved";save();return None,audit,None
+    compound["id"]=f"seed-joint-{selected['id']}"
+    compound["graph"]["candidate_id"]=compound["id"]
+    if compound["graph"].get("entity_identity"):
+        compound["graph"]["entity_identity"]["display_id_scope"]=compound["id"]
+    compound["graph"].setdefault("source_evidence",{})["initial_seed_bootstrap"]={
+        "parent_candidate_id":selected["id"],"operations":copy.deepcopy(audit["operations"]),
+        "intermediate_geometry_sha256":audit["intermediate"]["geometry_sha256"],
+        "ground_truth_used":False}
+    audit["compound"]["candidate_id"]=compound["id"]
+    _write(output/"compound-topology.json",compound["graph"])
+    audit["status"]="source_candidate";save()
+    return compound,audit,compound_source
+
+
+def _pending_source_topology_operations(candidate, feedback, inventory, visited, *, limit=4):
+    """Find fresh, source-witnessed annotation edits; proposals are never certificates."""
+    from .topology_editing import propose_annotation_arc_edits
+    from .topology_search import operation_fingerprint
+
+    graph=_edit_observation_parent(candidate)["graph"]
+    coverage=feedback.get("radius_binding_coverage") or {}
+    radius_records={row.get("record_id") for group in ("required_mappings","unresolved")
+                    for row in coverage.get(group) or [] if isinstance(row,dict)
+                    and row.get("source_arrow_verified") is True}
+    satisfied=set(feedback.get("satisfied_record_ids") or [])
+    angle_records={row.get("record_id") for row in graph.get("angle_source_observations") or []
+                   if isinstance(row,dict) and row.get("verified") is True
+                   and row.get("record_id") not in satisfied}
+    unresolved={row.get("record_id") for row in coverage.get("unresolved") or []
+                if isinstance(row,dict) and row.get("source_arrow_verified") is True}
+    by_id={row.get("id"):row for row in graph.get("entities") or [] if isinstance(row,dict)}
+    parent_hash=geometry_fingerprint(candidate["graph"])
+    proposed=propose_annotation_arc_edits(graph,inventory,limit=limit,
+                                           unresolved_radius_record_ids=unresolved)
+    pending=[]
+    for operation in proposed:
+        if not isinstance(operation,dict):continue
+        action=operation.get("action");record_id=operation.get("record_id")
+        ids=operation.get("entity_ids") or []
+        tags=set(operation.get("evidence_tags") or [])
+        if (action not in {"insert_annotated_fillet","refit_chain_as_annotated_arc",
+                           "restore_annotated_line_support","split_chain_at_source_features"}
+                or not isinstance(ids,list) or not 1<=len(ids)<=8
+                or any(entity_id not in by_id for entity_id in ids)
+                or not {"annotation_target","source_boundary"}<=tags):
+            continue
+        if record_id is not None:
+            if record_id not in (angle_records if action=="restore_annotated_line_support" else radius_records):
+                continue
+        elif action=="split_chain_at_source_features":
+            witnessed={row.get("record_id") for row in graph.get("annotation_support") or []
+                       if isinstance(row,dict) and row.get("kind")=="radius"
+                       and row.get("candidate_entity_id") in ids
+                       and row.get("arrowhead_verified") is True}
+            if len(witnessed)<2:continue
+        else:continue
+        if operation_fingerprint(parent_hash,operation) in visited:continue
+        pending.append({"action":action,"entity_ids":ids,"record_id":record_id,
+                        "source_witness":"verified_annotation_target_and_source_boundary"})
+    return pending
+
+
+def _maybe_extend_topology_time_budget(budget, record, previous, selected, inventory,
+                                       *, round_number, max_rounds, use_api):
+    """Grant one extra bounded clock only for certified progress with pending source work."""
+    audit=record["time_budget_extension"]
+    if budget.extension_seconds:return False
+    audit["evaluated_after_round"]=round_number
+    if round_number>=max_rounds:
+        audit["reason"]="no_remaining_round";return False
+    if budget.preflights>=budget.max_preflights or (use_api and budget.provider_calls>=budget.max_provider_calls):
+        audit["reason"]="count_budget_exhausted";return False
+    if budget.clock()-budget.started>=budget.max_seconds+min(600.,budget.max_seconds):
+        audit["reason"]="maximum_extended_time_already_elapsed";return False
+    if record.get("stop_reason") not in (None,"topology_search_time_budget_exhausted"):
+        audit["reason"]="non_time_search_stop";return False
+    before=previous.get("constraint_feedback") or {}
+    after=selected.get("constraint_feedback") or {}
+    try:
+        progressed=bool(after and _source_verified_primary_progress(previous,selected,before))
+    except Exception:
+        audit["reason"]="progress_evidence_unavailable";return False
+    if not progressed:
+        audit["reason"]="no_certified_source_numeric_regression_progress";return False
+    try:
+        pending=_pending_source_topology_operations(selected,after,inventory,budget.visited_operations)
+    except Exception:
+        audit["reason"]="pending_source_topology_evidence_unavailable";return False
+    if not pending:
+        audit["reason"]="no_fresh_source_witnessed_topology_obligation";return False
+    if budget.clock()-budget.started>=budget.max_seconds+min(600.,budget.max_seconds):
+        audit["reason"]="maximum_extended_time_already_elapsed";return False
+    reason="certified_progress_with_fresh_source_witnessed_topology_obligation"
+    if not budget.extend_once(reason=reason):return False
+    audit.update(status="granted",reason=reason,extension_seconds=budget.extension_seconds,
+                 total_max_seconds=budget.max_seconds+budget.extension_seconds,
+                 trigger_round=round_number,trigger_candidate_id=selected["id"],
+                 trigger_geometry_sha256=geometry_fingerprint(selected["graph"]),
+                 gained_satisfied_record_ids=sorted(set(after.get("satisfied_record_ids") or [])-
+                                                  set(before.get("satisfied_record_ids") or [])),
+                 pending_source_operations=pending,ground_truth_used=False)
+    if record.get("stop_reason")=="topology_search_time_budget_exhausted":
+        record["stop_reason"]=None
+        audit["cleared_prior_time_stop_for_next_round"]=True
+    return True
 
 
 def _topology_edit_loop(image_path, document, baseline, selected, bundle, output, *,
                         editor_provider=None, evaluator_provider=None, use_api=False,
                         progress=None, max_rounds=3, beam_width=3, max_preflights=18,
-                        max_provider_calls=12, max_seconds=600.):
+                        max_provider_calls=12, max_seconds=600., initial_seed_ids=()):
     """Bounded beam of source-certified edits; no GT-driven candidate selection."""
     from .constraint_binding import analyze_constraint_bindings
     from .parametric_solver import solve_parametric
@@ -651,6 +1352,9 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
         raise ValueError("topology_iteration_budget_must_be_1_to_3")
     if type(beam_width) is not int or not 1<=beam_width<=3:
         raise ValueError("topology_beam_width_must_be_1_to_3")
+    if not isinstance(initial_seed_ids,(list,tuple)) or len(initial_seed_ids)>5 or any(
+            not isinstance(name,str) for name in initial_seed_ids):
+        raise ValueError("topology_initial_seeds_must_be_at_most_five_candidate_ids")
     output=Path(output);root=output/"topology-iterations";root.mkdir(parents=True,exist_ok=True)
     emit=progress or (lambda stage,message:None)
     budget=SearchBudget(max_preflights=max_preflights,max_provider_calls=max_provider_calls,max_seconds=max_seconds)
@@ -658,75 +1362,115 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
             "beam_width":beam_width,"ranking":"verified_radius_records, satisfied_independent_records, satisfied_structural_constraints, remaining_shape_dof, source_error",
             "rounds":[],"stop_reason":None,"ground_truth_used":False,
             "scope":"Source-only bounded beam; numerical construction is not fresh binding, and model verdicts do not certify reference accuracy."}
-    cache={};geometries={};seen_selected={geometry_fingerprint(selected["graph"])}
+    record["time_budget_extension"]={"status":"not_granted","reason":None,
+        "original_max_seconds":budget.max_seconds,"extension_seconds":0.,
+        "maximum_extension_seconds":min(600.,budget.max_seconds),"total_max_seconds":budget.max_seconds,
+        "ground_truth_used":False}
+    record["initial_seed_audit"]={"selected_candidate_id":selected["id"],"attempts":[],
+                                  "admitted_candidate_ids":[],"ground_truth_used":False}
+    cache={};edit_observation_cache={};geometries={};seen_selected={geometry_fingerprint(selected["graph"])}
     def persist():
         record["budget"]=budget.summary()
         record["visited_operations"]=list(budget.visited_operations.values())
         record["visited_geometries"]=list(geometries.values())
         _write(output/"topology-iterations.json",record)
-    def verify(candidate):
+    def verify(candidate, *, source_validation=None):
         graph=candidate["graph"];geometry_key=geometry_fingerprint(graph)
-        # Geometry aliases can carry different current IDs/annotation targets;
-        # never reuse a stale binding-ID map solely because coordinates match.
-        semantics={"geometry":geometry_key,"entity_ids":[row.get("id") for row in graph.get("entities",[])],
-                   "annotations":graph.get("annotation_support",[])}
-        key=hashlib.sha256(json.dumps(semantics,sort_keys=True,allow_nan=False).encode()).hexdigest()
+        # Every source hint and construction claim can affect binding or solving.
+        # Cache only the exact graph that the preflight actually examined.
+        key=_canonical_sha256({"candidate_id":candidate["id"],"graph":graph})
         if key in cache:
+            observations=edit_observation_cache.get(key)
+            if observations is None:
+                candidate.pop("edit_source_observations",None)
+            else:
+                candidate["edit_source_observations"]=copy.deepcopy(observations)
             result=copy.deepcopy(cache[key]);result["candidate_id"]=candidate["id"]
             return result
         if not budget.reserve_preflight():
+            reason=budget.preflight_block_reason() or "topology_search_preflight_budget_exhausted"
             result=reconstruction_feedback(graph)
-            result.update(solver_status="preflight_failed",constraint_count=0,binding_status="not_run",
-                          source_validation={"passed":False,"reasons":["topology_search_preflight_budget_exhausted"]})
+            result.update(solver_status="preflight_not_run",preflight_status="not_run_budget",
+                          preflight_skip_reason=reason,constraint_count=0,binding_status="not_run",
+                          source_validation={"status":"not_run","passed":None,"reasons":[]})
+            if source_validation is not None:
+                result["topology_source_validation"]=source_validation
             return result
         persist()
         directory=root/"constraint-preflight"/key[:16];directory.mkdir(parents=True,exist_ok=True)
-        source_validation=_topology_source_validation(image_path,baseline,graph)
+        preflight_graph=copy.deepcopy(graph)
+        input_graph_sha256=_canonical_sha256(preflight_graph)
+        candidate.pop("edit_source_observations",None)
+        source_validation=(source_validation if source_validation is not None else
+                           _topology_source_validation(image_path,baseline,preflight_graph))
         _write(directory/"source-validation.json",source_validation)
         if not source_validation["passed"]:
-            result=reconstruction_feedback(graph)
+            result=reconstruction_feedback(preflight_graph)
             result.update(solver_status="source_validation_failed",constraint_count=0,
                           binding_status="not_run",source_validation=source_validation)
             try:
                 from .source_support_diagnostics import source_support_diagnostics
-                diagnostic=source_support_diagnostics(image_path,document,baseline,graph)
+                diagnostic=source_support_diagnostics(image_path,document,baseline,preflight_graph)
                 _write(directory/"source-support-diagnostics.json",diagnostic)
                 result["local_source_diagnostics"]=diagnostic
             except (OSError,KeyError,TypeError,ValueError):
                 result["local_source_diagnostics"]={"status":"unavailable"}
         else:
             try:
-                bindings=analyze_constraint_bindings(image_path,document,baseline,graph,directory,use_api=False)
+                bindings=analyze_constraint_bindings(image_path,document,baseline,preflight_graph,directory,use_api=False)
+                # These newly observed coordinates are proposals for a child
+                # edit, not part of the graph whose binding was just certified.
+                candidate["edit_source_observations"]={
+                    "schema_version":"edit-source-observations-v1",
+                    "scope":"Source-coordinate proposals for independently preflighted child edits only.",
+                    "binding_verified":False,"ground_truth_used":False,
+                    "angle_source_observations":copy.deepcopy(bindings.get("angle_source_observations",[])),
+                    "radius_source_segment_hypotheses":_radius_segment_hypotheses(
+                        bindings,graph.get("radius_source_segment_hypotheses") or ())}
                 if budget.remaining_seconds()<=0:
                     raise TimeoutError("topology_search_time_budget_exhausted")
-                solution=_solve_with_source_observation(solve_parametric,graph,bindings.get("constraints",[]),baseline,directory,
+                solution=_solve_with_source_observation(solve_parametric,preflight_graph,bindings.get("constraints",[]),baseline,directory,
                                                          budget_seconds=budget.remaining_seconds())
-                result=reconstruction_feedback(graph,bindings,solution)
+                if _canonical_sha256(preflight_graph)!=input_graph_sha256:
+                    raise ValueError("preflight_graph_mutated_during_binding_or_solve")
+                result=reconstruction_feedback(preflight_graph,bindings,solution)
+                _record_fillet_tangent_contract(directory,preflight_graph,bindings,solution,result)
                 diagnostic_entities=solution.get("entities") if solution.get("accepted") else solution.get("candidate_entities")
                 if diagnostic_entities:
-                    validation=_solved_source_validation(image_path,document,baseline,graph,diagnostic_entities)
+                    validation=_solved_source_validation(image_path,document,baseline,preflight_graph,diagnostic_entities)
                     _write(directory/"solved-source-validation.json",validation)
                     mask_diagnostics=None
                     if not validation["passed"]:
                         try:
-                            mask_diagnostics=source_mask_interval_diagnostics(baseline,graph,diagnostic_entities)
+                            mask_diagnostics=source_mask_interval_diagnostics(baseline,preflight_graph,diagnostic_entities)
                             mask_diagnostics["geometry_stage"]="solver_candidate" if solution.get("accepted") else "rejected_solver_candidate"
                             _write(directory/"source-mask-interval-diagnostics.json",mask_diagnostics)
                         except (KeyError,TypeError,ValueError,ArithmeticError):
                             mask_diagnostics={"status":"unavailable"}
                         from .source_support_diagnostics import source_support_diagnostics
-                        solved_graph={**graph,"entities":diagnostic_entities}
+                        solved_graph={**preflight_graph,"entities":diagnostic_entities}
                         diagnostic=source_support_diagnostics(image_path,document,baseline,solved_graph)
                         diagnostic["geometry_stage"]="solver_candidate" if solution.get("accepted") else "rejected_solver_candidate"
                         _write(directory/"source-support-diagnostics.json",diagnostic)
                         result["local_source_diagnostics"]=diagnostic
-                    source_failure_feedback(result,graph,validation,mask_diagnostics)
+                    source_failure_feedback(result,preflight_graph,validation,mask_diagnostics)
             except InterruptedError:
                 raise
             except Exception:
                 result=reconstruction_feedback(graph)
                 result.update(solver_status="preflight_failed",constraint_count=0,binding_status="not_run",
                               source_validation={"passed":False,"reasons":["source_constraint_preflight_failed"]})
+                candidate.pop("edit_source_observations",None)
+        # A downstream source check must not silently change the input after
+        # binding/solving. Only the untouched candidate graph may receive a
+        # trusted checkpoint identity, and a changed working copy fails shut.
+        if (_canonical_sha256(preflight_graph)!=input_graph_sha256 or
+                _canonical_sha256(graph)!=input_graph_sha256):
+            result=reconstruction_feedback(graph)
+            result.update(solver_status="preflight_failed",constraint_count=0,binding_status="not_run",
+                          source_validation={"passed":False,
+                                             "reasons":["preflight_input_mutated_during_preflight"]})
+            candidate.pop("edit_source_observations",None)
         result["topology_source_validation"]=source_validation
         result["preflight_artifact"]=str(directory)
         if result.get("solver_accepted") is True and result.get("post_solve_source_accepted") is True:
@@ -734,6 +1478,7 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
             _write(directory/"preflight-input-identity.json",_preflight_input_identity(image_path,document,baseline,graph))
         _write(directory/"reconstruction-feedback.json",result)
         cache[key]=copy.deepcopy(result)
+        edit_observation_cache[key]=copy.deepcopy(candidate.get("edit_source_observations"))
         geometries.setdefault(geometry_key,{"geometry_sha256":geometry_key,"candidate_ids":[]})["candidate_ids"].append(candidate["id"])
         geometries[geometry_key].update(solver_status=result.get("solver_status"),
             source_passed=(result.get("source_validation") or source_validation).get("passed"),
@@ -741,8 +1486,141 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
             remaining_shape_dof=result.get("remaining_shape_dof"),issue_count=result.get("issue_count"))
         persist()
         return result
+    selected_preflight_started=budget.clock()
     selected["constraint_feedback"]=verify(selected)
+    selected_preflight_seconds=max(0.,budget.clock()-selected_preflight_started)
+    record["initial_seed_audit"]["selected_preflight"]={
+        "solver_status":selected["constraint_feedback"].get("solver_status"),
+        "source_validation_passed":(selected["constraint_feedback"].get("topology_source_validation") or {}).get("passed"),
+        "preflight_artifact":selected["constraint_feedback"].get("preflight_artifact"),
+        "elapsed_seconds":round(selected_preflight_seconds,3)}
     beam=[selected]
+    ready_seeds=[];diagnostic_seeds=[];last_seed_preflight_seconds=0.
+    edit_time_reserve=min(300.,budget.max_seconds/2.)
+    record["initial_seed_audit"]["minimum_edit_reserve_seconds"]=edit_time_reserve
+    seed_hashes={geometry_fingerprint(selected["graph"])}
+    admitted_seed_ids=set()
+    preferred_bootstrap=False
+    compound_numeric_rejected=False
+    bootstrap_dir=root/"source-joint-bootstrap"
+    if beam_width>1 and budget.preflight_block_reason() is None:
+        bootstrap_dir.mkdir(parents=True,exist_ok=True)
+        compound,bootstrap_audit,compound_source=_source_joint_bootstrap(
+            image_path,document,baseline,selected,bundle,bootstrap_dir,
+            selected["constraint_feedback"],remaining_seconds=budget.remaining_seconds,
+            edit_time_reserve=edit_time_reserve)
+        record["initial_seed_audit"]["source_joint_bootstrap"]=bootstrap_audit
+        persist()
+        if compound is not None:
+            compound_hash=geometry_fingerprint(compound["graph"])
+            if compound_hash in seed_hashes:
+                bootstrap_audit.update(status="rejected",reason="repeated_geometry")
+            else:
+                preflight_started=budget.clock()
+                compound_feedback=verify(compound,source_validation=compound_source)
+                compound["constraint_feedback"]=compound_feedback
+                bootstrap_audit["numeric_preflight"]={
+                    "solver_status":compound_feedback.get("solver_status"),
+                    "preflight_artifact":compound_feedback.get("preflight_artifact"),
+                    "elapsed_seconds":round(max(0.,budget.clock()-preflight_started),3),
+                    "source_validation_passed":(compound_feedback.get("topology_source_validation") or {}).get("passed")}
+                if preflight_admissible(compound_feedback):
+                    bootstrap_audit.update(status="admitted",reason=None)
+                    ready_seeds.append(compound)
+                    beam.append(compound)
+                    seed_hashes.add(compound_hash)
+                    admitted_seed_ids.add(compound["id"])
+                    record["initial_seed_audit"]["admitted_candidate_ids"].append(compound["id"])
+                    bundle.setdefault("candidates",[]).append(compound)
+                    bundle["candidate_count"]=len(bundle["candidates"])
+                    preferred_bootstrap=True
+                    parent_hash=geometry_fingerprint(selected["graph"])
+                    for operation in bootstrap_audit["operations"]:
+                        _,key=budget.visit_operation(parent_hash,operation)
+                        budget.visited_operations[key].update(
+                            status="source_joint_bootstrap",candidate_id=compound["id"],reasons=[])
+                        parent_hash=bootstrap_audit["intermediate"]["geometry_sha256"]
+                else:
+                    compound_numeric_rejected=True
+                    bootstrap_audit.update(status="rejected",reason=(
+                        compound_feedback.get("preflight_skip_reason") or
+                        "source_joint_bootstrap_numeric_preflight_not_admissible"))
+            _write(bootstrap_dir/"source-joint-bootstrap-audit.json",bootstrap_audit)
+            persist()
+    else:
+        record["initial_seed_audit"]["source_joint_bootstrap"]={
+            "status":"skipped","reason":"initial_beam_or_preflight_budget_unavailable",
+            "ground_truth_used":False}
+    # The planner's one selected graph is a preference, not the entire search
+    # frontier. Recheck up to two other locally admissible source hypotheses
+    # under this same preflight/time budget before any local edit is proposed.
+    original_candidates={row["id"]:row for row in bundle.get("candidates",[])
+                         if isinstance(row,dict) and isinstance(row.get("id"),str)}
+    for candidate_id in initial_seed_ids:
+        audit={"candidate_id":candidate_id,"status":"skipped","reason":None}
+        record["initial_seed_audit"]["attempts"].append(audit)
+        if preferred_bootstrap:
+            audit["reason"]="source_joint_bootstrap_preferred_for_edit_budget";continue
+        if len(beam)>=beam_width:
+            audit["reason"]="initial_beam_full";continue
+        if candidate_id==selected["id"]:
+            audit["reason"]="already_selected";continue
+        candidate=original_candidates.get(candidate_id)
+        if candidate is None:
+            audit["reason"]="candidate_not_in_original_bundle";continue
+        fingerprint=geometry_fingerprint(candidate["graph"])
+        audit["geometry_sha256"]=fingerprint
+        if fingerprint in seed_hashes:
+            audit["reason"]="repeated_geometry";continue
+        # A second slow seed should not consume the time needed to execute an
+        # edit from the first. The first alternate gets one bounded trial; a
+        # second is attempted only when its last observed preflight cost fits
+        # alongside a half-budget edit reserve.
+        if budget.remaining_seconds()<edit_time_reserve+(
+                last_seed_preflight_seconds if admitted_seed_ids else 0.):
+            audit["reason"]="initial_seed_edit_time_reserved";continue
+        if budget.remaining_seconds()<=0:
+            audit["reason"]="topology_search_time_budget_exhausted";continue
+        source_check=_topology_source_validation(image_path,baseline,candidate["graph"])
+        audit["source_validation_passed"]=source_check.get("passed") is True
+        audit["source_validation_reasons"]=source_check.get("reasons",[])
+        if source_check.get("passed") is not True:
+            audit["reason"]="source_validation_failed";continue
+        if (compound_numeric_rejected and
+                budget.remaining_seconds()<edit_time_reserve+selected_preflight_seconds):
+            audit["reason"]="post_compound_failure_edit_time_reserved"
+            audit["minimum_remaining_for_alternate_seconds"]=round(
+                edit_time_reserve+selected_preflight_seconds,3)
+            continue
+        preflight_started=budget.clock()
+        feedback=verify(candidate,source_validation=source_check)
+        last_seed_preflight_seconds=max(0.,budget.clock()-preflight_started)
+        candidate["constraint_feedback"]=feedback
+        audit["preflight_status"]=feedback.get("solver_status")
+        audit["preflight_artifact"]=feedback.get("preflight_artifact")
+        audit["preflight_elapsed_seconds"]=round(last_seed_preflight_seconds,3)
+        if feedback.get("solver_status")=="preflight_not_run":
+            audit["reason"]=feedback.get("preflight_skip_reason") or "preflight_not_run";continue
+        if preflight_admissible(feedback):
+            audit["status"]="admitted"
+            ready_seeds.append(candidate)
+        elif feedback.get("binding_status")!="not_run":
+            candidate["diagnostic_only"]=True
+            candidate["formal_binding_coverage_for_ranking"]=0
+            audit["status"]="diagnostic_only"
+            diagnostic_seeds.append(candidate)
+        else:
+            audit["reason"]="preflight_failed";continue
+        beam.append(candidate)
+        seed_hashes.add(fingerprint)
+        admitted_seed_ids.add(candidate_id)
+        record["initial_seed_audit"]["admitted_candidate_ids"].append(candidate_id)
+        persist()
+    # Spend the first edit opportunity on newly opened source hypotheses;
+    # the original selected candidate remains the publishable fallback.
+    beam=[*ready_seeds,selected,*diagnostic_seeds]
+    record["initial_seed_audit"]["first_round_parent_ids"]=[row["id"] for row in beam]
+    persist()
     for number in range(1,max_rounds+1):
         previous_selected=selected
         previous_beam={geometry_fingerprint(row["graph"]) for row in beam}
@@ -782,7 +1660,8 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
             proposed,step=_topology_edit_stage(image_path,document,baseline,parent,bundle,directory,
                 editor_provider=editor_provider,evaluator_provider=evaluator_provider,use_api=use_api,
                 round_index=number,feedback=feedback,verifier=verify,operation_filter=operation_filter,
-                candidate_namespace=f"r{number:02d}-b{branch_index:02d}",provider_guard=provider_guard)
+                candidate_namespace=f"r{number:02d}-b{branch_index:02d}",provider_guard=provider_guard,
+                defer_after_primary_progress=number<max_rounds)
             step.update(round=number,branch=branch_index,parent_geometry_sha256=parent_hash,feedback=feedback)
             if step["acceptance_gate"].get("accepted") and geometry_fingerprint(proposed["graph"])==parent_hash:
                 step["acceptance_gate"].update(accepted=False,reason="repeated_geometry")
@@ -792,11 +1671,16 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
                 if not isinstance(value,dict):continue
                 _,key=budget.visit_operation(parent_hash,value)
                 operation["parent_operation_sha256"]=key
+                if operation.get("preflight_status")=="deferred_not_run":
+                    # The kernel constructed this proposal, but it has no
+                    # independent binding/solve receipt. It remains retryable.
+                    budget.visited_operations.pop(key,None)
+                    continue
                 budget.visited_operations[key].update(status=operation.get("preflight_status",operation.get("status")),
                     reasons=operation.get("preflight_reasons") or [operation.get("reason")],
                     candidate_id=operation.get("candidate_id"))
-            for operation in step.get("editor",{}).get("operations",[]):
-                if isinstance(operation,dict):budget.visit_operation(parent_hash,operation)
+            # The stage filter and execution receipts already mark attempted edits.
+            # Unexecuted editor proposals must remain eligible next round.
             fresh_operations |= bool(set(budget.visited_operations)-known_operations)
             retryable_failure |= any(step.get(role,{}).get("status")=="failed" and
                                      step.get(role,{}).get("schema_success") is not True for role in ("editor","evaluator"))
@@ -826,12 +1710,14 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
                 record["stop_reason"]="topology_search_provider_budget_exhausted";break
         if not branches:break
         preferred=next((row["final_candidate_id"] for row in branches if row["acceptance_gate"].get("accepted")),selected["id"])
-        credible=retain_distinct(next_pool,width=beam_width,preferred_id=preferred)
+        credible=retain_distinct(next_pool,width=beam_width,preferred_id=preferred,
+            annotation_inventory=bundle.get("annotation_inventory",[]))
         selected=credible[0] if credible else previous_selected
         # One publishable/fallback parent plus at most two kernel-safe diagnostic
         # branches lets a two-region repair span rounds without publishing an
         # intermediate failed numerical candidate or claiming its R coverage.
-        exploration=retain_distinct(exploration_pool,width=min(2,beam_width),preferred_id=None)
+        exploration=retain_distinct(exploration_pool,width=min(2,beam_width),preferred_id=None,
+            annotation_inventory=bundle.get("annotation_inventory",[]))
         beam=[selected];beam_hashes={geometry_fingerprint(selected["graph"])}
         for row in [*exploration,*credible[1:]]:
             key=geometry_fingerprint(row["graph"])
@@ -857,6 +1743,10 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
         elif any(branch["acceptance_gate"].get("reason")=="repeated_geometry" for branch in branches) and not changed:
             step["acceptance_gate"].update(accepted=False,reason="repeated_geometry")
             record["stop_reason"]="repeated_geometry"
+        step["final_candidate_id"]=selected["id"]
+        step["selection_origin"]=("initial_seed_promotion" if selected["id"] in admitted_seed_ids else
+                                  "initial_selection" if selected["id"]==record["initial_seed_audit"]["selected_candidate_id"] else
+                                  "local_edit")
         frontier_changed={geometry_fingerprint(row["graph"]) for row in beam}!=previous_beam
         if not changed and not frontier_changed and not record["stop_reason"]:
             can_revise=use_api and (fresh_operations or retryable_failure) and number<max_rounds
@@ -866,6 +1756,9 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
         record["rounds"].append(step)
         record["final_candidate_id"]=selected["id"]
         record["final_feedback"]=verify(selected)
+        _maybe_extend_topology_time_budget(budget,record,previous_selected,selected,
+            bundle.get("annotation_inventory",[]),round_number=number,
+            max_rounds=max_rounds,use_api=use_api)
         record["beam_candidate_ids"]=[row["id"] for row in beam if not row.get("diagnostic_only") and preflight_admissible(row.get("constraint_feedback") or {})]
         record["exploratory_candidate_ids"]=[row["id"] for row in beam if row.get("diagnostic_only")]
         record["diagnostic_seed_candidate_ids"]=[row["id"] for row in beam if not preflight_admissible(row.get("constraint_feedback") or {})]
@@ -879,14 +1772,23 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
         selected=next((row for row in beam if row["id"] in passing),previous_selected if record["rounds"] else selected)
         record["stop_reason"]="final_source_recheck_failed"
     record["final_candidate_id"]=selected["id"]
+    record["final_selection_origin"]=("initial_seed_promotion" if selected["id"] in admitted_seed_ids else
+                                      "initial_selection" if selected["id"]==record["initial_seed_audit"]["selected_candidate_id"] else
+                                      "local_edit")
     record.update(status="completed",stop_reason=record["stop_reason"] or "round_budget_exhausted")
     persist()
     # Preserve old receipt consumers while adding the full per-round audit.
     summary={**(record["rounds"][-1] if record["rounds"] else {}),"rounds":record["rounds"],"max_rounds":max_rounds,
              "stop_reason":record["stop_reason"],"final_candidate_id":selected["id"],
              "beam_width":beam_width,"budget":record["budget"],"visited_operations":record["visited_operations"],
+             "time_budget_extension":record["time_budget_extension"],
              "visited_geometries":record["visited_geometries"],"final_source_rechecks":record["final_source_rechecks"],
-             "accepted_round_count":sum(row["acceptance_gate"].get("accepted") is True for row in record["rounds"])}
+             "initial_seed_audit":record["initial_seed_audit"],"final_selection_origin":record["final_selection_origin"],
+             "accepted_round_count":sum(row["acceptance_gate"].get("accepted") is True for row in record["rounds"]),
+             "accepted_local_edit_count":sum(row["acceptance_gate"].get("accepted") is True and
+                                              row.get("selection_origin")=="local_edit" for row in record["rounds"]),
+             "accepted_seed_promotion_count":sum(row["acceptance_gate"].get("accepted") is True and
+                                                  row.get("selection_origin")=="initial_seed_promotion" for row in record["rounds"])}
     _write(output/"topology-edit-proposals.json",summary)
     return selected,summary
 
@@ -908,6 +1810,16 @@ def _source_valid_topology_choice(image_path, baseline, selected, selected_graph
         choices.extend((by_id[row["candidate_id"]],by_id[row["candidate_id"]]["graph"],"ranked_candidate")
                        for row in ranked if row["candidate_id"] in by_id and
                        row["candidate_id"] not in {selected["id"],base["id"]})
+    # The generated base wrapper retains the same source geometry but also
+    # carries independently localized annotation support and stable lineage.
+    # Try it before the original extraction graph when another candidate
+    # fails source validation; otherwise editing the unannotated fallback
+    # cannot insert a directed fillet even though its source arrow was found.
+    admissible_ids = {row.get("candidate_id") for row in local_evaluation.get("evaluated", [])
+                      if row.get("admissible")}
+    if (allow_alternatives and base["id"] in admissible_ids
+            and selected.get("id") != base["id"] and base["graph"] != base_graph):
+        choices.append((base, base["graph"], "generated_base_candidate"))
     # Even without annotation leaders an online editor may have proposed a
     # different graph. Its rejection must still preserve the exact base;
     # allow_alternatives controls generated candidates, not this rollback.
@@ -1050,18 +1962,21 @@ def _plan_topology(image_path, document, baseline, base_graph, output_dir, *, pl
                 selected["overlay_path"]=materialization["overlay_path"]
         if annotation_evidence or (use_api and editor_provider is not None):
             selected,edit_stage=_topology_edit_loop(image_path,document,baseline,selected,bundle,output,
-                editor_provider=editor_provider,evaluator_provider=evaluator_provider,use_api=use_api,progress=progress)
+                editor_provider=editor_provider,evaluator_provider=evaluator_provider,use_api=use_api,progress=progress,
+                initial_seed_ids=tuple(local.get("ranked_candidate_ids",())) if annotation_evidence else ())
             selected_id=selected["id"]
             selected_graph=selected["graph"]
-            if edit_stage.get("accepted_round_count",0):
+            if edit_stage.get("final_selection_origin")=="initial_seed_promotion":
+                source="bounded_source_seed_promotion"
+            elif edit_stage.get("final_selection_origin")=="local_edit":
                 source=("multimodal_local_topology_edit" if annotation_evidence else
                         "multimodal_local_topology_edit_without_annotation_leader")
         # The exact preserved graph is not necessarily a generated bundle
         # member. Only newly registered/unchanged generated candidates pass
         # through materialize_selected_candidate's membership/hash guard.
-        if preserved_base_before_edit and not (edit_stage or {}).get("accepted_round_count",0):
+        if preserved_base_before_edit and (edit_stage or {}).get("final_selection_origin","initial_selection")=="initial_selection":
             materialization=preserve_base_materialization()
-        elif annotation_evidence or (edit_stage or {}).get("accepted_round_count",0):
+        elif annotation_evidence or (edit_stage or {}).get("final_selection_origin")=="local_edit":
             materialization=materialize_selected_candidate(selected,bundle,output)
     else:
         edit_stage={"status":"skipped","reason":"no_source_valid_topology", "accepted_round_count":0,
@@ -1117,14 +2032,14 @@ def _binding_evidence_sha256(inventory):
     # Exclude paths, packet truncation and provider choices. These are the
     # actual independently measured source observations and candidate objects.
     keys=("units","source_image_sha256","proposal_tolerance_px","all_records","all_candidates",
-          "radius_source_observations","relations","source_arrow_ownership")
+          "radius_source_observations","angle_source_observations","relations","source_arrow_ownership")
     if not isinstance(inventory,dict) or any(key not in inventory for key in ("all_records","all_candidates")):
         return None
     return _canonical_sha256({key:inventory.get(key) for key in keys})
 
 
 def _constraint_signature(row):
-    return _canonical_sha256({key:row.get(key) for key in ("kind","record_id","entities","nodes","value","angle_mode")})
+    return _canonical_sha256({key:row.get(key) for key in ("kind","record_id","entities","nodes","value","angle_mode","reference_axis")})
 
 
 def _constraint_signatures(graph, rows):
@@ -1143,6 +2058,131 @@ def _constraint_receipts_complete(bindings, solution, graph):
             if row.get("passed") is True and all(key in row for key in keys)]
     try:return _constraint_signatures(graph,required)<=_constraint_signatures(graph,passed)
     except (ValueError,KeyError,TypeError,IndexError):return False
+
+
+def _fillet_tangent_contract(graph, bindings, solution):
+    """Audit arrow-verified radius arcs at their actual LINE joints.
+
+    A rounded corner has a geometric tangency obligation, but this diagnostic
+    never manufactures a constraint from an attractive fitted join.  A joint
+    becomes certified only if the current binding pass verified source ink or
+    a source-bound fillet construction and the solver satisfied that relation.
+    These are separate evidence classes: construction is not an independent
+    measurement of tangency in the source image.
+    Missing source evidence stays visibly *unknown*, rather than being counted
+    as either a successful fillet or a failed solver constraint.
+    """
+    bindings, solution = bindings or {}, solution or {}
+    bound = bindings.get("constraints") or []
+    confirmed = set((bindings.get("radius_binding_coverage") or {}).get("confirmed_arrow_records") or [])
+    entities = {row["id"]: row for row in graph.get("entities", [])}
+    incident = {}
+    for entity in entities.values():
+        for node in {entity.get("start_node"), entity.get("end_node")} - {None}:
+            incident.setdefault(node, []).append(entity)
+    independently_verified = {
+        row.get("relation_id") for row in bindings.get("bindings", [])
+        if row.get("accepted") is True and row.get("source") == "source_geometry"
+        and isinstance(row.get("evidence"), dict)
+        and row["evidence"].get("verified") is True
+        and row["evidence"].get("evidence_class") != "source_bound_design_construction"
+    }
+    design_constructed = {
+        row.get("relation_id") for row in bindings.get("bindings", [])
+        if row.get("accepted") is True and row.get("source") == "source_bound_design_fillet"
+        and isinstance(row.get("evidence"), dict)
+        and row["evidence"].get("verified") is True
+        and row["evidence"].get("evidence_class") == "source_bound_design_construction"
+        and row["evidence"].get("independent_source_tangent_measurement") is False
+    }
+    solver_accepted = solution.get("accepted") is True
+    satisfied = {row.get("id") for row in solution.get("constraints", [])
+                 if solver_accepted and row.get("passed") is True}
+    failed = {row.get("id") for row in solution.get("constraints", []) if row.get("passed") is False}
+    tangent_relations = {}
+    for row in bound:
+        relation = row.get("id", "")[1:]
+        if row.get("kind") != "tangent" or relation not in independently_verified | design_constructed:
+            continue
+        design = relation in design_constructed
+        if design and (row.get("evidence_class") != "source_bound_design_construction" or
+                       row.get("independent_source_tangent_measurement") is not False):
+            continue
+        eids = row.get("entities") or []
+        nodes = row.get("nodes") or []
+        if len(eids) == 2 and len(set(eids)) == 2 and len(nodes) == 1:
+            tangent_relations[(frozenset(eids), nodes[0])] = (row["id"], design)
+    diagnostics = []
+    seen = set()
+    for radius in bound:
+        record_id = radius.get("record_id")
+        eids = radius.get("entities") or []
+        if radius.get("kind") != "radius" or record_id not in confirmed or len(eids) != 1:
+            continue
+        key = record_id, eids[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        entity = entities.get(eids[0])
+        if entity is None or entity.get("type") != "ARC":
+            diagnostics.append({"record_id": record_id, "arc_entity_id": eids[0],
+                                "status": "radius_target_not_arc", "line_joints": []})
+            continue
+        joints = []
+        for node in (entity.get("start_node"), entity.get("end_node")):
+            if node is None:
+                continue
+            neighbors = [row for row in incident.get(node, []) if row["id"] != entity["id"]]
+            if len(neighbors) != 1:
+                joints.append({"node_id": node, "status": "ambiguous_incidence",
+                               "neighbor_entity_ids": [row["id"] for row in neighbors]})
+                continue
+            neighbor = neighbors[0]
+            if neighbor.get("type") != "LINE":
+                continue
+            relation_id, design = tangent_relations.get(
+                (frozenset((entity["id"], neighbor["id"])), node), (None, False))
+            prefix = "design_constructed" if design else "source_verified"
+            status = (prefix + "_and_satisfied" if relation_id in satisfied else
+                      prefix + "_but_unsatisfied" if relation_id in failed else
+                      prefix + "_without_solver_receipt" if relation_id else
+                      "source_tangency_unverified")
+            joints.append({"node_id": node, "line_entity_id": neighbor["id"],
+                           "relation_id": relation_id, "status": status,
+                           "evidence_class": "source_bound_design_construction" if design else
+                                             "independent_source_tangent_measurement" if relation_id else None})
+        diagnostics.append({"record_id": record_id, "arc_entity_id": entity["id"],
+                            "status": "review_line_arc_joints", "line_joints": joints})
+    statuses = [joint["status"] for item in diagnostics for joint in item["line_joints"]
+                if "line_entity_id" in joint]
+    certified = sum(value.startswith("source_verified_") for value in statuses)
+    passed = statuses.count("source_verified_and_satisfied")
+    constructed = sum(value.startswith("design_constructed_") for value in statuses)
+    construction_passed = statuses.count("design_constructed_and_satisfied")
+    ambiguous = sum(joint.get("status") == "ambiguous_incidence"
+                    for item in diagnostics for joint in item["line_joints"])
+    return {"schema_version": "source-fillet-tangent-contract-v1", "ground_truth_used": False,
+            "cohort": "bound_arrow_verified_radius_arcs",
+            "solver_accepted": solver_accepted,
+            "arrow_verified_radius_arcs": len(diagnostics), "line_arc_joints": len(statuses),
+            "source_verified_joints": certified, "satisfied_source_verified_joints": passed,
+            "design_constructed_joints": constructed,
+            "satisfied_design_constructed_joints": construction_passed,
+            "unverified_joints": statuses.count("source_tangency_unverified"),
+            "ambiguous_incidence_joints": ambiguous,
+            "all_source_verified_joints_satisfied": certified > 0 and certified == passed,
+            "all_design_constructed_joints_satisfied": constructed > 0 and constructed == construction_passed,
+            "all_line_arc_joints_certified": bool(statuses) and not ambiguous and passed + construction_passed == len(statuses),
+            "scope": "Diagnostic coverage only; unknown joints are not accepted tangencies or solver failures.",
+            "fillets": diagnostics}
+
+
+def _record_fillet_tangent_contract(output, graph, bindings, solution, feedback=None):
+    contract = _fillet_tangent_contract(graph, bindings, solution)
+    if feedback is not None:
+        feedback["fillet_tangent_contract"] = copy.deepcopy(contract)
+    _write(Path(output)/"fillet-tangent-contract.json", contract)
+    return contract
 
 
 def _certify_preflight_checkpoint(image_path, document, baseline, graph, artifact_dir, output_dir):
@@ -1208,6 +2248,7 @@ def _certify_preflight_checkpoint(image_path, document, baseline, graph, artifac
                         all_annotated_radii_verified=False,current_dxf_verified=False,
                         publication_status="candidate_only",exact_radius_validation=copy.deepcopy(exact))
         fresh_feedback=reconstruction_feedback(graph,bindings,solution)
+        _record_fillet_tangent_contract(output,graph,bindings,solution,fresh_feedback)
         fresh_feedback["source_validation"]=solved
         fresh_feedback["post_solve_source_accepted"]=True
         receipt={"status":"certified","input_identity":identity,
@@ -1422,6 +2463,7 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
                 stage.update(binding_counts=bound.get("counts",{}),constraints=bound.get("constraints",[]),
                     issues=bound.get("issues",[]),radius_binding_coverage=bound.get("radius_binding_coverage"),
                     reconstruction_feedback=prepared["feedback"],solved_source_validation=prepared["source_validation"],
+                    fillet_tangent_contract=prepared["feedback"].get("fillet_tangent_contract"),
                     annotation_radius_contract=copy.deepcopy(prepared["contract"]),
                     solver={key:value for key,value in sol.items() if key not in {"entities","nodes","candidate_entities","candidate_nodes","constraints"}},
                     selected_binding_provider=bound.get("provider",{}),binding_selection=selection,
@@ -1430,6 +2472,8 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
                                    ("reconstruction-feedback.json",prepared["feedback"]),
                                    ("radius-contract.json",stage["annotation_radius_contract"])):
                     _write(output/name,value)
+                if stage["fillet_tangent_contract"] is not None:
+                    _write(output/"fillet-tangent-contract.json",stage["fillet_tangent_contract"])
             adopt(trusted,{"status":"certified_preflight_baseline"})
             stage["provider"]=trusted["bindings"].get("provider",{})
             current=publish(trusted["export_directory"],trusted["model"],kind="parametric")
@@ -1443,12 +2487,14 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
             bindings=analyze_constraint_bindings(image_path,document,baseline,graph,attempt_dir,provider=provider,use_api=use_api)
             stage["provider"]=bindings.get("provider",{})
             checkpoint("parametric_solve","独立求解在线重绑定候选，并比较当前证据与已核实约束。")
-            solution=_solve_with_source_observation(solve_parametric,graph,bindings.get("constraints",[]),baseline,attempt_dir)
+            solution=_final_source_multistart(image_path,document,baseline,graph,
+                bindings.get("constraints",[]),attempt_dir,solver=solve_parametric)
             _write(attempt_dir/"parametric-solution.json",solution)
             attempted_entities=solution.get("entities") if solution.get("accepted") else solution.get("candidate_entities")
             source_check=(_solved_source_validation(image_path,document,baseline,graph,attempted_entities)
                           if attempted_entities else {"passed":False,"reasons":["final_numerical_candidate_unavailable"]})
             feedback=reconstruction_feedback(graph,bindings,solution)
+            _record_fillet_tangent_contract(attempt_dir,graph,bindings,solution,feedback)
             source_failure_feedback(feedback,graph,source_check)
             _write(attempt_dir/"reconstruction-feedback.json",feedback)
             _write(attempt_dir/"solved-source-validation.json",source_check)
@@ -1507,6 +2553,8 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
                 revoked_solution={"accepted":False,"status":"revoked_by_changed_source_evidence",
                     "entities":copy.deepcopy(graph["entities"]),"constraints":[],"underconstrained":True}
                 revoked_feedback=reconstruction_feedback(graph,revoked_bindings,revoked_solution)
+                stage["fillet_tangent_contract"]=_record_fillet_tangent_contract(
+                    output,graph,revoked_bindings,revoked_solution,revoked_feedback)
                 revoked_contract=annotation_radius_contract(revoked_bindings,revoked_solution)
                 revoked_contract.update(satisfied=False,candidate_satisfied=False,all_annotated_radii_verified=False,
                     current_dxf_verified=False,publication_status="revoked")
@@ -1535,9 +2583,11 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
         stage["issues"]=bindings.get("issues",[])
         stage["radius_binding_coverage"]=bindings.get("radius_binding_coverage")
         checkpoint("parametric_solve","联合求解图元尺寸与连接关系，逐项核验已绑定约束。")
-        solution=_solve_with_source_observation(solve_parametric,graph,stage["constraints"],baseline,output)
+        solution=_final_source_multistart(image_path,document,baseline,graph,
+            stage["constraints"],output,solver=solve_parametric)
         _write(output/"parametric-solution.json",solution)
         feedback=reconstruction_feedback(graph,bindings,solution)
+        stage["fillet_tangent_contract"]=_record_fillet_tangent_contract(output,graph,bindings,solution,feedback)
         _write(output/"reconstruction-feedback.json",feedback)
         stage["reconstruction_feedback"]=feedback
         stage["solver"]={key:value for key,value in solution.items() if key not in {"entities","nodes","candidate_entities","candidate_nodes","constraints"}}

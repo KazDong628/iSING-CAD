@@ -150,6 +150,40 @@ def test_local_executor_refits_single_and_combined_edits_without_mutating_base(t
     assert candidate == original
 
 
+def test_local_edit_rechecks_current_radius_segment_on_edited_graph(tmp_path, monkeypatch):
+    from contour_agent import topology_candidates as source_module
+
+    image_path, baseline, candidate, bundle = _local_fixture(tmp_path)
+    segment = [[210., 30.], [200., 70.]]
+    candidate["graph"]["radius_source_segment_hypotheses"] = [
+        {"record_id": "r000", "kind": "radius",
+         "source_evidence": {"segment_px": segment}}]
+    document = {"records": [{"text": "R12",
+                             "box": [[202, 20], [225, 20], [225, 42], [202, 42]]}]}
+    calls = []
+
+    def recheck(gray, record, proposed, boundary, band, contours, *, verifier):
+        calls.append(record["id"])
+        if not np.allclose(proposed, segment) or gray[70, 200] >= 200:
+            return None
+        return {"score": 1., "segment_px": segment, "arrowhead_verified": True,
+                "arrowhead": {"tip_px": segment[1], "verified": True}}
+
+    monkeypatch.setattr(source_module, "_leaders", lambda *args: [])
+    monkeypatch.setattr(source_module, "native_radius_leader_segments", lambda *args: [])
+    monkeypatch.setattr(source_module, "verify_source_hough_leader", recheck)
+    rows, audit = execute_topology_edits(image_path, document, baseline, candidate, bundle, [
+        {"action": "merge_chain_as_line", "entity_ids": ["g000", "g001", "g002"],
+         "record_id": None, "evidence_tags": ["collinear_support"]},
+    ], tmp_path / "edits")
+    assert audit["accepted_candidates"] == 1
+    assert calls == ["r000"]
+    support = rows[0]["graph"]["annotation_support"][0]
+    assert support["record_id"] == "r000"
+    assert support["arrowhead_verified"] is True
+    assert support["source_evidence"]["segment_px"] == segment
+
+
 def test_local_executor_rejects_bad_chain_without_mutating_base(tmp_path):
     image_path, baseline, candidate, bundle = _local_fixture(tmp_path)
     original = copy.deepcopy(candidate)

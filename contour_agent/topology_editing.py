@@ -30,7 +30,8 @@ from .vectorize import _arc, _closed_ring, _line, _sample_entities, assess_fit_q
 
 EDIT_ACTIONS = {"merge_chain_as_line", "merge_chain_as_arc", "merge_chain_best_fit",
                 "refit_chain_as_annotated_arc", "refit_entity_as_line",
-                "split_chain_at_source_features", "insert_annotated_fillet"}
+                "split_chain_at_source_features", "insert_annotated_fillet",
+                "restore_annotated_line_support"}
 
 
 def _edit_minimum(action):
@@ -49,6 +50,61 @@ def _source_endpoint_pair(graph, entity):
     return pair if pair.shape == (2, 2) and np.isfinite(pair).all() else None
 
 
+def _unique_source_targeted_unbound_arc(graph, inventory, entity_id, record_id):
+    """Admit an unbound ARC only as a source-backed fillet *proposal*.
+
+    A rough fitted radius is not dimensional evidence. The named OCR radius
+    must have one directed, full-shaft, first-contour source claim on this ARC;
+    fresh binding and solving remain mandatory after construction.
+    """
+    arc = next((row for row in graph.get("entities", []) if row.get("id") == entity_id), None)
+    record = next((row for row in inventory if row.get("record_id") == record_id and
+                   row.get("kind") == "radius"), None)
+    nominal = (record or {}).get("nominal")
+    annotation = arc.get("radius_annotation_evidence") if isinstance(arc, dict) else None
+    if (not isinstance(arc, dict) or arc.get("type") != "ARC" or
+            arc.get("radius_binding") or arc.get("radius_constructed") or
+            arc.get("dimension_bound") or arc.get("constraint_ids") or
+            arc.get("radius_binding_status") not in
+            {None, "not_requested", "unresolved_fixed_radius_fit_failed"} or
+            (annotation is not None and
+             (not isinstance(annotation, dict) or annotation.get("record_id") != record_id)) or
+            isinstance(nominal, bool) or not isinstance(nominal, (int, float)) or
+            not math.isfinite(nominal) or nominal <= 0):
+        return False
+    claims = [row for row in graph.get("annotation_support", []) if isinstance(row, dict) and
+              row.get("kind") == "radius" and row.get("status") == "candidate_supported" and
+              row.get("arrowhead_verified") is True and row.get("record_id") == record_id]
+    if len(claims) != 1 or claims[0].get("candidate_entity_id") != entity_id:
+        return False
+    if any(row.get("record_id") != record_id and row.get("candidate_entity_id") == entity_id and
+           row.get("kind") == "radius" and row.get("arrowhead_verified") is True
+           for row in graph.get("annotation_support", []) if isinstance(row, dict)):
+        return False
+    claim = claims[0]
+    if any(row.get("entity_type") == "ARC" and row.get("entity_id") != entity_id
+           for row in claim.get("adjacent_target_hypotheses", []) if isinstance(row, dict)):
+        return False
+    evidence = claim.get("source_evidence") or {}
+    target = evidence.get("target_source_px")
+    try: target = np.asarray(target, float)
+    except (TypeError, ValueError): return False
+    grid = graph.get("source_grid_pitch_px") or 1.
+    gap = claim.get("target_gap_px")
+    visibility = evidence.get("contour_visibility") or {}
+    first_hit = visibility.get("first_intersection_px")
+    try: first_hit = np.asarray(first_hit, float)
+    except (TypeError, ValueError): return False
+    return bool(target.shape == (2,) and np.isfinite(target).all() and
+                first_hit.shape == (2,) and np.isfinite(first_hit).all() and
+                isinstance(grid, (int, float)) and math.isfinite(grid) and grid > 0 and
+                isinstance(gap, (int, float)) and math.isfinite(gap) and
+                gap <= 2.25 * grid and
+                (evidence.get("shaft_evidence") or {}).get("verified") is True and
+                visibility.get("verified") is True and
+                (evidence.get("arrowhead") or {}).get("verified") is True)
+
+
 def _complete_fillet_support_scope(graph, inventory, operation):
     """Include the missing support beyond a short, source-targeted corner.
 
@@ -60,6 +116,15 @@ def _complete_fillet_support_scope(graph, inventory, operation):
         return requested
     indices = _ordered_indices(graph, requested, minimum=1)
     entities = graph["entities"]
+    # An existing source-bound radius between two finite LINE supports is
+    # already the complete local domain.  Expanding past either support would
+    # let an unrelated neighboring feature influence a tangency repair.
+    if (len(indices) == 3 and [entities[index].get("type") for index in indices] ==
+            ["LINE", "ARC", "LINE"] and
+            ((entities[indices[1]].get("radius_binding") or {}).get("record_id") == operation.get("record_id") or
+             _unique_source_targeted_unbound_arc(
+                 graph, inventory, entities[indices[1]]["id"], operation.get("record_id")))):
+        return requested
     record = next((r for r in inventory if r.get("record_id") == operation.get("record_id")), {})
     nominal = record.get("nominal")
     if isinstance(nominal, bool) or not isinstance(nominal, (int, float)) or not math.isfinite(nominal) or nominal <= 0:
@@ -99,6 +164,47 @@ def _complete_fillet_support_scope(graph, inventory, operation):
                 or math.dist(other["start"], other["end"]) <= 1.5*length):
             continue
         expanded = [neighbor, *expanded] if step < 0 else [*expanded, neighbor]
+    # A provider may include the preceding annotated ARC when pointing at a
+    # short LINE connector.  Completing the other side then produces a four-
+    # primitive scope even though the directed fillet is owned by the two
+    # finite LINE supports and their short connector.  Select that smallest
+    # source-witnessed chain before geometric construction; the ordinary
+    # source-fit, arrow, constraint and solver gates still decide acceptance.
+    if len(expanded) > 3:
+        windows = []
+        for offset in range(len(expanded) - 2):
+            window = expanded[offset:offset + 3]
+            first, connector, last = (entities[index] for index in window)
+            if any(row.get("type") != "LINE" for row in (first, connector, last)):
+                continue
+            if len({row["id"] for row in (first, connector, last)}.intersection(requested)) < 2:
+                continue
+            if (connector.get("radius_binding") or connector.get("dimension_bound")
+                    or connector.get("constraint_ids")):
+                continue
+            lengths = [math.dist(row["start"], row["end"])
+                       for row in (first, connector, last)]
+            if (lengths[1] <= 1e-8 or lengths[1] > 2 * nominal
+                    or min(lengths[0], lengths[2]) <= 1.5 * lengths[1]):
+                continue
+            source_pair = _source_endpoint_pair(graph, connector)
+            if source_pair is None:
+                continue
+            source_length = float(np.linalg.norm(source_pair[1] - source_pair[0]))
+            if source_length <= 1e-8:
+                continue
+            radius_px = nominal * source_length / lengths[1]
+            target_gap = float(np.linalg.norm(source_pair - target, axis=1).min())
+            if target_gap > 2 * radius_px:
+                continue
+            windows.append((target_gap / radius_px, window))
+        if len(windows) == 1:
+            expanded = windows[0][1]
+        elif windows:
+            windows.sort(key=lambda row: row[0])
+            # Two equally plausible corners require a separate source review.
+            if windows[1][0] - windows[0][0] > .25:
+                expanded = windows[0][1]
     return [entities[index]["id"] for index in expanded]
 
 
@@ -110,6 +216,8 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
     """
     if not isinstance(graph, dict) or not isinstance(inventory, list) or limit <= 0:
         return []
+    from .annotation_line_support import propose_annotation_line_edits
+    angle_lines = propose_annotation_line_edits(graph, inventory, limit=1)
     entities = {row.get("id"): row for row in graph.get("entities", []) if isinstance(row, dict)}
     records = {row.get("record_id"): row for row in inventory if isinstance(row, dict)
                and row.get("record_id") and row.get("kind") == "radius"}
@@ -119,6 +227,7 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
     by_entity = {}
     for row in supports:
         by_entity.setdefault(row["candidate_entity_id"], []).append(row)
+    unresolved = set(unresolved_radius_record_ids or [])
     ranked, fillets = [], []
     ordered_entities = list(entities.values())
     def source_endpoints(entity):
@@ -161,7 +270,45 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
         operation = {"action": "insert_annotated_fillet", "entity_ids": pair,
             "record_id": record["record_id"], "evidence_tags": ["annotation_target", "source_boundary"]}
         operation["entity_ids"] = _complete_fillet_support_scope(graph, inventory, operation)
-        fillets.append((mismatch, operation))
+        fillets.append(((2 if primitive_conflict and record["record_id"] in unresolved else 0,
+                         mismatch), operation))
+
+    def propose_bound_arc_tangent_reinsertion(entity_id, support, record):
+        """Propose exact-R reinsertion of a source-targeted ARC between LINEs."""
+        arc = entities[entity_id]
+        binding = arc.get("radius_binding") or {}
+        already_bound = binding.get("record_id") == record["record_id"]
+        unique_unbound = _unique_source_targeted_unbound_arc(
+            graph, inventory, entity_id, record["record_id"])
+        if (arc.get("type") != "ARC" or not (already_bound or unique_unbound) or
+                support.get("arrowhead_verified") is not True or
+                (support.get("source_evidence") or {}).get("target_source_px") is None
+                or len(ordered_entities) < 4):
+            return
+        position = next(i for i, row in enumerate(ordered_entities) if row["id"] == entity_id)
+        before, after = (ordered_entities[(position-1) % len(ordered_entities)],
+                         ordered_entities[(position+1) % len(ordered_entities)])
+        if before.get("type") != "LINE" or after.get("type") != "LINE":
+            return
+        if unique_unbound and any(math.dist(line["start"], line["end"]) < float(record["nominal"])
+                                  for line in (before, after)):
+            return
+        # The construction kernel checks the complete source ring and arrow;
+        # this geometric deviation is only a trigger, never acceptance proof.
+        deviations = [float(_fillet_tangent(before, "end") @ _fillet_tangent(arc, "start")),
+                      float(_fillet_tangent(arc, "end") @ _fillet_tangent(after, "start"))]
+        radius_matches = math.isclose(float(arc.get("radius", 0.)), float(record["nominal"]),
+                                      rel_tol=1e-8, abs_tol=1e-8)
+        if radius_matches and min(deviations) >= math.cos(math.radians(1.)):
+            return
+        operation = {"action": "insert_annotated_fillet",
+                     "entity_ids": [before["id"], entity_id, after["id"]],
+                     "record_id": record["record_id"],
+                     "evidence_tags": ["annotation_target",
+                                       "existing_radius_arc" if already_bound else "unique_source_targeted_unbound_arc",
+                                       "finite_line_supports", "source_boundary"]}
+        fillets.append(((1 if record["record_id"] in unresolved else 0,
+                         1.+max(1.-value for value in deviations)), operation))
 
     for entity_id, rows in by_entity.items():
         entity = entities[entity_id]
@@ -176,8 +323,10 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
             mismatch = 0.0
             if (graph.get("units") == "mm" and isinstance(fitted, (int, float)) and fitted > 0):
                 mismatch = abs(math.log(float(fitted) / float(nominal)))
-            if not primitive_conflict and mismatch < .20:
-                continue
+            if not primitive_conflict and len(rows) == 1:
+                propose_bound_arc_tangent_reinsertion(entity_id, support, record)
+                if mismatch < .20:
+                    continue
             if not (support.get("arrowhead_verified") or
                     float(support.get("target_gap_px", math.inf)) <=
                     2.25 * float(graph.get("source_grid_pitch_px") or 1.)):
@@ -237,7 +386,6 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
     positions={row["id"]:i for i,row in enumerate(ordered_entities)}
     verified=sorted([row for row in supports if row.get("arrowhead_verified") is True],
                     key=lambda row:positions[row["candidate_entity_id"]])
-    unresolved=set(unresolved_radius_record_ids or [])
     partitions=[]
     for first,second in zip(verified,verified[1:]):
         lo,hi=positions[first["candidate_entity_id"]],positions[second["candidate_entity_id"]]
@@ -270,6 +418,7 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
                                           "evidence_tags":["annotation_target","source_boundary","continuity"]}))
     if partitions:
         reserved.insert(0,max(partitions,key=lambda row:row[0])[1])
+    reserved = [*angle_lines, *reserved]
     return [*reserved[:limit], *[operation for _, operation in ranked[:max(0, limit - len(reserved))]]]
 
 
@@ -483,6 +632,10 @@ def _radius_edit_evidence(graph, operation, inventory, entity_ids, design_to_sou
                "method": "multimodal target plus local leader and fixed-radius source fit",
                "arrowhead_verified": bool(matched.get("arrowhead_verified")),
                "target_gap_px": float(matched.get("target_gap_px", 0.))}
+    if (action == "insert_annotated_fillet" and len(entity_ids) == 3 and
+            _unique_source_targeted_unbound_arc(graph, inventory, entity_ids[1], record_id)):
+        # This admits a bounded construction trial, not a dimension binding.
+        binding["unique_unbound_arc_source_claim"] = True
     if matched.get("target_match_method"):
         binding["target_match_method"] = matched["target_match_method"]
         binding["target_match_entity_ids"] = list(entity_ids)
@@ -829,6 +982,190 @@ def _annotated_curved_fillet(points, radius, tolerance, binding):
     return min(choices, key=lambda row: row[:2])[2]
 
 
+def _annotated_existing_line_fillet(points, radius, tolerance, binding, selected):
+    """Preserve existing LINE supports; a fillet cannot rotate or replace them.
+
+    Only a two-line junction, one short unbound connector, or one already
+    source-bound radius ARC between those same finite supports is eligible.
+    A three-piece edit may redistribute only its existing middle domain.
+    Source residuals and the directed target still have to justify the exact R.
+    An infeasible construction remains unresolved instead of refitting supports.
+    """
+    failure = "source_does_not_support_exact_annotated_fillet"
+    if not binding or binding.get("arrowhead_verified") is not True:
+        raise ValueError("fillet_requires_verified_directed_radius_target")
+    target = np.asarray(binding.get("target_source_px"), float)
+    if target.shape != (2,) or not np.isfinite(target).all():
+        raise ValueError("fillet_requires_source_target_location")
+    points = np.asarray(points, float)
+    if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 5
+            or not np.isfinite(points).all() or not math.isfinite(radius)
+            or radius <= 0 or not math.isfinite(tolerance) or tolerance <= 0):
+        raise ValueError(failure)
+    middle_arc = (len(selected) == 3 and selected[1].get("type") == "ARC")
+    if (len(selected) not in (2, 3) or selected[0].get("type") != "LINE"
+            or selected[-1].get("type") != "LINE"
+            or (len(selected) == 3 and selected[1].get("type") not in {"LINE", "ARC"})):
+        raise ValueError("fillet_requires_two_existing_line_supports")
+    for first, second in zip(selected, selected[1:]):
+        if math.dist(first["end"], second["start"]) > 1e-6:
+            raise ValueError("fillet_support_chain_not_connected")
+    a, b = np.asarray(selected[0]["start"], float), np.asarray(selected[-1]["end"], float)
+    u = np.asarray(selected[0]["end"], float)-a
+    v = b-np.asarray(selected[-1]["start"], float)
+    ul, vl = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+    if min(ul, vl) <= max(1e-8, tolerance):
+        raise ValueError("fillet_would_consume_line_support")
+    if (np.linalg.norm(points[0]-a) > 1e-6 or np.linalg.norm(points[-1]-b) > 1e-6):
+        raise ValueError("fillet_source_endpoints_do_not_match_supports")
+    if middle_arc:
+        prior = selected[1].get("radius_binding") or {}
+        if prior:
+            if (prior.get("record_id") != binding.get("record_id") or
+                    not math.isclose(float(selected[1].get("radius", 0.)), radius,
+                                     rel_tol=1e-8, abs_tol=1e-8)):
+                raise ValueError("fillet_reinsertion_requires_same_bound_radius")
+        elif (binding.get("unique_unbound_arc_source_claim") is not True or
+              selected[1].get("radius_constructed") or
+              selected[1].get("radius_binding_status") not in
+              {None, "not_requested", "unresolved_fixed_radius_fit_failed"}):
+            raise ValueError("fillet_unbound_arc_requires_unique_source_claim")
+    elif len(selected) == 3:
+        connector = selected[1]
+        length = math.dist(connector["start"], connector["end"])
+        if (connector.get("radius_binding") or connector.get("dimension_bound")
+                or connector.get("constraint_ids") or length <= 1e-8
+                or length > 2*radius or min(ul, vl) <= 1.5*length):
+            raise ValueError("fillet_connector_is_not_a_short_unbound_corner")
+    u, v = u/ul, v/vl
+    turn = math.atan2(float(u[0]*v[1]-u[1]*v[0]), float(u@v))
+    if not math.radians(5) <= abs(turn) <= math.radians(160):
+        raise ValueError(failure)
+    try:
+        lengths = np.linalg.solve(np.column_stack([u, v]), b-a)
+    except np.linalg.LinAlgError as error:
+        raise ValueError(failure) from error
+    distance = radius*math.tan(abs(turn)/2)
+    retained = lengths-distance
+    # Both original outer endpoints and LINE directions stay fixed. A
+    # tangent may redistribute one unbound short connector, but never reach
+    # outside its finite local domain or consume an outer support LINE.
+    if not np.isfinite(retained).all() or min(retained) <= max(1e-8, tolerance):
+        raise ValueError("fillet_contact_outside_finite_line_support")
+    first, last = a+retained[0]*u, b-retained[1]*v
+    redistribution = []
+    for side, contact, original_length, remaining in (
+            ("before", first, ul, retained[0]), ("after", last, vl, retained[1])):
+        extension = float(remaining-original_length)
+        if extension <= 1e-7:
+            continue
+        if len(selected) != 3:
+            raise ValueError("fillet_contact_outside_finite_line_support")
+        c0, c1 = np.asarray(selected[1]["start"], float), np.asarray(selected[1]["end"], float)
+        middle_chord = float(np.linalg.norm(c1-c0))
+        gap = float(_primitive_distance(contact[None, :], selected[1])[0])
+        if middle_arc:
+            # Reuse only the old radius arc's finite footprint.  Its current
+            # tangent is not trusted; the source ring below must also support
+            # the newly constructed contact.
+            source_gap = float(_source_polyline_distance(contact[None, :], points)[0])
+            if (extension > middle_chord or gap > max(2*tolerance, 2.)
+                    or source_gap > tolerance):
+                raise ValueError("fillet_contact_outside_replaced_radius_arc_domain")
+            redistribution.append({"side": side, "extension_px": extension,
+                "replaced_arc_gap_px": gap, "source_path_gap_px": source_gap,
+                "replaced_arc_chord_px": middle_chord,
+                "source_tolerance_px": float(tolerance)})
+        else:
+            connector_vector = c1-c0
+            fraction = float((contact-c0) @ connector_vector)/(middle_chord**2)
+            if (extension > middle_chord or not -1e-7 <= fraction <= 1.+1e-7
+                    or gap > tolerance):
+                raise ValueError("fillet_contact_outside_finite_line_support_or_short_connector_domain")
+            redistribution.append({"side": side, "extension_px": extension,
+                "connector_projection_fraction": fraction, "finite_connector_gap_px": gap,
+                "connector_length_px": middle_chord, "source_tolerance_px": float(tolerance)})
+    center = first+np.array([-u[1], u[0]])*math.copysign(radius, turn)
+    candidate = [{"type": "LINE", "start": a.tolist(), "end": first.tolist()},
+                 {"type": "ARC", "start": first.tolist(), "end": last.tolist(),
+                  "center": center.tolist(), "radius": float(radius), "clockwise": turn < 0},
+                 {"type": "LINE", "start": last.tolist(), "end": b.tolist()}]
+    distances = np.asarray([_primitive_distance(points, e) for e in candidate])
+    assignments = np.argmin(distances, axis=0)
+    if (np.count_nonzero(assignments == 1) < 3 or np.any(np.diff(assignments) < 0)
+            or float(distances.min(axis=0).max()) > tolerance
+            or float(_primitive_distance(target[None, :], candidate[1])[0]) > max(1., tolerance)):
+        raise ValueError(failure)
+    if len(selected) == 3 and not middle_arc:
+        # A named short diagonal can be a real chamfer. Its removal needs
+        # observed curvature beyond raster uncertainty, not merely a nearby R.
+        corner_source = points[assignments == 1]
+        bend = float(_primitive_distance(corner_source, selected[1]).max())
+        if bend <= max(.5, tolerance*.25):
+            raise ValueError("fillet_connector_has_no_resolved_source_curvature")
+    sampled = _sample_entities(candidate, max_step_px=max(.25, min(1., tolerance/2)))[0]
+    forward = float(cKDTree(sampled).query(points, workers=1)[0].max())
+    reverse = float(_source_polyline_distance(sampled, points).max())
+    if max(forward, reverse) > max(tolerance*1.5, 1.):
+        raise ValueError(failure)
+    for index, entity in enumerate(candidate):
+        assigned = distances[index, assignments == index]
+        entity["fit_error_px"] = float(assigned.max()) if len(assigned) else 0.
+    middle_source = ({key: copy.deepcopy(selected[1][key])
+                      for key in ("type", "start", "end", "center", "radius", "clockwise")
+                      if key in selected[1]} if len(selected) == 3 else None)
+    candidate[1].update(radius_binding=copy.deepcopy(binding),
+        radius_annotation_evidence=copy.deepcopy(binding), radius_binding_status="applied",
+        fillet_construction=("existing_line_arc_line_tangent_reinsertion" if middle_arc
+                             else "existing_finite_line_supports"),
+        source_refinement={"outer_endpoints_fixed": True, "support_directions_fixed": True,
+                           "support_types_fixed": True, "radius_exact": True,
+                           "source_path_and_arrow_verified": True,
+                           "ground_truth_used": False,
+                           "original_finite_line_supports_px": [
+                               [selected[0]["start"], selected[0]["end"]],
+                               [selected[-1]["start"], selected[-1]["end"]]],
+                           "original_middle_source_geometry": middle_source,
+                           "constructed_contact_points_px": [first.tolist(), last.tolist()],
+                           "maximum_source_error_px": float(distances.min(axis=0).max()),
+                           "maximum_reverse_error_px": reverse})
+    if redistribution:
+        if middle_arc:
+            candidate[1]["source_refinement"]["replaced_arc_domain_redistribution"] = redistribution
+        else:
+            candidate[1]["fillet_construction"] = "existing_lines_short_connector_redistribution"
+            candidate[1]["source_refinement"]["connector_domain_redistribution"] = redistribution
+    # A later radius fillet can extend an already restored angular LINE into
+    # the replaced ARC domain. Preserve its source-stroke witness only when
+    # the replacement retains the entire old finite, directed LINE. Fresh
+    # angle binding still rechecks the original stroke and both arrowheads.
+    for old_line, new_line in ((selected[0], candidate[0]),
+                               (selected[-1], candidate[-1])):
+        witness = old_line.get("angle_support_evidence")
+        if (not isinstance(witness, dict) or
+                witness.get("method") != "verified_two_radius_joint_line_topology_restore" or
+                witness.get("ground_truth_used") is not False or
+                not isinstance(witness.get("record_id"), str)):
+            continue
+        old_segment = np.asarray([old_line["start"], old_line["end"]], float)
+        new_segment = np.asarray([new_line["start"], new_line["end"]], float)
+        old_vector, new_vector = np.diff(old_segment, axis=0)[0], np.diff(new_segment, axis=0)[0]
+        old_length, new_length = float(np.linalg.norm(old_vector)), float(np.linalg.norm(new_vector))
+        if min(old_length, new_length) <= tolerance:
+            continue
+        direction = new_vector/new_length
+        if float(old_vector @ direction)/old_length < 1-1e-10:
+            continue
+        offsets = old_segment-new_segment[0]
+        projections = offsets @ direction
+        normal_gap = np.abs(offsets[:, 0]*direction[1]-offsets[:, 1]*direction[0])
+        if (np.max(normal_gap) > 1e-4 or np.min(projections) < -1e-4 or
+                np.max(projections) > new_length+1e-4):
+            continue
+        new_line["angle_support_evidence"] = copy.deepcopy(witness)
+    return candidate
+
+
 def _annotated_line_fillet(points, radius, tolerance, binding):
     """Historical entry point, now supporting LINE or ARC on either side."""
     try:
@@ -845,8 +1182,19 @@ def _annotated_line_fillet(points, radius, tolerance, binding):
 
 
 def _replacement_chain(support, action, tolerance, selected_entities, *, force_arc=False,
-                       annotated_radius_px=None, radius_binding=None, radius_targets=None, candidate_scorer=None):
-    if action == "split_chain_at_source_features":
+                       annotated_radius_px=None, radius_binding=None, radius_targets=None, candidate_scorer=None,
+                       angle_evidence=None):
+    if action == "restore_annotated_line_support":
+        from .annotation_line_support import restore_annotated_joint_line_support, restore_annotated_line_support
+        if len(selected_entities) == 2:
+            replacements = restore_annotated_joint_line_support(
+                support, angle_evidence, tolerance, radius_targets=radius_targets,
+                fixed_radius_fitter=_fixed_radius_arc)
+        else:
+            replacements = restore_annotated_line_support(
+                support, angle_evidence, tolerance, radius_targets=radius_targets,
+                fixed_radius_fitter=_fixed_radius_arc)
+    elif action == "split_chain_at_source_features":
         if radius_targets and len(radius_targets)>=2:
             from .annotated_arc_resegmentation import resegment_annotated_arcs
             partition=resegment_annotated_arcs(support,radius_targets,tolerance,source_entity_count=len(selected_entities),
@@ -857,7 +1205,12 @@ def _replacement_chain(support, action, tolerance, selected_entities, *, force_a
         else:
             replacements = _split_source_chain(support, tolerance)
     elif action == "insert_annotated_fillet":
-        replacements = _annotated_line_fillet(support, annotated_radius_px, tolerance, radius_binding)
+        if len(selected_entities) in (2, 3) and (all(e.get("type") == "LINE" for e in selected_entities)
+                or [e.get("type") for e in selected_entities] == ["LINE", "ARC", "LINE"]):
+            replacements = _annotated_existing_line_fillet(
+                support, annotated_radius_px, tolerance, radius_binding, selected_entities)
+        else:
+            replacements = _annotated_line_fillet(support, annotated_radius_px, tolerance, radius_binding)
     else:
         replacements = [_fit_replacement(support, action, tolerance, force_arc=force_arc,
                                           annotated_radius_px=annotated_radius_px, radius_binding=radius_binding)]
@@ -928,6 +1281,12 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
     indices = _ordered_indices(graph, entity_ids, minimum=minimum)
     if action == "refit_entity_as_line" and len(indices) != 1:
         raise ValueError("single_entity_refit_requires_one_entity")
+    if action == "restore_annotated_line_support" and len(indices) not in (1, 2):
+        raise ValueError("angle_line_restore_requires_one_or_two_entities")
+    angle_evidence = None
+    if action == "restore_annotated_line_support":
+        from .annotation_line_support import angle_edit_evidence
+        angle_evidence = angle_edit_evidence(graph, inventory, operation)
     grid = float(graph.get("source_grid_pitch_px") or 1.)
     if not math.isfinite(grid) or grid <= 0:
         raise ValueError("invalid_source_grid")
@@ -936,6 +1295,14 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
         graph, operation, inventory, entity_ids, design_to_source)
     source_entities = _base_source_entities(graph, design_to_source, orientation_det)
     selected_entities = [source_entities[index] for index in indices]
+    if action == "insert_annotated_fillet" and len(indices) == 3:
+        # Source-coordinate conversion intentionally carries only geometry and
+        # radius provenance. Check other formal connector semantics on the
+        # original graph before a short diagonal can be removed.
+        connector = graph["entities"][indices[1]]
+        if (all(e.get("type") == "LINE" for e in selected_entities)
+                and (connector.get("dimension_bound") or connector.get("constraint_ids"))):
+            raise ValueError("fillet_connector_is_not_a_short_unbound_corner")
     chain_samples, _, _ = _sample_entities(selected_entities, max_step_px=max(.35, min(1., grid / 2)))
     raw = _source_ring(baseline)
     ring = _closed_ring(raw) if raw is not None else _base_source_ring(graph, design_to_source, grid)
@@ -944,10 +1311,13 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
     support, localization_mismatch = _ring_path(ring, start, end, chain_samples)
     tolerance = max(.25, float(graph.get("proposal_tolerance_px") or grid))
     radius_targets=(_verified_partition_targets(graph,inventory,entity_ids,design_to_source,support)
-                    if action=="split_chain_at_source_features" else None)
+                    if action in {"split_chain_at_source_features", "restore_annotated_line_support"} else None)
     replacements = _replacement_chain(support, action, tolerance, selected_entities, force_arc=force_arc,
                                       annotated_radius_px=annotated_radius_px, radius_binding=radius_binding,
-                                      radius_targets=radius_targets,candidate_scorer=candidate_scorer)
+                                      radius_targets=radius_targets,candidate_scorer=candidate_scorer,
+                                      angle_evidence=angle_evidence)
+    from .annotation_line_support import protect_annotated_straight_supports
+    protect_annotated_straight_supports(graph, entity_ids, selected_entities, replacements, tolerance)
 
     start_index = indices[0]
     rotated = source_entities[start_index:] + source_entities[:start_index]
@@ -970,6 +1340,7 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
         "action": action, "entity_ids": list(entity_ids),
         "requested_entity_ids": list(requested_entity_ids),
         "support_scope_expanded": list(entity_ids) != list(requested_entity_ids),
+        "support_scope_trimmed": bool(set(requested_entity_ids) - set(entity_ids)),
         "record_id": operation.get("record_id"),
         "evidence_tags": list(operation.get("evidence_tags") or []),
         "removed_entity_count": len(indices), "replacement_count": len(replacements),
@@ -977,8 +1348,11 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
         "replacement_types": [row["type"] for row in replacements],
         "net_entity_reduction": len(indices) - len(replacements),
         "replacement_fit_error_px": max(float(row.get("fit_error_px", 0.)) for row in replacements),
-        "annotation_guided": bool(radius_binding) or bool(radius_targets and len(radius_targets)>=2),
-        "resegmentation_applied": any(bool(row.get("source_partition_evidence")) for row in replacements),
+        "annotation_guided": bool(angle_evidence) or bool(radius_binding) or bool(radius_targets and len(radius_targets)>=2),
+        "resegmentation_applied": (action == "restore_annotated_line_support" or
+                                   any(bool(row.get("source_partition_evidence")) for row in replacements)),
+        "angle_support_record_ids": [angle_evidence["record_id"]] if angle_evidence else [],
+        "angle_numeric_binding_applied": False,
         "bound_record_ids": sorted({row["radius_binding"]["record_id"] for row in replacements
                                     if row.get("radius_binding") and row["radius_binding"].get("record_id")}),
         "radius_binding_applied": any(bool(row.get("radius_binding")) for row in replacements),
@@ -1092,7 +1466,10 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
     grid = float(graph.get("source_grid_pitch_px") or 1.)
     raw = _source_ring(baseline)
     ring = _closed_ring(raw) if raw is not None else _base_source_ring(graph, design_to_source, grid)
-    inventory, _ = _annotation_inventory(gray, records, ring, grid)
+    inventory, _ = _annotation_inventory(
+        gray, records, ring, grid,
+        [*(graph.get("annotation_support") or []),
+         *(graph.get("radius_source_segment_hypotheses") or [])])
     stroke = _StrokeEvidence(gray, records, grid)
     candidates, audit, accepted_operations = [], [], []
 
@@ -1153,6 +1530,7 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
                       "merge_chain_best_fit": "best",
                       "refit_chain_as_annotated_arc": "annotated-arc",
                       "refit_entity_as_line": "retype-line",
+                      "restore_annotated_line_support": "annotated-line",
                       "split_chain_at_source_features": "source-split",
                       "insert_annotated_fillet": "annotated-fillet"}[operation["action"]]
             candidate_id = f"cand-edit-{index:02d}-{suffix}"

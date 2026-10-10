@@ -265,6 +265,26 @@ def test_source_gate_fallback_uses_ranked_valid_graph_then_exact_base(tmp_path,a
     assert receipt["attempts"][-1]["validation"]["passed"]
 
 
+def test_source_gate_prefers_annotated_generated_base_over_unannotated_original(tmp_path):
+    from contour_agent.parametric_pipeline import _source_valid_topology_choice
+
+    image, baseline = fixture_model(tmp_path)
+    original = supported_graph(image, baseline)
+    wrapped = deepcopy(original)
+    wrapped["annotation_support"] = [{"record_id": "r-small", "kind": "radius",
+                                     "status": "candidate_supported", "candidate_entity_id": "g001"}]
+    rejected = deepcopy(original)
+    rejected["source_evidence"]["proposal_stroke_support"]["edge_supported_fraction"] = .75
+    candidates = [{"id": "base", "graph": wrapped}, {"id": "smooth", "graph": rejected}]
+    local = {"evaluated": [{"candidate_id": "smooth", "admissible": True, "score": .9},
+                           {"candidate_id": "base", "admissible": True, "score": .8}]}
+    candidate, graph, receipt = _source_valid_topology_choice(
+        image, baseline, candidates[1], rejected, candidates, local, original)
+    assert candidate is candidates[0] and graph is wrapped
+    assert receipt["selected_graph_source"] == "generated_base_candidate"
+    assert receipt["attempts"][-1]["validation"]["passed"] is True
+
+
 def test_source_gate_fallback_does_not_rescue_invalid_base_or_unranked_candidate(tmp_path):
     from contour_agent.parametric_pipeline import _source_valid_topology_choice
     image,baseline=fixture_model(tmp_path)

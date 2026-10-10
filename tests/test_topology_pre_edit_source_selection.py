@@ -99,3 +99,21 @@ def test_source_validation_is_still_rechecked_after_an_editor_changes_the_graph(
     assert graph["source_gate_passed"]
     assert plan["source_validation_selection"]["status"]=="fallback_selected"
     assert plan["source_validation_selection"]["attempts"][0]["candidate_id"]=="edited-invalid"
+
+
+def test_seed_promotion_is_reported_separately_from_a_local_edit(monkeypatch,tmp_path):
+    base,planner=_setup(monkeypatch,tmp_path)
+    monkeypatch.setattr("contour_agent.parametric_pipeline._topology_source_validation",
+                        lambda image,baseline,graph:{"passed":True,"reasons":[]})
+    def seed_loop(image,document,baseline,selected,bundle,output,**kwargs):
+        assert selected["id"]=="bad"
+        assert kwargs["initial_seed_ids"]==()
+        return next(row for row in bundle["candidates"] if row["id"]=="good"),{
+            "final_selection_origin":"initial_seed_promotion","accepted_round_count":1,
+            "accepted_seed_promotion_count":1,"accepted_local_edit_count":0}
+    monkeypatch.setattr("contour_agent.parametric_pipeline._topology_edit_loop",seed_loop)
+    graph,plan=_plan_topology(tmp_path/"source.png",{}, {},base,tmp_path,
+                              planner_provider=planner,use_api=True)
+    assert graph["candidate_id"]=="source-supported-alternative"
+    assert plan["selection_source"]=="bounded_source_seed_promotion"
+    assert plan["materialization"]["candidate_id"]=="good"

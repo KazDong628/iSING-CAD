@@ -87,8 +87,13 @@ def _radius_crop(source, record):
     return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii"), metadata
 
 
-def validate_radius_target_response(text, record_ids, image_size):
-    """Accept only bounded original-image pixel hypotheses; no model verdicts."""
+def validate_radius_target_response(text, record_ids, image_size, *, isolate_record_errors=False):
+    """Validate the full envelope before optionally isolating record pixel errors.
+
+    The default is the original all-or-nothing contract. Isolated records lose
+    ALL their alternatives and become unknown. Every retained proposal passes
+    the same source-pixel and shaft checks; local ink verification is still due.
+    """
     if not isinstance(text, str) or len(text) > 16000:
         raise _InspectionError("invalid_output")
     try:
@@ -103,8 +108,9 @@ def validate_radius_target_response(text, record_ids, image_size):
     if (not isinstance(unknown, list) or any(not isinstance(rid, str) or rid not in record_ids for rid in unknown)
             or len(set(unknown)) != len(unknown)):
         raise _InspectionError("invalid_unknown_records")
-    counts = Counter()
-    cleaned, seen = [], set()
+    # Global structure, ownership, counts and accounting are checked first.
+    # An unknown record or extra field must never hide behind a bad shaft.
+    counts, encoded_rows = Counter(), set()
     for row in proposals:
         if not isinstance(row, dict) or set(row) != {"record_id", "tip_px", "shaft_px"}:
             raise _InspectionError("invalid_proposal")
@@ -114,23 +120,57 @@ def validate_radius_target_response(text, record_ids, image_size):
         counts[rid] += 1
         if counts[rid] > 2:
             raise _InspectionError("record_proposal_budget")
+        # Fingerprint only; finite pixel validation below rejects overflowed numbers.
+        # This string is never persisted or sent to a provider.
+        encoded = json.dumps(row, sort_keys=True, allow_nan=True)
+        if encoded in encoded_rows:
+            raise _InspectionError("duplicate_proposal")
+        encoded_rows.add(encoded)
+    if set(counts) & set(unknown) or set(counts) | set(unknown) != set(record_ids):
+        raise _InspectionError("incomplete_record_accounting")
+    cleaned, seen, rejected = [], set(), []
+    for row in proposals:
+        rid = row["record_id"]
+        failure = None
         for key in ("tip_px", "shaft_px"):
             point = row[key]
             if (not isinstance(point, list) or len(point) != 2 or
-                    any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v < image_size[i]
+                    any(type(v) not in (int, float) or not 0 <= v < image_size[i] or not math.isfinite(v)
                         for i, v in enumerate(point))):
-                raise _InspectionError("invalid_source_pixel")
-        if math.dist(row["tip_px"], row["shaft_px"]) < 3.:
-            raise _InspectionError("degenerate_shaft")
-        identity = (rid, *row["tip_px"], *row["shaft_px"])
-        if identity in seen:
-            raise _InspectionError("duplicate_proposal")
-        seen.add(identity)
+                failure = "invalid_source_pixel"
+                break
+        if failure is None:
+            identity = (rid, *row["tip_px"], *row["shaft_px"])
+            if identity in seen:
+                raise _InspectionError("duplicate_proposal")
+            seen.add(identity)
+            if math.dist(row["tip_px"], row["shaft_px"]) < 3.:
+                failure = "degenerate_shaft"
+        if failure is not None:
+            if not isolate_record_errors:
+                raise _InspectionError(failure)
+            rejected.append({"record_id": rid, "error_code": failure})
+            continue
         cleaned.append({"record_id": rid, "tip_px": list(map(float, row["tip_px"])),
                         "shaft_px": list(map(float, row["shaft_px"]))})
-    if set(counts) & set(unknown) or set(counts) | set(unknown) != set(record_ids):
-        raise _InspectionError("incomplete_record_accounting")
-    return {"proposals": cleaned, "unknown_record_ids": list(unknown)}
+    if not rejected:
+        return {"proposals": cleaned, "unknown_record_ids": list(unknown)}
+    rejected_ids = sorted({row["record_id"] for row in rejected})
+    cleaned = [row for row in cleaned if row["record_id"] not in rejected_ids]
+    return {"proposals": cleaned, "unknown_record_ids": sorted(set(unknown) | set(rejected_ids)),
+            "model_unknown_record_ids": list(unknown), "rejected_record_ids": rejected_ids,
+            "rejected_records": rejected, "response_structure_valid": True,
+            "schema_rejection_scope": "record_pixel_semantics", "partial_schema_success": bool(cleaned)}
+
+
+def _usable_radius_target_receipt(receipt):
+    """Partial admission is explicit; it never means full schema success."""
+    return receipt.get("schema_success") is True or (
+        receipt.get("schema_success") is False and receipt.get("partial_schema_success") is True and
+        receipt.get("response_structure_valid") is True and
+        receipt.get("schema_rejection_scope") == "record_pixel_semantics" and
+        receipt.get("status") == "partial" and bool(receipt.get("proposals")) and
+        bool(receipt.get("rejected_record_ids")))
 
 
 def _safe_receipt(value, secret):
@@ -231,12 +271,21 @@ class RadiusTargetProvider:
                 return finish()
             text, source, reason, usage = extract_text(settings, response)
             receipt.update(response_text_source=source, finish_reason=reason, usage=numeric_token_usage(usage))
+            # Retain only a digest, including failed semantic/schema responses.
+            # Raw response text/private reasoning is never persisted.
+            if isinstance(text, str):
+                receipt["response_text_sha256"] = hashlib.sha256(text.encode()).hexdigest()
             if reason not in (None, "stop"):
                 receipt["error_code"] = "truncated_output" if reason in {"length", "incomplete"} else "incomplete_response"
                 return finish()
-            value = validate_radius_target_response(text, selected_ids, source_meta["source_image_size"])
-            receipt.update(status="succeeded", schema_success=True,
-                           response_text_sha256=hashlib.sha256(text.encode()).hexdigest(), **value)
+            value = validate_radius_target_response(text, selected_ids, source_meta["source_image_size"],
+                                                    isolate_record_errors=True)
+            rejected = bool(value.get("rejected_record_ids"))
+            partial = value.get("partial_schema_success") is True
+            receipt.update(status="partial" if partial else "failed" if rejected else "succeeded",
+                           schema_success=not rejected, **value)
+            if rejected:
+                receipt["error_code"] = "record_pixel_semantics_rejected"
             return finish()
         except (asyncio.TimeoutError, httpx.TimeoutException):
             receipt["error_code"] = "timeout"
@@ -310,7 +359,7 @@ def locate_radius_targets(image_path, document, baseline, output_dir, provider, 
             progress(stage, message)
 
     def merge(receipt, already_verified):
-        if receipt.get("schema_success") is not True:
+        if not _usable_radius_target_receipt(receipt):
             return
         grouped = {}
         for proposal in receipt.get("proposals", []):
@@ -354,9 +403,10 @@ def locate_radius_targets(image_path, document, baseline, output_dir, provider, 
         attempts.append(receipt)
         save(f"radius-targets-attempt-{attempt:02d}.json", receipt)
         requested.update(selected_ids)
-        if receipt.get("schema_success") is True:
+        if _usable_radius_target_receipt(receipt):
             latest_model_unknown.difference_update(selected_ids)
-            latest_model_unknown.update(rid for rid in receipt.get("unknown_record_ids", []) if rid in selected_ids)
+            latest_model_unknown.update(rid for rid in receipt.get("model_unknown_record_ids", receipt.get("unknown_record_ids", []))
+                                        if rid in selected_ids)
         merge(receipt, verified)
         try:
             local = _local_radius_inventory(image_path, enriched, baseline)
@@ -385,12 +435,17 @@ def locate_radius_targets(image_path, document, baseline, output_dir, provider, 
     known_requests = sum(row.get("network_requests", 0) for row in attempts
                          if type(row.get("network_requests", 0)) is int)
     unknown_requests = sum(type(row.get("network_requests")) is not int for row in attempts)
+    partial_schema = any(row.get("partial_schema_success") is True for row in attempts)
+    rejected_records = sorted({rid for row in attempts for rid in row.get("rejected_record_ids", []) if rid in radius_ids})
     aggregate = {"protocol": "bounded-source-radius-target-localization-v2",
-                 "status": "succeeded" if all_schema else ("skipped" if not attempts else "partial_or_failed"),
+                 "status": "succeeded" if all_schema else "partial" if partial_schema else ("skipped" if not attempts else "partial_or_failed"),
                  "attempt_count": len(attempts), "attempt_limit": 2,
                  "network_requests": None if unknown_requests else known_requests,
                  "known_network_requests": known_requests, "attempts_with_unknown_request_count": unknown_requests,
                  "http_success": all_http, "schema_success": all_schema,
+                 "partial_schema_success": partial_schema, "any_partial_schema_success": partial_schema,
+                 "rejected_record_ids": rejected_records,
+                 "unresolved_rejected_record_ids": [rid for rid in rejected_records if rid in unresolved],
                  "any_http_success": any(row.get("http_success") is True for row in attempts),
                  "any_schema_success": any(row.get("schema_success") is True for row in attempts),
                  "per_request_timeout_seconds": request_budget, "total_request_budget_seconds": 2*request_budget,

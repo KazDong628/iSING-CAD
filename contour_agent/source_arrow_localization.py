@@ -194,6 +194,127 @@ def source_arrow_label_attachment(gray, record, observation, *, text_points=None
     return result
 
 
+def recover_source_attached_radius_arrow(gray, record, seed, boundary_points, band,
+                                         contours=None, *, verifier=None):
+    """Revisit one weak source tip using OCR-facing ink, never an R or CAD fit.
+
+    A localizer may select an annotation/extension stroke beside the actual
+    radius leader. Search a bounded one-pixel tip neighbourhood and the OCR
+    edge facing it; every survivor passes the unchanged full arrow and shaft
+    verifier. This is a fallback only when the existing tip lacks a close
+    original-ink contour intersection or glyph attachment.
+    """
+    from scipy.spatial import cKDTree
+    from .constraint_binding import _box
+    if verifier is None:
+        from .constraint_binding import verify_source_arrow_proposal
+        verifier = verify_source_arrow_proposal
+    if (gray is None or gray.ndim != 2 or record.get("parsed", {}).get("kind") != "radius"
+            or not seed.get("arrowhead_verified") or
+            not (seed.get("shaft_evidence") or {}).get("verified")):
+        return None
+    box = _box(record)
+    ink = _source_text_pixels(gray, record)
+    try:
+        tip = np.asarray(seed["arrowhead"]["tip_px"], float)
+        direction = np.asarray(seed["arrowhead"]["direction_px"], float)
+        boundary = np.asarray(boundary_points, float)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (box is None or ink is None or tip.shape != (2,) or direction.shape != (2,) or
+            boundary.ndim != 2 or boundary.shape[1] != 2 or not len(boundary) or
+            not np.isfinite(tip).all() or not np.isfinite(direction).all() or
+            not np.isfinite(boundary).all()):
+        return None
+    magnitude = float(np.linalg.norm(direction))
+    if magnitude < 1e-8:
+        return None
+    direction /= magnitude
+    low, high = box.min(axis=0), box.max(axis=0)
+    width = float(min(high-low))
+    if width < 8:
+        return None
+    # The closest facing OCR-box edge is determined from the observed source
+    # tip alone. Source text and source ink rank the search, not the nominal.
+    outside = np.maximum(low-tip, 0.)+np.maximum(tip-high, 0.)
+    axis = int(np.argmax(outside))
+    if outside[axis] < 4.:
+        return None
+    side = high[axis] if tip[axis] > high[axis] else low[axis]
+    sign = 1. if tip[axis] > high[axis] else -1.
+    cross = 1-axis
+    across = np.arange(math.floor(low[cross]), math.ceil(high[cross])+1, 4, dtype=float)
+    stations = side+sign*np.array([4., 7., 10.])
+    text_points = ink[np.linspace(0, len(ink)-1, min(512, len(ink)), dtype=int)]
+    tree = cKDTree(boundary)
+    width_observed = max((float(value) for value in
+                          (seed.get("arrowhead") or {}).get("cross_section_widths_px", [])
+                          if isinstance(value, (int, float)) and math.isfinite(value)), default=8.)
+    tip_shift = int(round(max(6., min(8., .75*width_observed))))
+    options = []
+    for x in range(int(round(tip[0]))-tip_shift, int(round(tip[0]))+tip_shift+1):
+        for y in range(int(round(tip[1]))-tip_shift, int(round(tip[1]))+tip_shift+1):
+            target = np.array([float(x), float(y)])
+            gap = float(tree.query(target)[0])
+            if gap > 3.:
+                continue
+            for station in stations:
+                for offset in across:
+                    shaft = np.empty(2, float)
+                    shaft[axis], shaft[cross] = station, offset
+                    delta = target-shaft
+                    length = float(np.linalg.norm(delta))
+                    if length < 8.:
+                        continue
+                    unit = delta/length
+                    if float(np.dot(unit, direction)) < math.cos(math.radians(40.)):
+                        continue
+                    normal = np.array([-unit[1], unit[0]])
+                    attachment = float(np.median(np.abs((text_points-target) @ normal)))/width
+                    if attachment > .38:
+                        continue
+                    points = shaft+np.linspace(0., 1., 16)[:, None]*delta
+                    strip = np.rint(points[:, None, :]+np.arange(-2., 3.)[None, :, None]*normal).astype(int)
+                    px, py = strip[:, :, 0], strip[:, :, 1]
+                    inside = (px >= 0) & (px < gray.shape[1]) & (py >= 0) & (py < gray.shape[0])
+                    source = gray[np.clip(py, 0, gray.shape[0]-1), np.clip(px, 0, gray.shape[1]-1)] < 170
+                    if float(np.mean(np.any(inside & source, axis=1))) < .875:
+                        continue
+                    options.append((gap, attachment, shaft.tolist(), target.tolist()))
+    if not options:
+        return None
+    options.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+    verified = []
+    for gap, attachment, shaft, target in options[:256]:
+        proposal = {"record_id": record.get("id"), "shaft_px": shaft, "tip_px": target}
+        evidence = verifier(gray, record, proposal, boundary, band, contours)
+        if evidence is None:
+            continue
+        source_attachment = source_arrow_label_attachment(gray, record, evidence, text_points=ink)
+        first = (evidence.get("contour_visibility") or {}).get("first_intersection_to_target_px")
+        if (not source_attachment.get("strong_text_adjacency") or first is None or first > 1. or
+                float(evidence.get("arrow_tip_to_arc_gap_px", math.inf)) > 3.):
+            continue
+        verified.append((float(first), source_attachment["normalized_text_to_shaft"],
+                         float(evidence["arrow_tip_to_arc_gap_px"]), evidence, proposal))
+    if not verified:
+        return None
+    first, attachment, gap, evidence, proposal = min(verified, key=lambda row: row[:3])
+    return {**evidence, "method": "source_ocr_edge_arrow_with_full_shaft_locally_verified",
+            "proposal_origin": "bounded_original_source_ocr_edge_search",
+            "model_proposal_used": False,
+            "source_pixel_localization": {"method": "bounded_original_source_ocr_edge_search",
+                                          "seed_tip_px": tip.tolist(),
+                                          "verified_full_shaft_and_arrow": True,
+                                          "strong_source_text_adjacency": True,
+                                          "first_source_contour_intersection_gap_px": first,
+                                          "source_tip_to_current_contour_px": gap,
+                                          "searched_coordinate_count": len(options),
+                                          "full_verification_limit": 256,
+                                          "nominal_used_to_rank": False,
+                                          "ground_truth_used": False}}
+
+
 def _same_source_arrow(first, second, band):
     """Group one physical taper, requiring direction AND shaft agreement."""
     try:
@@ -207,6 +328,72 @@ def _same_source_arrow(first, second, band):
                       abs(float(v[0]*delta[1]-v[1]*delta[0])))
         return bool(np.dot(u, v) >= math.cos(math.radians(8.)) and np.linalg.norm(p-q) <= radius
                     and lateral <= max(3., min(4., .5*float(band))))
+    except (KeyError, TypeError, ValueError, FloatingPointError):
+        return False
+
+
+def same_original_ink_arrow_shaft(gray, first, second):
+    """Prove two nearby tip hypotheses follow one wide source-ink shaft.
+
+    Check the observed arrow body, not the narrowing tip wedge. The source
+    arrow verifier measures middle and body widths at .42 and .72 of its
+    length; this check samples within those same stations. A successful proof
+    may group duplicate detections, while preserving every target hypothesis.
+    """
+    if gray is None or gray.ndim != 2:
+        return False
+    try:
+        a, b = first["arrowhead"], second["arrowhead"]
+        p, q = np.asarray(a["tip_px"], float), np.asarray(b["tip_px"], float)
+        u, v = np.asarray(a["direction_px"], float), np.asarray(b["direction_px"], float)
+        if (not all(arr.shape == (2,) and np.isfinite(arr).all() for arr in (p, q, u, v)) or
+                min(np.linalg.norm(u), np.linalg.norm(v)) < 1e-8):
+            return False
+        u /= np.linalg.norm(u); v /= np.linalg.norm(v)
+        lengths = [float(a.get("length_px", 0)), float(b.get("length_px", 0))]
+        length = min(lengths)
+        if length < 16. or float(u@v) < math.cos(math.radians(8.)):
+            return False
+        widths = []
+        for arrow in (a, b):
+            values = [float(value) for value in arrow.get("cross_section_widths_px") or []
+                      if isinstance(value, (int, float)) and not isinstance(value, bool)
+                      and math.isfinite(value) and value > 0]
+            if not values:
+                return False
+            widths.append(max(values))
+        lateral = max(abs(float(np.cross(u, q-p))), abs(float(np.cross(v, q-p))))
+        if (lateral > .65*min(widths) or np.linalg.norm(q-p) > min(8., .75*min(widths))):
+            return False
+        # Two separate parallel ink strokes can have matching direction and
+        # nearby tips. A single rounded pixel on a slanted, antialiased shaft
+        # is not a white channel, so sample a one-pixel axial band and require
+        # a connected ink path across each section. The .42 and .72 stations
+        # are the observed middle/body widths from _arrowhead_evidence; .30
+        # may still be inside the taper where the two detected edges diverge.
+        axis = u+v
+        axis /= np.linalg.norm(axis)
+        for fraction in (.42, .52, .62, .72):
+            depth = fraction*length
+            ends = (p-depth*u, q-depth*v)
+            span = np.linspace(*ends, max(9, int(math.ceil(lateral*2))+1))
+            points = np.rint(span[None, :, :] +
+                              np.asarray([-1., 0., 1.])[:, None, None]*axis).astype(int)
+            x, y = points[:, :, 0], points[:, :, 1]
+            if (np.any(x < 0) or np.any(x >= gray.shape[1]) or
+                    np.any(y < 0) or np.any(y >= gray.shape[0])):
+                return False
+            dark = gray[y, x] < 170
+            if float(np.mean(np.any(dark, axis=0))) < .9:
+                return False
+            # Column support alone could join two dark parallel shafts across
+            # a persistent white slit. The original pixels must also form an
+            # eight-connected path across this narrow 2-D source-ink band.
+            components, labels = cv2.connectedComponents(dark.astype(np.uint8), connectivity=8)
+            if not any(np.any(labels[:, 0] == label) and np.any(labels[:, -1] == label)
+                       for label in range(1, components)):
+                return False
+        return True
     except (KeyError, TypeError, ValueError, FloatingPointError):
         return False
 
@@ -266,7 +453,15 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
             continue
         # Complete-link grouping prevents a series of neighboring arrowheads
         # from becoming one taper merely through transitive proximity.
-        group = next((g for g in groups if all(_same_source_arrow(row, old, band) for old in g)), None)
+        # Repeated preflight may carry a verified shaft back into the graph.
+        # Its two edge detections can then differ laterally by a few pixels,
+        # exceeding the narrow same-tip rule despite following one broad,
+        # continuous original-ink stroke. Require the independent full-ink
+        # bridge at several shaft depths before treating them as one arrow;
+        # target alternatives are preserved in the group union below.
+        group = next((g for g in groups if all(
+            _same_source_arrow(row, old, band) or
+            same_original_ink_arrow_shaft(gray, row, old) for old in g)), None)
         if group is None:
             groups.append([row])
         else:
@@ -277,9 +472,14 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
         by_record = {}
         for row in group:
             key = row["record_id"]
-            cost = row["source_text_shaft_attachment"].get("normalized_text_to_shaft", math.inf)
+            source_crossing = (row.get("contour_visibility") or {}).get("first_intersection_to_target_px")
+            cost = (source_crossing is None or source_crossing > 1.,
+                    row["source_text_shaft_attachment"].get("normalized_text_to_shaft", math.inf))
             old = by_record.get(key)
-            if old is None or cost < old["source_text_shaft_attachment"].get("normalized_text_to_shaft", math.inf):
+            old_crossing = (old.get("contour_visibility") or {}).get("first_intersection_to_target_px") if old else None
+            old_cost = (old_crossing is None or old_crossing > 1.,
+                        (old.get("source_text_shaft_attachment") or {}).get("normalized_text_to_shaft", math.inf)) if old else None
+            if old is None or cost < old_cost:
                 by_record[key] = row
         choices = sorted(by_record.values(), key=lambda row: (
             row["source_text_shaft_attachment"].get("normalized_text_to_shaft", math.inf), row["record_id"]))

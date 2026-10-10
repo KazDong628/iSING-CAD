@@ -85,7 +85,13 @@ _SOURCE_EVIDENCE = {**{key: _SCALAR for key in ("method", "axis", "uniquely_supp
     "source_text": {key: _SCALAR for key in ("checked", "symbol_confusion", "text_confirmed", "reason")},
     "source_arrow_ownership_rejection_reasons": (_SCALAR, 16),
     "dimension_line": _SOURCE_LINE, "line_endpoints_px": _SEGMENT, "endpoint_gaps_px": _POINT,
-    "extension_lines": (_SOURCE_LINE, 2), "observed_station_groups": (_STATION, 2)}
+    "extension_lines": (_SOURCE_LINE, 2), "observed_station_groups": (_STATION, 2),
+    "angle_observation": {"record_id":_SCALAR,"reference_axis":_SCALAR,"verified":_SCALAR,
+        "source_line":{"start_px":_POINT,"end_px":_POINT,"observed_direction_deg_from_axis":_SCALAR},
+        "reference_stroke":_SOURCE_LINE,
+        "evidence":{"method":_SCALAR,"verified":_SCALAR,"nominal_used_to_rank":_SCALAR,
+            "reference_arrow":{"tip_px":_POINT,"direction_px":_POINT},
+            "target_arrow":{"tip_px":_POINT,"direction_px":_POINT}}}}
 _RELATION_EVIDENCE = {**{key: _SCALAR for key in ("method", "verified", "passed", "reason", "status",
     "observed_station_px", "span_px", "proposal_band_px", "support_kind", "shared_node",
     "boundary_observation", "observed_deviation_degrees", "mask_observed_deviation_degrees", "tolerance_degrees")},
@@ -177,7 +183,7 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
         for key in ("occluded_leader_hypotheses", "ambiguous_crossing_leaders_requiring_review"):
             if evidence.get(key):
                 source[key+"_summary"] = _source_path_review_summary(evidence[key], audit)
-        candidate_rows.append({**{key: row.get(key) for key in ("id", "record_id", "kind", "entities", "nodes")},
+        candidate_rows.append({**{key: row.get(key) for key in ("id", "record_id", "kind", "entities", "nodes", "reference_axis")},
                                "evidence": source})
     all_records = inventory.get("all_records", inventory.get("records", []))
     all_candidates = inventory.get("all_candidates", inventory.get("candidates", []))

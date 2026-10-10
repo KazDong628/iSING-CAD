@@ -148,6 +148,8 @@ def evaluate_candidates(candidates, *, max_candidates=5):
             reasons.append("duplicate_candidate_id")
         graph = _graph(candidate)
         validation = graph.get("validation") if isinstance(graph.get("validation"), dict) else {}
+        if (graph.get("angle_line_preservation") or {}).get("passed") is False:
+            reasons.append("source_annotated_line_support_lost")
         for key in ("closed", "connected", "simple", "ordered_entity_cycle"):
             if validation.get(key) is not True:
                 reasons.append(f"{key}_validation_failed")

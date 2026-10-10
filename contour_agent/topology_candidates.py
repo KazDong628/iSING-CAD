@@ -53,6 +53,91 @@ def _read_image(path):
     return image
 
 
+def _angular_line_witnesses(observations):
+    """Keep source-proven LINE evidence separate from unique angle binding.
+
+    A nearby ARC can also intersect the annotation's broad source-stroke band.
+    That ambiguity should postpone *numeric binding*, but it cannot authorize
+    replacing an independently observed whole LINE with an ARC.  Each witness
+    records the source stroke and the length of LINE support, not a fitted
+    slope or a reference-DXF property.
+    """
+    witnesses = []
+    for row in observations:
+        evidence = row.get("evidence") or {}
+        if (row.get("verified") is not True or evidence.get("verified") is not True
+                or evidence.get("method") != "source_angular_arrows_axis_and_straight_support_v1"):
+            continue
+        source_line = row.get("source_line") or {}
+        try:
+            segment = np.asarray([source_line["start_px"], source_line["end_px"]], float)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (segment.shape != (2, 2) or not np.isfinite(segment).all()
+                or np.linalg.norm(segment[1]-segment[0]) <= 0):
+            continue
+        spans = {}
+        for target in row.get("target_candidates", []):
+            if target.get("entity_type") != "LINE" or target.get("whole_line_supported") is not True:
+                continue
+            span = target.get("supported_span_px")
+            if not isinstance(span, (int, float)) or not math.isfinite(span) or span <= 0:
+                continue
+            entity_id = target.get("entity_id")
+            if isinstance(entity_id, str):
+                spans[entity_id] = max(float(span), spans.get(entity_id, 0.))
+        if spans:
+            witnesses.append({"record_id": row["record_id"],
+                              "reference_axis": row["reference_axis"],
+                              "source_line": segment,
+                              "supported_span_px": sum(spans.values()),
+                              "entity_ids": sorted(spans)})
+    return witnesses
+
+
+def _same_angular_source_stroke(required, proposed, band):
+    """Match an immutable image stroke, allowing a bounded Hough endpoint shift."""
+    if (required["record_id"] != proposed["record_id"]
+            or required["reference_axis"] != proposed["reference_axis"]):
+        return False
+    original, candidate = required["source_line"], proposed["source_line"]
+    direction = original[1]-original[0]
+    length = float(np.linalg.norm(direction))
+    unit = direction/length
+    candidate_direction = candidate[1]-candidate[0]
+    candidate_length = float(np.linalg.norm(candidate_direction))
+    if abs(float(np.dot(unit, candidate_direction/candidate_length))) < math.cos(math.radians(7.)):
+        return False
+    # The same record may have several nearby hatch or extension strokes.
+    # Require both lateral agreement and overlap with the original finite
+    # source support rather than treating record ID as a geometric location.
+    transverse = np.abs((candidate-original[0]) @ np.asarray([-unit[1], unit[0]]))
+    if float(np.max(transverse)) > max(6., 1.7*band):
+        return False
+    projections = (candidate-original[0]) @ unit
+    overlap = max(0., min(length, float(np.max(projections)))-max(0., float(np.min(projections))))
+    return overlap >= .4*length
+
+
+def _preserved_angular_line_records(required, proposed, band):
+    """Report records whose original straight support survives the proposal."""
+    satisfied = set()
+    for original in required:
+        if any(_same_angular_source_stroke(original, candidate, band)
+               and candidate["supported_span_px"] >= .7*original["supported_span_px"]
+               for candidate in proposed):
+            satisfied.add(original["record_id"])
+    # A record with multiple independently observed straight strokes must
+    # retain all of them; a match on only one does not satisfy that record.
+    for record_id in tuple(satisfied):
+        if any(not any(_same_angular_source_stroke(original, candidate, band)
+                       and candidate["supported_span_px"] >= .7*original["supported_span_px"]
+                       for candidate in proposed)
+               for original in required if original["record_id"] == record_id):
+            satisfied.remove(record_id)
+    return satisfied
+
+
 def _affines(graph, model):
     """Return design->source and source->design affine maps.
 
@@ -147,12 +232,24 @@ def _base_source_entities(graph, design_to_source, orientation_det):
         # Display gNNN indices are scoped to one graph revision. Identity and
         # lineage survive cycle rotation and replacement of neighboring objects.
         for key in ("radius_binding", "radius_annotation_evidence", "radius_binding_status", "radius_constructed",
-                    "ancestor_stable_ids"):
+                    "ancestor_stable_ids", "angle_support_evidence", "fillet_construction", "source_refinement"):
             if key in entity:
                 item[key] = copy.deepcopy(entity[key])
+        # Feedback from the original extraction graph uses a scoped fallback
+        # identity (``graph:gNNN``) when no stable ID was assigned yet.  Carry
+        # that identity as lineage before assigning this revision's immutable
+        # source-geometry ID; otherwise an innocuous split appears to erase
+        # every previously verified horizontal/vertical relation.
+        immediate_parent = entity.get("stable_id") or f"{graph.get('candidate_id', 'graph')}:{entity['id']}"
         item["stable_id"] = entity.get("stable_id") or _source_entity_identity(item, graph.get("source_sha256"))
         item["parent_entity_ids"] = [entity["id"]]
+        # ``parent_stable_ids`` names the immediate source primitive used by
+        # topology edits. Keep that contract; older graph-scoped identities
+        # belong to the transitive ancestry ledger below.
         item["parent_stable_ids"] = [item["stable_id"]]
+        item["ancestor_stable_ids"] = list(dict.fromkeys([
+            immediate_parent, *entity.get("parent_stable_ids", []),
+            *entity.get("ancestor_stable_ids", [])]))
         result.append(item)
     return result
 
@@ -169,10 +266,47 @@ def _point_box_gap(point, box):
     return float(np.linalg.norm(np.maximum(low-point, 0.) + np.minimum(high-point, 0.)))
 
 
-def _annotation_inventory(gray, records, ring, grid):
-    """Find source-observed leader candidates without assigning CAD truth."""
+def _radius_segment_hypotheses(rows):
+    """Normalize inherited radius locations to coordinates without verdicts."""
+    if not isinstance(rows, (list, tuple)):
+        return []
+    hypotheses, by_record = [], {}
+    for row in rows[:1000]:
+        if not isinstance(row, dict) or row.get("kind") != "radius":
+            continue
+        record_id = row.get("record_id")
+        evidence = row.get("source_evidence")
+        if not isinstance(record_id, str) or not isinstance(evidence, dict):
+            continue
+        try:
+            segment = np.asarray(evidence.get("segment_px"), float)
+        except (TypeError, ValueError):
+            continue
+        if segment.shape != (2, 2) or not np.isfinite(segment).all():
+            continue
+        entries = by_record.setdefault(record_id, [])
+        if len(entries) >= 4 or any(np.allclose(segment, old, atol=1e-4, rtol=0.) for old in entries):
+            continue
+        entries.append(segment)
+        hypotheses.append({"record_id": record_id, "kind": "radius",
+                           "source_evidence": {"segment_px": segment.tolist()}})
+    return hypotheses
+
+
+def _annotation_inventory(gray, records, ring, grid, source_observations=()):
+    """Find source-observed leader candidates without assigning CAD truth.
+
+    Earlier topology stages may have located a short leader that the fresh
+    Hough pass misses. Carry only its source-pixel segment, then rerun the full
+    arrow, shaft and label proof on this image and boundary. In particular,
+    an earlier ``arrowhead_verified`` flag is never an admission here.
+    """
     lines = _leaders(gray, records)
     tree = cKDTree(ring[:-1])
+    inherited = {}
+    for observation in _radius_segment_hypotheses(source_observations):
+        inherited.setdefault(observation["record_id"], []).append(
+            np.asarray(observation["source_evidence"]["segment_px"], float))
     inventory = []
     for row in records[:250]:
         parsed = row.get("parsed", {})
@@ -211,6 +345,27 @@ def _annotation_inventory(gray, records, ring, grid):
                         "directed_verification_issues": [], "status": "directed_arrow_candidate"}
             options.append(((False, float(evidence["score"])), evidence))
             item["locally_verified_source_arrow_proposal_count"] += 1
+        item["inherited_source_segment_count"] = len(inherited.get(row.get("id"), []))
+        item["reverified_inherited_source_segment_count"] = 0
+        if parsed.get("kind") == "radius":
+            for segment_index, segment in enumerate(inherited.get(row.get("id"), [])):
+                # Historic direction and verdict are both untrusted. Either
+                # orientation must pass the same original-pixel verifier.
+                for oriented in (segment, segment[::-1]):
+                    full = verify_source_hough_leader(gray, row, oriented, ring, band, [ring],
+                                                      verifier=verify_source_arrow_proposal)
+                    if full is None:
+                        continue
+                    target_gap, contour_index = tree.query(np.asarray(full["arrowhead"]["tip_px"], float))
+                    options.append(((False, float(full["score"])), {
+                        **full, "leader_id": f"inherited-source-{segment_index:02d}",
+                        "detection_resolution": "inherited_segment_reverified",
+                        "target_source_px": ring[int(contour_index)].tolist(),
+                        "boundary_endpoint_gap_px": float(target_gap),
+                        "arrow_tip_to_boundary_gap_px": float(target_gap),
+                        "directed_verification_issues": [], "status": "directed_arrow_candidate"}))
+                    item["reverified_inherited_source_segment_count"] += 1
+                    break
         native_lines = native_radius_leader_segments(gray, row, records)
         for line_index, segment in enumerate(lines + native_lines):
             native_line = line_index >= len(lines)
@@ -359,7 +514,7 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
                   "parameter_source": "bounded_source_topology_candidate", "dimension_bound": False,
                   "source_fit_error_px": float(source_entity.get("fit_error_px", 0.))}
         entity["stable_id"] = source_entity.get("stable_id") or _source_entity_identity(source_entity, source_sha256)
-        for key in ("parent_entity_ids", "parent_stable_ids", "ancestor_stable_ids", "radius_binding_status"):
+        for key in ("parent_entity_ids", "parent_stable_ids", "ancestor_stable_ids", "radius_binding_status", "angle_support_evidence"):
             if key in source_entity:
                 entity[key] = copy.deepcopy(source_entity[key])
         if source_entity["type"] == "ARC":
@@ -392,6 +547,17 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
                 entity.update(parameter_source="multimodal_annotation_guided_arc_refit", dimension_bound=False,
                               radius_constructed=True, radius_binding_status="constructed_unverified",
                               radius_binding=copy.deepcopy(source_entity["radius_binding"]))
+            # Keep only the local, source-only LINE/ARC/LINE construction
+            # witness.  Fresh binding still has to reobserve its radius arrow
+            # and both finite original-ink LINE supports before admitting a
+            # design tangency.  Ordinary ARC refits never acquire this tag.
+            if (source_entity.get("fillet_construction") in {
+                    "existing_finite_line_supports",
+                    "existing_lines_short_connector_redistribution",
+                    "existing_line_arc_line_tangent_reinsertion"}
+                    and isinstance(source_entity.get("source_refinement"), dict)):
+                entity["fillet_construction"] = source_entity["fillet_construction"]
+                entity["source_refinement"] = copy.deepcopy(source_entity["source_refinement"])
         entities.append(entity)
     base_evidence = base_graph.get("source_evidence") or {}
     baseline_support = base_evidence.get("baseline_stroke_support") or support_summary["source_stroke_support"]
@@ -413,7 +579,12 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
                             "simple": bool(quality.get("sampled_topology_valid")),
                             "ordered_entity_cycle": True, "dimensions_solved": False,
                             "engineering_verified": False},
-             "scope": "A source-only LINE/ARC topology hypothesis for planner comparison and later dimension solving."}
+              "scope": "A source-only LINE/ARC topology hypothesis for planner comparison and later dimension solving."}
+    source_segments = _radius_segment_hypotheses(base_graph.get("radius_source_segment_hypotheses"))
+    if source_segments:
+        # Carry only source coordinates to the next hypothesis. Binding must
+        # reobserve the pixels and decide arrow ownership on its own graph.
+        graph["radius_source_segment_hypotheses"] = source_segments
     graph["entity_identity"] = {
         "schema_version": "topology-entity-lineage-v1",
         "display_id_scope": candidate_id,
@@ -532,12 +703,30 @@ def generate_topology_candidates(image_path, document, baseline_model, base_grap
         observation_source = "base_cad_samples_no_raw_observation_available"
     base_source_entities = _base_source_entities(base_graph, design_to_source, orientation_det)
     records = canonical_records(document)
-    inventory, inventory_summary = _annotation_inventory(gray, records, ring, grid)
+    inventory, inventory_summary = _annotation_inventory(
+        gray, records, ring, grid,
+        [*(base_graph.get("annotation_support") or []),
+         *(base_graph.get("radius_source_segment_hypotheses") or [])])
     inventory_summary["boundary_observation_source"] = observation_source
     stroke = _StrokeEvidence(gray, records, grid)
     parent_hash = _json_hash(base_graph)
     candidates = []
     failures = []
+    # An already independently evidenced angular LINE may not disappear just
+    # because an ARC fits the raster with fewer primitives. Reobserve each
+    # candidate in original pixels; IDs and fitted numerical angles are not
+    # authoritative. A unique angle *binding* is deliberately stricter than
+    # this topology protection: an adjacent ARC within the observation band
+    # cannot erase a separately source-supported LINE.
+    from .constraint_binding import _angle_source_observations, _source_transform
+    def observe_angles(candidate_graph):
+        transform=_source_transform(baseline_model,candidate_graph)
+        observations=_angle_source_observations(gray,records,candidate_graph,transform,
+            max(4.,float(candidate_graph.get("proposal_tolerance_px") or grid)))
+        candidate_graph["angle_source_observations"]=observations
+        return _angular_line_witnesses(observations)
+    required_angular_lines=observe_angles(copy.deepcopy(base_graph))
+    required_angle_ids={row["record_id"] for row in required_angular_lines}
     # The first hypothesis always preserves the existing source-only topology
     # exactly.  Later hypotheses may simplify it, but cannot silently replace
     # the baseline in the candidate set.
@@ -559,6 +748,16 @@ def generate_topology_candidates(image_path, document, baseline_model, base_grap
                               source_sha256, parent_hash, tolerance, quality, support, support_summary,
                               {"name": strategy_name, "description": description,
                                "tolerance_grid_multiple": multiple})
+            proposed_angular_lines=observe_angles(graph)
+            supported_angle_ids=_preserved_angular_line_records(
+                required_angular_lines, proposed_angular_lines,
+                max(4.,float(graph.get("proposal_tolerance_px") or grid)))
+            graph["angle_line_preservation"]={"passed":required_angle_ids<=supported_angle_ids,
+                "required_record_ids":sorted(required_angle_ids),
+                "supported_record_ids":sorted(supported_angle_ids),
+                "lost_record_ids":sorted(required_angle_ids-supported_angle_ids),
+                "basis":"independently_observed_source_angle_arrows_and_finite_straight_support",
+                "ground_truth_used":False}
             counts = {"total": len(source_entities),
                       "LINE": sum(e["type"] == "LINE" for e in source_entities),
                       "ARC": sum(e["type"] == "ARC" for e in source_entities)}

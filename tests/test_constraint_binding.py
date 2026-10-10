@@ -606,6 +606,36 @@ def test_topology_leader_is_rechecked_against_current_entity_ids_and_pixels(tmp_
     assert after["constraints"][0]["value"]==45
 
 
+def test_carried_radius_segment_is_rechecked_without_old_target_or_verdict(tmp_path, monkeypatch):
+    path, _, model, graph = source(tmp_path)
+    observed_coarse_radius_source(path, model)
+    document = {"records": [{"text": "R45", "box": [[240,180],[265,180],[265,200],[240,200]]}]}
+    graph["entities"] = [{"id": "g009", "type": "ARC", "start": [0,100], "end": [0,20],
+                          "center": [0,60], "radius": 40, "clockwise": True}]
+    graph["annotation_support"] = []
+    graph["radius_source_segment_hypotheses"] = [{
+        "record_id": "r000", "kind": "radius", "candidate_entity_id": "obsolete-g000",
+        "arrowhead_verified": True,
+        "source_evidence": {"segment_px": [[239.,180.],[180.,180.]],
+                            "arrowhead_verified": True}}]
+    monkeypatch.setattr("contour_agent.constraint_binding._leaders", lambda *args: [])
+    # Old positive metadata and coordinates alone cannot establish a binding.
+    absent = analyze_constraint_bindings(path, document, model, graph, tmp_path/"absent")
+    assert absent["constraints"] == []
+    image = Image.open(path); draw = ImageDraw.Draw(image)
+    draw.line((239,180,180,180), fill="black", width=2)
+    draw.polygon([(180,180),(195,175),(195,185)], fill="black"); image.save(path)
+    present = analyze_constraint_bindings(path, document, model, graph, tmp_path/"present")
+    assert len(present["constraints"]) == 1
+    assert present["constraints"][0]["entities"] == ["g009"]
+    assert present["constraints"][0]["value"] == 45
+    # A false carried coordinate hypothesis still must fail the same pixel
+    # verification even though a different real arrow exists in the source.
+    graph["radius_source_segment_hypotheses"][0]["source_evidence"]["segment_px"] = [[239.,160.],[180.,160.]]
+    false = analyze_constraint_bindings(path, document, model, graph, tmp_path/"false")
+    assert false["constraints"] == []
+
+
 def test_radius_edit_diagnostic_does_not_claim_nominal_applied(tmp_path):
     path,_,model,graph=source(tmp_path)
     document={"records":[{"text":"R3","box":[[200,120],[230,120],[230,140],[200,140]]}]}

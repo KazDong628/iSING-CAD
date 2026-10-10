@@ -1,4 +1,5 @@
 """Bounded source-only topology candidate generation tests."""
+import copy
 import hashlib
 import json
 import math
@@ -149,3 +150,69 @@ def test_source_hash_gt_guard_and_candidate_bound_are_enforced(tmp_path):
     for value in (2, 6, True):
         with pytest.raises(ValueError, match="3 to 5"):
             generate_topology_candidates(path, document, model, base, max_candidates=value)
+
+
+def test_candidate_rechecks_inherited_radius_segments_without_trusting_old_verdict(tmp_path, monkeypatch):
+    from contour_agent import topology_candidates as module
+
+    path, _, model, _ = _fixture(tmp_path)
+    image = cv2.imdecode(np.fromfile(str(path), np.uint8), cv2.IMREAD_COLOR)
+    cv2.line(image, (140, 210), (180, 255), (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.imencode(".png", image)[1].tofile(str(path))
+    document = {"records": [
+        {"text": "R12", "box": [[72, 23], [112, 23], [112, 40], [72, 40]]},
+        {"text": "R8", "box": [[106, 187], [145, 187], [145, 218], [106, 218]]},
+    ]}
+    base = build_topology(path, document, model, tmp_path / "base-with-two-labels")
+    segments = {"r000": [[115., 35.], [154., 59.]],
+                "r001": [[140., 210.], [180., 255.]]}
+    attempts = []
+
+    # The transfer contract is under test here. The independent source-pixel
+    # verifier has its own tests; this stub accepts only the two drawn strokes.
+    def recheck(gray, record, segment, boundary, band, contours, *, verifier):
+        attempts.append(record["id"])
+        expected = np.asarray(segments[record["id"]])
+        if not np.allclose(segment, expected) or gray[int(expected[1, 1]), int(expected[1, 0])] >= 200:
+            return None
+        return {"score": 1., "segment_px": expected.tolist(), "arrowhead_verified": True,
+                "arrowhead": {"tip_px": expected[1].tolist(), "verified": True}}
+
+    monkeypatch.setattr(module, "_leaders", lambda *args: [])
+    monkeypatch.setattr(module, "native_radius_leader_segments", lambda *args: [])
+    monkeypatch.setattr(module, "verify_source_hough_leader", recheck)
+
+    stale = copy.deepcopy(base)
+    stale["annotation_support"] = [
+        {"record_id": record_id, "kind": "radius", "arrowhead_verified": True,
+         "source_evidence": {"segment_px": [[5., 5.], [8., 8.]]}}
+        for record_id in segments]
+    refreshed = copy.deepcopy(base)
+    refreshed["annotation_support"] = [
+        {"record_id": record_id, "kind": "radius", "arrowhead_verified": False,
+         "source_evidence": {"segment_px": segment}}
+        for record_id, segment in segments.items()]
+    checkpoint = copy.deepcopy(stale)
+    checkpoint["radius_source_segment_hypotheses"] = [
+        {"record_id": record_id, "kind": "radius", "arrowhead_verified": True,
+         "candidate_entity_id": "old-target",
+         "source_evidence": {"segment_px": segment, "arrowhead": {"verified": True}}}
+        for record_id, segment in segments.items()]
+
+    old_bundle = generate_topology_candidates(path, document, model, stale, max_candidates=3)
+    new_bundle = generate_topology_candidates(path, document, model, refreshed, max_candidates=3)
+    checkpoint_bundle = generate_topology_candidates(path, document, model, checkpoint, max_candidates=3)
+    old_graph = old_bundle["candidates"][0]["graph"]
+    new_graph = new_bundle["candidates"][0]["graph"]
+    checkpoint_graph = checkpoint_bundle["candidates"][0]["graph"]
+    assert old_graph["entities"] == new_graph["entities"]
+    assert checkpoint_graph["entities"] == old_graph["entities"]
+    assert all(row["status"] == "no_source_leader_candidate" for row in old_graph["annotation_support"])
+    assert all(row["arrowhead_verified"] is True for row in new_graph["annotation_support"])
+    assert all(row["arrowhead_verified"] is True for row in checkpoint_graph["annotation_support"])
+    assert checkpoint_graph["radius_source_segment_hypotheses"] == [
+        {"record_id": record_id, "kind": "radius", "source_evidence": {"segment_px": segment}}
+        for record_id, segment in segments.items()]
+    assert {row["record_id"] for row in new_bundle["annotation_inventory"]
+            if row["reverified_inherited_source_segment_count"] == 1} == set(segments)
+    assert set(attempts) == set(segments)

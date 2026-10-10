@@ -270,6 +270,53 @@ def test_fillet_scope_does_not_expand_without_verified_source_arrow(tmp_path):
     with pytest.raises(ValueError):_apply_one(graph,baseline,operation,inventory)
 
 
+def test_verified_fillet_uses_minimal_two_line_supports_after_provider_includes_upstream_arc(tmp_path):
+    from contour_agent.topology_editing import _complete_fillet_support_scope
+    _, graph, baseline, _, _ = _fixture(tmp_path)
+    points = [[10., 10.], [20., 20.], [99.7, 20.], [120., 40.3],
+              [120., 110.], [10., 110.]]
+    graph["nodes"] = [{"id": f"v{i:03d}", "source_px": point,
+                       "x": point[0], "y": -point[1]}
+                      for i, point in enumerate(points)]
+    graph["entities"] = [{"id": f"g{i:03d}", "type": "LINE",
+                          "start": [start[0], -start[1]], "end": [end[0], -end[1]],
+                          "start_node": f"v{i:03d}",
+                          "end_node": f"v{(i + 1) % len(points):03d}"}
+                         for i, (start, end) in enumerate(zip(points, points[1:] + points[:1]))]
+    # This previously included upstream R10 in a four-object fillet scope.
+    graph["entities"][0].update(type="ARC", center=[10., -20.],
+                                 radius=10., clockwise=True,
+                                 radius_binding={"record_id": "other-radius"})
+    graph["annotation_support"] = [{"record_id": "r001", "kind": "radius",
+        "status": "candidate_supported", "candidate_entity_id": "g001",
+        "arrowhead_verified": True, "source_evidence": {
+            "target_source_px": _binding()["target_source_px"]}}]
+    inventory = [{"record_id": "r001", "kind": "radius", "nominal": 20., "text": "R20"}]
+    ideal = [{"type": "ARC", "start": [10., 10.], "end": [20., 20.],
+              "center": [10., 20.], "radius": 10., "clockwise": False},
+             *_corner_parts(),
+             {"type": "LINE", "start": [120., 110.], "end": [10., 110.]},
+             {"type": "LINE", "start": [10., 110.], "end": [10., 10.]}]
+    baseline["extraction"]["raw_polyline_px"] = _sample_entities(
+        ideal, max_step_px=.5)[0].tolist()
+    operation = {"action": "insert_annotated_fillet",
+                 "entity_ids": ["g000", "g001", "g002"], "record_id": "r001"}
+    original = copy.deepcopy(graph)
+    assert _complete_fillet_support_scope(graph, inventory, operation) == ["g001", "g002", "g003"]
+    entities, quality, detail = _apply_one(graph, baseline, operation, inventory)
+    assert [row["type"] for row in entities[:3]] == ["LINE", "ARC", "LINE"]
+    assert entities[1]["radius"] == pytest.approx(20., abs=1e-12)
+    assert detail["entity_ids"] == ["g001", "g002", "g003"]
+    assert detail["support_scope_trimmed"] and detail["radius_binding_applied"]
+    assert quality["sampled_topology_valid"] and graph == original
+    graph["annotation_support"][0]["arrowhead_verified"] = False
+    assert _complete_fillet_support_scope(graph, inventory, operation) == operation["entity_ids"]
+    graph["annotation_support"][0]["arrowhead_verified"] = True
+    graph["entities"][2]["dimension_bound"] = True
+    assert _complete_fillet_support_scope(graph, inventory, operation) == [
+        "g000", "g001", "g002", "g003"]
+
+
 def test_combined_edits_detect_overlap_in_completed_fillet_support(tmp_path):
     from contour_agent.topology_editing import _apply_combined
     graph,baseline,inventory=_short_corner_fixture(tmp_path)
