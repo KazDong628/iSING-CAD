@@ -290,3 +290,97 @@ def test_radius_contract_without_solver_receipt_does_not_claim_subset_acceptance
     assert not audit["constraint_subset_accepted"] and not audit["pipeline_accepted"]
     assert audit["radius_contract"]["coverage"]["unknown_count"] == 1
     assert audit["radius_contract"]["exact_radius_validation"]["dxf_readback_performed"] is None
+
+
+def _published_joint_validation():
+    return {"passed":True,"strict_relation_validation":{
+        "passed":True,"required_count":1,"satisfied_count":1,"dxf_readback_performed":True,
+        "native_mapping_verified":True,"angle_tolerance_deg":1e-7,"endpoint_tolerance":1e-7,
+        "checks":[{"constraint_id":"krel001","entity_ids":["g000","g001"],"node_id":"v001","passed":True,
+                   "model":{"angle_residual_deg":1e-12,"endpoint_gap":0.,"passed":True},
+                   "dxf":{"angle_residual_deg":2e-12,"endpoint_gap":0.,"passed":True}}]},
+        "reconstruction_contract":{"satisfied":False,"recognized_dimensions":3,"bound_source_records":2,
+        "unbound_dimensions":1,"all_recognized_attributes_covered":False,
+        "all_join_relationships_certified":False,"remaining_shape_dof":4,"shape_fully_determined":False,
+        "entity_count":3,"entity_count_by_type":{"LINE":1,"ARC":2},"unresolved_joint_count":1,
+        "joints":[{"node_id":"v001","entities":["g000","g001"],"types":["LINE","ARC"],
+                   "relationship":"source_admitted_tangent","constraint_id":"krel001","passed":True},
+                  {"node_id":"v002","entities":["g001","g002"],"types":["ARC","ARC"],
+                   "relationship":"unresolved","passed":False},
+                  {"node_id":"v000","entities":["g002","g000"],"types":["ARC","LINE"],
+                   "relationship":"unresolved","passed":False}]}}
+
+
+def test_published_joint_audit_is_visible_without_candidate_solution_and_is_whitelisted(tmp_path):
+    output=tmp_path/"jobs"/"published-joints";output.mkdir(parents=True)
+    validation=_published_joint_validation()
+    strict=validation["strict_relation_validation"];coverage=validation["reconstruction_contract"]
+    strict["provider"]={"api_key":"DO-NOT-EXPOSE"};strict["path"]="C:/private/secret"
+    strict["checks"][0]["dxf"]["secret"]="DO-NOT-EXPOSE"
+    coverage["joints"][0]["evidence"]={"provider":{"token":"DO-NOT-EXPOSE"}}
+    coverage["remaining_shape_dof"]={"secret":"DO-NOT-EXPOSE"}
+    coverage["entity_count_by_type"]["secret"]="DO-NOT-EXPOSE"
+    (output/"validation.json").write_text(json.dumps(validation),encoding="utf8")
+    result=build_model_transcript({"id":"j"*32,"artifact_directory":str(output)},tmp_path)
+    audit=result["parameterization"];public=audit["strict_relation_validation"]
+    assert public["certificate_source"]=="published_validation"
+    assert public["passed"] and public["current_dxf_verified"]
+    assert public["required_count"]==public["satisfied_count"]==1
+    coverage=audit["reconstruction_contract"]
+    assert coverage["unresolved_joint_count"]==2  # Never trust an understated summary over its joint inventory.
+    assert coverage["unresolved_arc_arc_joint_count"]==1
+    assert coverage["remaining_shape_dof"] is None
+    assert not coverage["satisfied"] and not coverage["all_join_relationships_certified"]
+    assert not coverage["reference_accuracy_verified"]
+    serialized=json.dumps(result)
+    assert "DO-NOT-EXPOSE" not in serialized and "C:/private" not in serialized
+
+
+def test_current_joint_certificate_never_falls_back_to_a_newer_candidate(tmp_path):
+    output=tmp_path/"jobs"/"retained-current";output.mkdir(parents=True)
+    candidate=_published_joint_validation()
+    (output/"parametric-solution.json").write_text(json.dumps({"accepted":True,
+        "strict_relation_validation":candidate["strict_relation_validation"],
+        "strict_tangent_contract":{"satisfied":True,"required_count":12}}),encoding="utf8")
+    (output/"reconstruction-contract.json").write_text(json.dumps({"satisfied":True,"remaining_shape_dof":0}),encoding="utf8")
+    # A standalone/latest candidate receipt cannot certify the published DXF.
+    result=build_model_transcript({"id":"k"*32,"artifact_directory":str(output)},tmp_path)
+    assert result["parameterization"]["strict_relation_validation"] is None
+    assert result["parameterization"]["reconstruction_contract"] is None
+    published=_published_joint_validation();published["strict_relation_validation"]["passed"]=False
+    published["strict_relation_validation"]["checks"][0]["dxf"].update(passed=False,angle_residual_deg=.03)
+    (output/"validation.json").write_text(json.dumps(published),encoding="utf8")
+    result=build_model_transcript({"id":"k"*32,"artifact_directory":str(output)},tmp_path)
+    assert not result["parameterization"]["strict_relation_validation"]["passed"]
+    assert result["parameterization"]["strict_relation_validation"]["satisfied_count"]==0
+    assert result["parameterization"]["reconstruction_contract"]["remaining_shape_dof"]==4
+
+
+def test_unknown_arc_arc_never_inherits_complete_relation_flag(tmp_path):
+    output=tmp_path/"jobs"/"false-complete";output.mkdir(parents=True)
+    validation=_published_joint_validation();contract=validation["reconstruction_contract"]
+    contract.update(satisfied=True,unresolved_joint_count=0,all_join_relationships_certified=True,
+                    all_recognized_attributes_covered=True,remaining_shape_dof=0,shape_fully_determined=True)
+    contract["joints"][0]["relationship"]={"provider":"DO-NOT-EXPOSE"}
+    contract["joints"][0]["types"]=[{"provider":"DO-NOT-EXPOSE"},"ARC"]
+    (output/"validation.json").write_text(json.dumps(validation),encoding="utf8")
+    result=build_model_transcript({"id":"m"*32,"artifact_directory":str(output)},tmp_path)
+    contract=result["parameterization"]["reconstruction_contract"]
+    assert contract["unresolved_joint_count"]==3
+    assert contract["unresolved_arc_arc_joint_count"]==1
+    assert not contract["satisfied"] and not contract["all_join_relationships_certified"]
+    assert "DO-NOT-EXPOSE" not in json.dumps(result)
+
+
+def test_whitelisted_complete_source_audit_still_does_not_claim_gt(tmp_path):
+    output=tmp_path/"jobs"/"complete-source";output.mkdir(parents=True)
+    validation=_published_joint_validation();contract=validation["reconstruction_contract"]
+    contract.update(satisfied=True,unresolved_joint_count=0,all_join_relationships_certified=True,
+                    all_recognized_attributes_covered=True,remaining_shape_dof=0,shape_fully_determined=True,
+                    unbound_dimensions=0,bound_source_records=3,reference_accuracy_verified=True)
+    for row in contract["joints"]:row.update(relationship="source_admitted_tangent",passed=True)
+    (output/"validation.json").write_text(json.dumps(validation),encoding="utf8")
+    result=build_model_transcript({"id":"n"*32,"artifact_directory":str(output)},tmp_path)
+    contract=result["parameterization"]["reconstruction_contract"]
+    assert contract["satisfied"] and contract["all_join_relationships_certified"]
+    assert not contract["reference_accuracy_verified"]

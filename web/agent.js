@@ -252,6 +252,7 @@ function renderModelTranscript(host,value){
     box.append(node("b","","参数化求解 · 独立检查"),node("p","",`${audit.constraint_subset_accepted?"已接受约束子集的解":"尚未接受参数解"} · ${audit.constraints?.length||0} 项已求解约束 · ${counts.bound_source_records??"—"} 条已绑定标注 / ${counts.recognized_dimensions??"—"} 条识别标注`),
       node("p","",`未绑定标注 ${counts.unbound_dimensions??"—"} 条 · 剩余形状自由度 ${diagnostics.remaining_shape_dof??"—"}。几何可导出不代表尺寸完整或已通过 GT 验证。`));
     if(audit.radius_contract)box.append(renderRadiusAudit(audit));
+    for(const [label,title,copy] of publishedGeometryAuditCards(audit)){const card=node("section","parameter-audit");card.append(node("b","",`${label} · ${title}`),node("p","",copy));box.append(card);}
     const issues=audit.feedback?.issues||[];
     if(issues.length){const list=node("ul","audit-issues");for(const issue of issues.slice(0,12))list.append(node("li","",issueText(issue)));box.append(list);}
     const details=node("details","receipt-answer");details.append(node("summary","","查看约束残差与未解决项"),node("pre","",JSON.stringify(audit,null,2)));box.append(details);host.append(box);
@@ -275,6 +276,18 @@ function renderRadiusAudit(audit){
   return box;
 }
 function issueText(issue){return `${issue.record_id||issue.entity_id||issue.entity_ids?.join(" → ")||"当前轮廓"} · ${auditReasonLabels[issue.code]||issue.code||"待检查"}${issue.record_id&&issue.entity_id?` (${issue.entity_id})`:""}`;}
+function publishedGeometryAuditCards(audit){
+  const strict=audit?.strict_relation_validation,reconstruction=audit?.reconstruction_contract;
+  const current=strict?.certificate_source==="published_validation"&&strict.current_dxf_verified===true;
+  const required=strict?.required_count,strictPassed=current&&strict.passed===true;
+  const tangentTitle=!strict?"当前产物尚无严格相切证书":required===0?"未声明相切约束":`${strict?.satisfied_count??"—"}/${required??"—"} 项通过${strictPassed?"":" · 尚未通过完整回读检查"}`;
+  const unknown=reconstruction?.unresolved_joint_count,dof=reconstruction?.remaining_shape_dof;
+  const complete=reconstruction?.certificate_source==="published_validation"&&reconstruction.satisfied===true&&reconstruction.all_join_relationships_certified===true&&unknown===0&&dof===0&&strictPassed;
+  return [
+    ["严格相切核验",tangentTitle,current?`当前发布 DXF 的已声明接点 · 角误差上限 ${strict.angle_tolerance_deg??"—"}°；该子集通过不代表所有接点均已确定。`:"只读取当前发布产物的验证证书；候选解通过不能替代当前 DXF 回读。"],
+    ["重建完整性",complete?"已识别约束与关系检查通过":"重建约束尚未完整满足",reconstruction?`当前产物：未知接点 ${unknown??"—"}（ARC–ARC ${reconstruction.unresolved_arc_arc_joint_count??"—"}） · 剩余形状自由度 ${dof??"—"} · 未绑定标注 ${reconstruction.unbound_dimensions??"—"}。未知关系不豁免；此检查不等于 GT 一致。`:"当前产物尚无完整性证书；不能从候选结果推断完成状态。"]
+  ];
+}
 function renderIterationAudit(iterations){
   const box=node("section","iteration-audit"),rounds=iterations.rounds||[];
   box.append(node("b","audit-title",`局部拓扑迭代 · ${rounds.length}/${iterations.max_rounds||3} 轮`));
@@ -508,6 +521,7 @@ function renderReasonCards(detail){
   if(iterations)cards.push(["迭代进度",`${iterations.rounds?.length||0}/${iterations.max_rounds||3} 轮`,auditReasonLabels[iterations.stop_reason]||iterations.stop_reason||"运行中"]);
   if(parameterization)cards.push(["参数化求解",`${parameterization.constraints?.length||0} 项已求解约束`,`剩余形状自由度 ${parameterization.diagnostics?.remaining_shape_dof??"—"} · ${parameterization.constraint_subset_accepted?"已接受约束子集的解":"参数解未接受"}`]);
   if(parameterization?.radius_contract){const radius=parameterization.radius_contract,c=radius.coverage||{};cards.push(["严格半径核验",radius.satisfied?"半径标注检查通过":"半径标注尚未完整通过",`已绑定 ${c.bound_count??"—"}/${c.recognized_count??"—"} · 未知 ${c.unknown_count??"—"} · 歧义 ${c.ambiguous_count??"—"}；未知箭头不豁免。`]);}
+  if(parameterization)cards.push(...publishedGeometryAuditCards(parameterization));
   const primitives=detail.primitiveDiagnostics?.primitives||[],jumps=primitives.map(row=>row.tangent_jump_deg).filter(Number.isFinite);
   if(jumps.length)cards.push(["接点诊断",`最大方向跳变 ${Math.max(...jumps).toFixed(2)}°`,"测量值不代表错误；是否应相切须由原图与标注判断。"]);
   if(!cards.length){box.append(node("p","empty-copy","等待规划与校验数据。"));return;}

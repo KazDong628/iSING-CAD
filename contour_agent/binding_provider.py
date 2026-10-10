@@ -1,4 +1,4 @@
-"""One bounded source-image call selecting existing binding IDs, never CAD values."""
+"""Bounded source-image pages selecting existing binding IDs, never CAD values."""
 from __future__ import annotations
 
 import asyncio
@@ -25,9 +25,15 @@ For each binding, transcribe the actual dimension visible in the SOURCE IMAGE in
 Use only IDs in the supplied inventory. At most one candidate per record. Select a relation only if its geometry is visibly supported. These are approximate primitives awaiting a numerical solve: a small shape or radius discrepancy is not itself a reason to reject an otherwise clearly targeted dimension. Inspect the visible line endpoints and arrow direction, choose a supported candidate when identifiable, and abstain on ambiguous records. Empty arrays are valid only when none of the supplied candidates or relations is identifiable. Never return numbers, CAD coordinates, new dimensions, explanations, or extra keys. Candidate alternatives may remain ambiguous; do not invent a missing leader or endpoint. This selection alone does not certify dimensions or geometry."""
 
 
-def validate_selection(content):
+MAX_BINDING_PAGES = 4
+PAGE_RECORD_LIMIT = 16
+PAGE_CANDIDATE_LIMIT = 32
+PAGE_RELATION_LIMIT = 16
+
+
+def validate_selection(content, *, item_limit=24, character_limit=24000):
     """Strict independent response schema; semantic checks are separate."""
-    if not isinstance(content, str) or len(content) > 24000:
+    if not isinstance(content, str) or len(content) > character_limit:
         raise _InspectionError("invalid_output")
     try:
         value = _single_json_object(content.strip())
@@ -35,7 +41,9 @@ def validate_selection(content):
         raise _InspectionError("invalid_json") from None
     if not isinstance(value, dict) or set(value) != {"bindings", "relations"}:
         raise _InspectionError("schema_mismatch")
-    for name, keys, limit in (("bindings", {"record_id", "candidate_id"}, 24), ("relations", {"relation_id"}, 24)):
+    if not isinstance(item_limit, int) or not 1 <= item_limit <= 96:
+        raise ValueError("invalid selection row limit")
+    for name, keys, limit in (("bindings", {"record_id", "candidate_id"}, item_limit), ("relations", {"relation_id"}, item_limit)):
         rows = value[name]
         if not isinstance(rows, list) or len(rows) > limit:
             raise _InspectionError("schema_mismatch")
@@ -163,9 +171,16 @@ def _source_path_review_summary(paths, audit):
 
 def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relation_limit=24):
     """Explicit, recursively bounded source summaries with unchanged row IDs."""
-    records = inventory.get("records", [])[:record_limit]
+    records, candidates = [], []
+    all_packet_candidates = inventory.get("candidates", [])
+    for row in inventory.get("records", []):
+        group = [candidate for candidate in all_packet_candidates if candidate.get("record_id") == row["id"]]
+        # Never show only a prefix of a record's competing hypotheses.
+        if len(records) >= record_limit or len(candidates) + len(group) > candidate_limit:
+            continue
+        records.append(row)
+        candidates.extend(group)
     ids = {row["id"] for row in records}
-    candidates = [row for row in inventory.get("candidates", []) if row.get("record_id") in ids][:candidate_limit]
     relations = inventory.get("relations", [])[:relation_limit]
     audit = {"method": "source_evidence_whitelist_summary_v1", "full_audit_retained_locally": True,
              "omitted_nonwhitelisted_fields": 0, "truncated_strings": 0,
@@ -199,6 +214,159 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
                 "relation_ids_not_sent": [row["id"] for row in full_relations[relation_limit:]],
                 "packet_row_limits": [record_limit, candidate_limit, relation_limit]},
             "source_evidence_summary": audit}
+
+
+def _binding_pages(inventory):
+    """Page the full source inventory, preserving every candidate group.
+
+    Unknown OCR and records without selectable targets remain in the coverage
+    denominator and exclusions; their omission is never an API abstention.
+    """
+    if not isinstance(inventory, dict):
+        raise ValueError("invalid inventory")
+    records = inventory.get("all_records", inventory.get("records", []))
+    candidates = inventory.get("all_candidates", inventory.get("candidates", []))
+    relations = inventory.get("relations", [])
+    for rows in (records, candidates, relations):
+        if not isinstance(rows, list):
+            raise ValueError("invalid inventory rows")
+        ids = [row.get("id") if isinstance(row, dict) else None for row in rows]
+        if (any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", value)
+                for value in ids) or len(ids) != len(set(ids))):
+            raise ValueError("invalid or duplicate inventory IDs")
+    record_ids = {row["id"] for row in records}
+    grouped = {row["id"]: [] for row in records}
+    for candidate in candidates:
+        record_id = candidate.get("record_id")
+        if not isinstance(record_id, str) or record_id not in grouped:
+            raise ValueError("candidate references unknown source record")
+        grouped[record_id].append(candidate)
+    eligible, selectable, exclusions = [], [], []
+    for row in records:
+        parsed = row.get("parsed") or {}
+        nominal = parsed.get("nominal") if isinstance(parsed, dict) else None
+        supported = (isinstance(parsed, dict) and parsed.get("kind") in {"radius", "length", "diameter", "angle"}
+                     and isinstance(nominal, (float, int)) and not isinstance(nominal, bool)
+                     and math.isfinite(nominal) and nominal > 0)
+        if not supported:
+            exclusions.append({"record_id": row["id"], "reason": "unsupported_or_unresolved_source_dimension"})
+            continue
+        eligible.append(row)
+        group = grouped[row["id"]]
+        if not group:
+            exclusions.append({"record_id": row["id"], "reason": "no_source_candidate"})
+        elif len(group) > PAGE_CANDIDATE_LIMIT:
+            exclusions.append({"record_id": row["id"], "reason": "complete_candidate_group_exceeds_page_limit"})
+        else:
+            selectable.append(row)
+    selectable.sort(key=lambda row: (not any(c.get("local_reliable") for c in grouped[row["id"]]), row["id"]))
+    pending = selectable[:]
+    remaining_relations = relations[:]
+    pages = []
+    while (pending or remaining_relations) and len(pages) < MAX_BINDING_PAGES:
+        page_records, page_candidates, next_pending = [], [], []
+        for row in pending:
+            group = grouped[row["id"]]
+            if len(page_records) >= PAGE_RECORD_LIMIT or len(page_candidates) + len(group) > PAGE_CANDIDATE_LIMIT:
+                next_pending.append(row)
+                continue
+            page_records.append(row)
+            page_candidates.extend(group)
+        page_relations, remaining_relations = remaining_relations[:PAGE_RELATION_LIMIT], remaining_relations[PAGE_RELATION_LIMIT:]
+        pages.append({"units": inventory.get("units"), "records": page_records, "candidates": page_candidates,
+                      "relations": page_relations, "radius_binding_coverage": inventory.get("radius_binding_coverage", {})})
+        pending = next_pending
+    if not pages:
+        # Retain a bounded empty-inventory transport probe for existing callers.
+        pages.append({"units": inventory.get("units"), "records": [], "candidates": [], "relations": []})
+    exclusions.extend({"record_id": row["id"], "reason": "page_count_limit"} for row in pending)
+    return pages, {
+        "all_record_ids": [row["id"] for row in records],
+        "all_candidate_ids": [row["id"] for row in candidates],
+        "all_relation_ids": [row["id"] for row in relations],
+        "source_eligible_record_ids": [row["id"] for row in eligible],
+        "source_selectable_record_ids": [row["id"] for row in selectable],
+        "record_exclusions": exclusions,
+        "radius_record_denominator": inventory.get("radius_binding_coverage", {}).get("recognized_count"),
+        "packet_row_limits": [PAGE_RECORD_LIMIT, PAGE_CANDIDATE_LIMIT, PAGE_RELATION_LIMIT],
+        "relation_ids_excluded_by_page_limit": [row["id"] for row in remaining_relations],
+    }
+
+
+def _merge_page_selections(pages):
+    """Reject conflicting cross-page decisions instead of last-write wins."""
+    grouped, relations, conflicts = {}, {}, []
+    for page in pages:
+        if not page.get("selection_payload_verified") or not page.get("schema_success"):
+            continue
+        for row in page.get("bindings", []):
+            grouped.setdefault(row["record_id"], []).append(row)
+        for row in page.get("relations", []):
+            relations.setdefault(row["relation_id"], row)
+    bindings = []
+    for record_id, values in grouped.items():
+        signatures = {(row["candidate_id"], row.get("observed_text")) for row in values}
+        if len(signatures) != 1:
+            conflicts.append({"record_id": record_id, "candidate_ids": sorted({row["candidate_id"] for row in values}),
+                              "reason": "conflicting_page_selections"})
+        else:
+            bindings.append(dict(values[0]))
+    return bindings, list(relations.values()), conflicts
+
+
+def validate_receipt_selection(receipt):
+    """Validate per-page selection envelopes and the exact aggregate union.
+
+    Legacy providers retain the original single-response limit. A paged
+    response earns the larger aggregate limit only from individually verified
+    bounded pages and their actual transmitted inventories.
+    """
+    if not isinstance(receipt, dict):
+        raise _InspectionError("invalid_selection_receipt")
+    value = {"bindings": receipt.get("bindings"), "relations": receipt.get("relations")}
+    pages = receipt.get("pages")
+    if pages is None:
+        return validate_selection(json.dumps(value, allow_nan=False))
+    if not isinstance(pages, list) or not 1 <= len(pages) <= MAX_BINDING_PAGES:
+        raise _InspectionError("invalid_selection_pages")
+    successful = []
+    for page in pages:
+        if not isinstance(page, dict):
+            raise _InspectionError("invalid_selection_page")
+        if page.get("schema_success") is not True or page.get("selection_payload_verified") is not True:
+            continue
+        selection = validate_selection(json.dumps({"bindings": page.get("bindings"),
+                                                  "relations": page.get("relations")}, allow_nan=False))
+        records, candidates, relations = [page.get(f"input_{kind}_ids") for kind in ("record", "candidate", "relation")]
+        for rows, limit in ((records, PAGE_RECORD_LIMIT), (candidates, PAGE_CANDIDATE_LIMIT),
+                            (relations, PAGE_RELATION_LIMIT)):
+            if (not isinstance(rows, list) or len(rows) > limit or
+                    any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", item)
+                        for item in rows) or len(rows) != len(set(rows))):
+                raise _InspectionError("invalid_page_inventory")
+        ownership = page.get("input_candidate_record_ids")
+        if (not isinstance(ownership, dict) or set(ownership) != set(candidates) or
+                any(not isinstance(owner, str) or owner not in records for owner in ownership.values())):
+            raise _InspectionError("invalid_page_candidate_ownership")
+        _validate_selection_payload(selection, {"records": [{"id": item} for item in records],
+            "candidates": [{"id": item, "record_id": ownership[item]} for item in candidates],
+            "relations": [{"id": item} for item in relations]})
+        successful.append(page)
+    if not successful:
+        raise _InspectionError("no_verified_selection_page")
+    for kind in ("record", "candidate", "relation"):
+        field = f"input_{kind}_ids"
+        expected = list(dict.fromkeys(item for page in successful for item in page[field]))
+        if receipt.get(field) != expected:
+            raise _InspectionError("aggregate_inventory_mismatch")
+    bindings, relations, conflicts = _merge_page_selections(successful)
+    if conflicts or receipt.get("conflicting_selections"):
+        raise _InspectionError("conflicting_page_selections")
+    selection = validate_selection(json.dumps(value, allow_nan=False), item_limit=MAX_BINDING_PAGES * 24,
+                                   character_limit=MAX_BINDING_PAGES * 24000)
+    if selection != {"bindings": bindings, "relations": relations}:
+        raise _InspectionError("aggregate_selection_mismatch")
+    return selection
 
 
 def _validate_selection_payload(selection, payload):
@@ -265,6 +433,108 @@ class BindingProvider:
         return asyncio.run(self._select(image_path, topology_path, inventory))
 
     async def _select(self, image_path, topology_path, inventory):
+        started = time.monotonic()
+        budget = min(600., max(.001, float(self.settings.api_timeout)))
+        try:
+            page_inputs, coverage = _binding_pages(inventory)
+        except (TypeError, ValueError, KeyError):
+            return {"status": "failed", "protocol": self.settings.wire_api + "-source-constraint-binding-v3-paged",
+                    "model": self.settings.model, "error_code": "invalid_inventory", "network_requests": 0,
+                    "http_success": False, "schema_success": False, "semantic_success": False,
+                    "selection_payload_verified": False, "bindings": [], "relations": [], "pages": [],
+                    "input_record_ids": [], "input_candidate_ids": [], "input_relation_ids": [],
+                    "ground_truth_sent": False, "dimensions_verified": False}
+        pages, stopped = [], None
+        for index, page in enumerate(page_inputs):
+            remaining = budget - (time.monotonic() - started)
+            if remaining <= 0:
+                stopped = "total_deadline_exhausted"
+                break
+            result = await self._select_page(image_path, topology_path, page, remaining)
+            result["page_index"] = index + 1
+            pages.append(result)
+            if result.get("error_code") in {"not_configured", "invalid_endpoint", "authentication", "permission", "rate_limit"}:
+                stopped = result["error_code"]
+                break
+        successful = [page for page in pages if page.get("schema_success") is True and
+                      page.get("selection_payload_verified") is True]
+        bindings, relations, conflicts = _merge_page_selections(pages)
+        # The compatibility input_* fields describe only valid-response pages:
+        # downstream callers use these IDs to infer actual model abstention.
+        # sent_* separately records all attempted packets, including failures.
+        def ids_from(receipts, field):
+            return list(dict.fromkeys(value for receipt in receipts for value in receipt.get(field, [])))
+        attempted = [page for page in pages if page.get("network_requests", 0) > 0]
+        aggregate = dict(pages[0]) if pages else {
+            "model": self.settings.model, "http_success": False, "schema_success": False,
+            "semantic_success": False, "selection_payload_verified": False, "image_sent": False,
+            "ground_truth_sent": False, "dimensions_verified": False, "bindings": [], "relations": []}
+        aggregate.pop("page_index", None)
+        aggregate.update(protocol=self.settings.wire_api + "-source-constraint-binding-v3-paged",
+                         pages=pages, bindings=bindings, relations=relations,
+                         network_requests=sum(page.get("network_requests", 0) for page in pages),
+                         http_success=bool(attempted) and all(page.get("http_success") is True for page in attempted),
+                         schema_success=bool(successful), semantic_success=bool(successful) and not conflicts,
+                         selection_payload_verified=bool(successful),
+                         selection_subset_verified=bool(successful),
+                         all_pages_succeeded=len(successful) == len(page_inputs) and not conflicts,
+                         all_pages_http_success=bool(attempted) and len(attempted) == len(page_inputs)
+                                                and all(page.get("http_success") is True for page in attempted),
+                         all_pages_schema_success=len(successful) == len(page_inputs),
+                         conflicting_selections=conflicts,
+                         max_pages=MAX_BINDING_PAGES, planned_pages=len(page_inputs), completed_pages=len(pages),
+                         total_timeout_seconds=budget, elapsed_seconds=round(time.monotonic() - started, 3),
+                         pagination_stop_reason=stopped)
+        for name in ("record", "candidate", "relation"):
+            field = f"input_{name}_ids"
+            aggregate[field] = ids_from(successful, field)
+            aggregate[f"sent_{name}_ids"] = ids_from(attempted, field)
+            coverage[f"sent_{name}_ids"] = aggregate[f"sent_{name}_ids"]
+            coverage[f"verified_response_{name}_ids"] = aggregate[field]
+            coverage[f"{name}_ids_not_sent"] = [value for value in coverage[f"all_{name}_ids"]
+                                               if value not in set(aggregate[f"sent_{name}_ids"])]
+            coverage[f"{name}_ids_without_valid_response"] = [value for value in coverage[f"all_{name}_ids"]
+                                                             if value not in set(aggregate[field])]
+            coverage[f"all_{name}_count"] = len(coverage[f"all_{name}_ids"])
+            coverage[f"sent_{name}_count"] = len(aggregate[f"sent_{name}_ids"])
+        aggregate["input_candidate_record_ids"] = {
+            candidate_id: owner for page in successful
+            for candidate_id, owner in page.get("input_candidate_record_ids", {}).items()}
+        aggregate["input_image_count"] = sum(page.get("input_image_count", 0) for page in attempted)
+        aggregate["detail_panels"] = [{**panel, "page_index": page["page_index"]}
+                                      for page in attempted for panel in page.get("detail_panels", [])]
+        coverage["source_eligible_record_count"] = len(coverage["source_eligible_record_ids"])
+        coverage["source_selectable_record_count"] = len(coverage["source_selectable_record_ids"])
+        coverage["all_source_eligible_records_sent"] = set(coverage["source_eligible_record_ids"]) <= set(aggregate["sent_record_ids"])
+        coverage["all_source_eligible_records_have_valid_response"] = set(coverage["source_eligible_record_ids"]) <= set(aggregate["input_record_ids"])
+        coverage["all_relations_sent"] = not coverage["relation_ids_not_sent"]
+        aggregate.update(inventory_coverage=coverage, input_records=len(aggregate["input_record_ids"]),
+                         input_candidates=len(aggregate["input_candidate_ids"]),
+                         status="succeeded" if aggregate["all_pages_succeeded"] else "partial" if successful else "failed")
+        aggregate["coverage_complete"] = bool(aggregate["all_pages_succeeded"] and
+                                                coverage["all_source_eligible_records_have_valid_response"] and
+                                                not coverage["relation_ids_without_valid_response"] and not conflicts)
+        if successful and not aggregate["coverage_complete"]:
+            aggregate["status"] = "partial"
+        if aggregate["status"] == "succeeded":
+            aggregate.pop("error_code", None)
+        elif aggregate["status"] == "partial":
+            aggregate["error_code"] = ("partial_page_failure" if len(successful) < len(page_inputs) else
+                                       "conflicting_page_selections" if conflicts else "partial_inventory_coverage")
+        elif not aggregate.get("error_code"):
+            aggregate["error_code"] = stopped or "binding_pages_failed"
+        # A shared request budget and page receipts disclose costs; never let
+        # the first page's usage masquerade as the whole online operation.
+        usage = {}
+        for page in pages:
+            for key, value in (page.get("usage") or {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[key] = usage.get(key, 0) + value
+        if usage:
+            aggregate["usage"] = usage
+        return aggregate
+
+    async def _select_page(self, image_path, topology_path, inventory, remaining_budget):
         settings, started = self.settings, time.monotonic()
         receipt = {"status": "failed", "protocol": settings.wire_api+"-source-constraint-binding-v2", "model": settings.model,
                    "network_requests": 0, "http_success": False, "schema_success": False,
@@ -298,12 +568,13 @@ class BindingProvider:
         if not endpoint_allowed(settings):
             receipt["error_code"] = "invalid_endpoint"
             return finish()
-        budget = min(600., max(.001, float(settings.api_timeout)))
+        budget = min(600., max(.001, float(remaining_budget)))
         receipt["total_timeout_seconds"] = budget
         try:
             source, source_meta = _image_payload(Path(image_path))
             topology, topology_meta = _image_payload(Path(topology_path))
-            inventory_payload = bounded_inventory(inventory,record_limit=16,candidate_limit=32,relation_limit=16) if settings.wire_api=="responses" else bounded_inventory(inventory)
+            inventory_payload = bounded_inventory(inventory, record_limit=PAGE_RECORD_LIMIT,
+                                                  candidate_limit=PAGE_CANDIDATE_LIMIT, relation_limit=PAGE_RELATION_LIMIT)
             details,detail_receipts = _detail_panels(image_path,topology_path,inventory_payload,
                                                      limit=2 if settings.wire_api=="responses" else 4)
             inventory_text = json.dumps(inventory_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -318,7 +589,8 @@ class BindingProvider:
                            input_records=len(inventory_payload["records"]), input_candidates=len(inventory_payload["candidates"]),
                            input_relation_ids=[row["id"] for row in inventory_payload["relations"]],
                            input_record_ids=[row["id"] for row in inventory_payload["records"]],
-                           input_candidate_ids=[row["id"] for row in inventory_payload["candidates"]])
+                           input_candidate_ids=[row["id"] for row in inventory_payload["candidates"]],
+                           input_candidate_record_ids={row["id"]: row["record_id"] for row in inventory_payload["candidates"]})
             receipt.update(detail_panels=detail_receipts,input_image_count=2+len(details))
         except _InspectionError as error:
             receipt["error_code"] = error.code
@@ -354,7 +626,7 @@ class BindingProvider:
                     receipt["finish_reason"] = reason if reason in {"stop", "length", "content_filter", "tool_calls", None} else "other"
                     if reason not in (None, "stop"):
                         raise _InspectionError("truncated_output")
-                    selection = validate_selection(message)
+                    selection = validate_selection(message, item_limit=24)
                     _validate_selection_payload(selection, inventory_payload)
                 except _InspectionError:
                     receipt["response_excerpt"] = content

@@ -55,7 +55,7 @@ def test_rejected_exact_candidate_cannot_certify_retained_dxf(tmp_path, monkeypa
 def test_solver_missing_check_cannot_replace_required_dxf_audit_with_empty_success(tmp_path, monkeypatch):
     _, stage, output = setup_radius_pipeline(tmp_path, monkeypatch, solver_checks=False)
     contract = json.loads((output/"radius-contract.json").read_text(encoding="utf8"))
-    if stage["accepted"]:
+    if stage["constraint_subset_accepted"]:
         # Export may independently recover the complete admitted obligations.
         checks = contract["exact_radius_validation"]
         assert checks["dxf_readback_performed"] is True
@@ -65,8 +65,9 @@ def test_solver_missing_check_cannot_replace_required_dxf_audit_with_empty_succe
         assert contract["satisfied"] is False
 
 
-def test_restart_preserves_unresolved_radius_review_status(tmp_path, monkeypatch):
-    model, stage, output = setup_radius_pipeline(tmp_path, monkeypatch, complete=False)
+@pytest.mark.parametrize("complete", [True,False])
+def test_restart_preserves_unresolved_radius_review_status(tmp_path, monkeypatch, complete):
+    model, stage, output = setup_radius_pipeline(tmp_path, monkeypatch, complete=complete)
     assert stage["constraint_subset_accepted"] and not stage["accepted"]
     seed_pending_job(tmp_path, model, output)
     service = recover(tmp_path, monkeypatch)
@@ -74,7 +75,8 @@ def test_restart_preserves_unresolved_radius_review_status(tmp_path, monkeypatch
         job = service.store.get("persisted")
         assert job["validation"]["passed"] and job["automatic_completion"]
         assert not job["parameterization"]["accepted"]
-        assert job["parameterization"]["status"] == "completed_with_unresolved_radii"
+        assert job["parameterization"]["status"] == ("completed_with_unresolved_attributes" if complete else
+                                                       "completed_with_unresolved_radii")
         assert job["status"] == "needs_review"
     finally:
         service.executor.shutdown(wait=True)
@@ -123,6 +125,10 @@ def test_publication_tail_failure_provenance_matches_actual_rolled_back_core(tmp
     assert provenance["published_artifact_kind"] == "topology"
     assert provenance["parameterization_accepted"] is False
     assert provenance["constraint_subset_accepted"] is False
+    current_contract=json.loads((output/"reconstruction-contract.json").read_text(encoding="utf8"))
+    assert current_contract["satisfied"] is False
+    assert current_contract["prediction_dxf_sha256"] == digest(output/"drawing.dxf")
+    assert current_contract["status"] == "not_certified"
     assert provenance["strict_radius_contract"]["satisfied"] is False
 
 
@@ -130,12 +136,12 @@ def test_publication_tail_failure_provenance_matches_actual_rolled_back_core(tmp
 def test_current_published_provenance_distinguishes_subset_from_all_radii(tmp_path, monkeypatch, complete):
     _, stage, output = setup_radius_pipeline(tmp_path, monkeypatch, complete=complete)
     provenance = json.loads((output/"workflow-provenance.json").read_text(encoding="utf8"))
-    assert stage["accepted"] is complete
+    assert stage["accepted"] is False
     assert provenance["publication_integrity_verified"] is True
     assert provenance["published_core_manifest_match"] == "candidate"
     assert provenance["published_artifact_kind"] == "parametric"
     assert provenance["constraint_subset_accepted"] is True
-    assert provenance["parameterization_accepted"] is complete
+    assert provenance["parameterization_accepted"] is False
     assert provenance["strict_radius_contract"]["satisfied"] is complete
     assert provenance["prediction_dxf_sha256"] == hashlib.sha256((output/"drawing.dxf").read_bytes()).hexdigest()
 

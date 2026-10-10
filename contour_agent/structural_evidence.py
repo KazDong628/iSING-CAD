@@ -144,6 +144,105 @@ def _ink_trace(ink, samples, band):
     return result
 
 
+def _source_ink_tangent_trace(ink, samples, band):
+    """Retry an incomplete measurement with bounded, unclipped ink sections.
+
+    The search aperture is wider than the allowed centre displacement: observing
+    both sides of a thick stroke does not authorize moving the source boundary.
+    Window choice is made per side, before comparing the two joint directions.
+    No CAD tangent or annotation value participates in the measurement.
+    """
+    previous = _ink_trace(ink, samples, band)
+    if previous.get("verified"):
+        return previous
+    samples = np.asarray(samples, dtype=float)
+    if (samples.ndim != 2 or samples.shape[1] != 2 or len(samples) < 3
+            or not np.isfinite(samples).all() or not math.isfinite(band) or band <= 0):
+        return previous
+    distances = np.r_[0., np.cumsum(np.linalg.norm(np.diff(samples, axis=0), axis=1))]
+    maximum = min(96., float(distances[-1]) * .85)
+    minimum = max(24., 4 * band)
+    windows = sorted({maximum, 24., 32., 48., 64., 96.}, reverse=True)
+    windows = [span for span in windows if minimum <= span <= maximum]
+    attempts = []
+    extent = max(8, int(math.ceil(2 * band)))
+    offsets = np.arange(-extent, extent + 1, dtype=float)
+    for span in windows:
+        stations = np.linspace(1.5, span, 96)
+        seed = np.c_[np.interp(stations, distances, samples[:, 0]),
+                     np.interp(stations, distances, samples[:, 1])]
+        direction = np.gradient(seed, axis=0)
+        direction /= np.maximum(np.linalg.norm(direction, axis=1)[:, None], 1e-9)
+        normals = np.c_[-direction[:, 1], direction[:, 0]]
+        measured, kept, widths = [], [], []
+        rejected = {key: 0 for key in ("outside_image", "no_ink", "multiple_runs",
+                                      "clipped_run", "wide_run", "centre_outside_band")}
+        for index, (point, normal) in enumerate(zip(seed, normals)):
+            cross = np.rint(point + offsets[:, None] * normal).astype(int)
+            if not ((cross[:, 0] >= 0) & (cross[:, 0] < ink.shape[1]) &
+                    (cross[:, 1] >= 0) & (cross[:, 1] < ink.shape[0])).all():
+                rejected["outside_image"] += 1
+                continue
+            occupied = ink[cross[:, 1], cross[:, 0]]
+            starts = np.flatnonzero(occupied & ~np.r_[False, occupied[:-1]])
+            ends = np.flatnonzero(occupied & ~np.r_[occupied[1:], False])
+            if len(starts) != 1:
+                rejected["no_ink" if not len(starts) else "multiple_runs"] += 1
+                continue
+            if starts[0] == 0 or ends[0] == len(offsets) - 1:
+                rejected["clipped_run"] += 1
+                continue
+            width = int(ends[0] - starts[0] + 1)
+            centre = float(offsets[starts[0]:ends[0] + 1].mean())
+            if width > max(7., band):
+                rejected["wide_run"] += 1
+                continue
+            if abs(centre) > band:
+                rejected["centre_outside_band"] += 1
+                continue
+            measured.append(point + centre * normal)
+            kept.append(index)
+            widths.append(width)
+        row = {"span_px": span, "sample_count": len(stations),
+               "unambiguous_samples": len(kept), "rejected_samples": rejected,
+               "verified": False, "reason": "source_junction_strokes_ambiguous"}
+        attempts.append(row)
+        # Same 75% support and endpoint coverage as the original 24/32 test.
+        if len(kept) < 72 or min(kept, default=96) > 9 or max(kept, default=0) < 86:
+            continue
+        points = np.asarray(measured)
+        parameter = stations[kept] / span
+        def fit(selected):
+            coefficients = np.polynomial.polynomial.polyfit(parameter[selected], points[selected], 2)
+            fitted = np.polynomial.polynomial.polyval(parameter[selected], coefficients).T
+            vector = coefficients[1]
+            vector /= max(float(np.linalg.norm(vector)), 1e-9)
+            return vector, float(np.percentile(np.linalg.norm(points[selected] - fitted, axis=1), 90))
+        short = parameter <= .75
+        if int(short.sum()) < 48:
+            continue
+        full, residual = fit(np.ones(len(points), bool))
+        near, near_residual = fit(short)
+        stability = math.degrees(math.acos(float(np.clip(full @ near, -1., 1.))))
+        row.update(tangent_direction_px=full.tolist(), fit_residual_p90_px=residual,
+                   short_fit_residual_p90_px=near_residual, scale_disagreement_degrees=stability)
+        if max(residual, near_residual) > max(1.25, float(np.median(widths)) / 2):
+            row["reason"] = "source_local_curve_fit_unstable"
+        elif stability > 2.:
+            row["reason"] = "source_tangent_scale_disagreement"
+        else:
+            row.update(verified=True, reason=None)
+            break
+    selected = next((row for row in attempts if row["verified"]), None)
+    return {**(selected or {"verified": False, "reason": "source_tangent_multiscale_evidence_insufficient"}),
+            "method": "bounded_multiscale_unique_source_ink_tangent_v1",
+            "measurement_aperture_half_width_px": extent, "centre_displacement_budget_px": band,
+            "window_selection": "longest_independently_verified_finite_source_window",
+            "window_attempts": attempts, "previous_measurement": previous,
+            "independent_source_tangent_measurement": True,
+            "fitted_tangency_used_as_evidence": False}
+
+
 def structural_evidence(gray, records, graph, transform, sample, band):
     """Return source-validated copies of the graph's structural hypotheses."""
     cleaned, ink = source_ink(gray, records)
@@ -179,7 +278,7 @@ def structural_evidence(gray, records, graph, transform, sample, band):
                     key = entity["id"], at_end
                     if key not in trace_cache:
                         points = sample(entity, transform)
-                        trace_cache[key] = _ink_trace(ink, points[::-1] if at_end else points, band)
+                        trace_cache[key] = _source_ink_tangent_trace(ink, points[::-1] if at_end else points, band)
                     traces.append(trace_cache[key])
                 evidence = {"method": "two_sided_source_tangent_v1", "verified": False,
                             "shared_node": node, "sides": traces, "tolerance_degrees": 3.,

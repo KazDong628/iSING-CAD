@@ -24,6 +24,8 @@ def fixture_model(tmp_path, units="mm"):
               {"id":"g001","type":"LINE","start":[-4.,5.],"end":[0.,5.]},
               {"id":"g002","type":"ARC","start":[0.,5.],"end":[0.,-5.],"center":[0.,0.],"radius":5.,"clockwise":True},
               {"id":"g003","type":"LINE","start":[0.,-5.],"end":[-4.,-5.]}]
+    for index,entity in enumerate(entities):
+        entity.update(start_node=f"v{index:03d}",end_node=f"v{(index+1)%len(entities):03d}")
     scale=5. if units=="mm" else 1.
     raw,_,_=_sample_entities(entities)
     pixels=np.c_[raw[:,0]*scale+100,100-raw[:,1]*scale].tolist()

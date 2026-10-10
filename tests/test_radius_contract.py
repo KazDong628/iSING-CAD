@@ -87,9 +87,9 @@ def test_pipeline_publishes_exact_subset_without_claiming_unresolved_radii_compl
     monkeypatch.setattr("contour_agent.parametric_solver.solve_parametric",lambda *a,**k:{
         "accepted":True,"status":"accepted","entities":graph["entities"],"constraints":[equation()],"validation":{"passed":True}})
     model,stage=refine_parametric(image,{},baseline,output)
-    assert stage["constraint_subset_accepted"] and stage["accepted"] is complete
+    assert stage["constraint_subset_accepted"] and stage["accepted"] is False
     assert stage["annotation_radius_contract"]["satisfied"] is complete
-    assert stage["status"]==("completed" if complete else "completed_with_unresolved_radii")
+    assert stage["status"]==("completed_with_unresolved_attributes" if complete else "completed_with_unresolved_radii")
     assert (output/"drawing.dxf").is_file() and not model["validation"]["dimensions_verified"]
     contract=json.loads((output/"radius-contract.json").read_text(encoding="utf8"))
     assert contract["exact_radius_validation"]["dxf_readback_performed"]
@@ -98,4 +98,5 @@ def test_pipeline_publishes_exact_subset_without_claiming_unresolved_radii_compl
     assert provenance["solver_executed"] and provenance["published_artifact_kind"]=="parametric"
     assert not provenance["reference_dxf_used_as_prediction_geometry"]
     saved=json.loads((output/"model.json").read_text(encoding="utf8"))
-    assert saved["parameterization"]["accepted"] is complete
+    assert saved["parameterization"]["accepted"] is False
+    assert saved["validation"]["reconstruction_contract"]["satisfied"] is False

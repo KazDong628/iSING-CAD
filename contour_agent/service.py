@@ -1,5 +1,6 @@
 """Small agent state machine: extract -> review -> solve -> independently validate."""
 from __future__ import annotations
+from copy import deepcopy
 import hashlib
 import io
 import json
@@ -40,9 +41,74 @@ def _parameterization_needs_review(job):
     stage=job.get("parameterization") or {}
     if not stage:return False
     contract=stage.get("annotation_radius_contract")
+    validation=job.get("validation") or {}
+    coverage=validation.get("reconstruction_contract") or {}
+    strict=validation.get("strict_relation_validation") or {}
     return bool(stage.get("accepted") is not True or
+                coverage.get("satisfied") is not True or
+                coverage.get("unresolved_joint_count") != 0 or
+                coverage.get("remaining_shape_dof") != 0 or
+                strict.get("passed") is not True or
+                strict.get("dxf_readback_performed") is not True or
+                strict.get("native_mapping_verified") is not True or
                 (contract is not None and (not contract.get("satisfied") or
                                           contract.get("publication_status")=="candidate_only")))
+
+
+def _recover_parametric_certificate(model, document):
+    """Recheck current CORE obligations; an old accepted flag is not a certificate.
+
+    This never discovers new obligations or upgrades legacy exports. The saved
+    export-time stage supplies the obligation inventory, not a newer attempt's
+    sidecar. Native geometry is independently read back again before restoring
+    acceptance; downloadable, coherent geometry may still remain uncertified.
+    """
+    from .radius_contract import annotation_radius_contract, exact_radius_checks
+    from .reconstruction_contract import reconstruction_contract
+    from .relation_contract import relation_checks
+
+    stage=model.get("parameterization") or {}
+    validation=model.get("validation") or {}
+    constraints=stage.get("constraints") or []
+    entities=model.get("entities") or []
+    stored_strict=validation.get("strict_relation_validation") or {}
+    stored_exact=validation.get("exact_radius_validation") or {}
+    stored_coverage=validation.get("reconstruction_contract") or {}
+    stored_radii=validation.get("annotation_radius_contract") or {}
+    strict=relation_checks(entities,constraints,dxf_document=document)
+    exact=exact_radius_checks(entities,constraints,dxf_document=document)
+    current_subset=bool(
+        model.get("algorithm_version")=="source-topology-bound-parametric-v1" and
+        stored_strict.get("schema_version")=="strict-relation-contract-v1" and
+        stored_strict.get("passed") is True and
+        stored_strict.get("dxf_readback_performed") is True and
+        stored_strict.get("native_mapping_verified") is True and
+        stored_strict.get("required_count")==strict.get("required_count") and
+        stored_exact.get("passed") is True and stored_exact.get("dxf_readback_performed") is True and
+        stored_exact.get("required_count")==exact.get("required_count") and
+        strict.get("passed") is True and strict.get("native_mapping_verified") is True and
+        exact.get("passed") is True)
+    radii=annotation_radius_contract(stage,{
+        "entities":entities,"accepted":(stage.get("solver") or {}).get("accepted") is True})
+    radius_complete=bool(current_subset and stored_radii.get("satisfied") is True and
+        stored_radii.get("current_dxf_verified") is True and radii.get("satisfied") is True)
+    checked_validation={**deepcopy(validation),"strict_relation_validation":strict,
+                        "exact_radius_validation":exact,
+                        "annotation_radius_contract":{**radii,"satisfied":radius_complete}}
+    coverage=reconstruction_contract(entities,stage,checked_validation)
+    complete=bool(current_subset and stored_coverage.get("schema_version")=="source-reconstruction-contract-v1" and
+        stored_coverage.get("satisfied") is True and coverage.get("satisfied") is True)
+    reasons=list(coverage.get("reasons") or [])
+    if not current_subset:reasons.append("current_native_subset_certificate_missing_or_failed")
+    if stored_coverage.get("schema_version")!="source-reconstruction-contract-v1":
+        reasons.append("current_reconstruction_certificate_missing")
+    elif stored_coverage.get("satisfied") is not True:
+        reasons.append("published_reconstruction_was_not_complete")
+    return {"source":"current_published_core","constraint_subset_verified":current_subset,
+            "annotated_radii_verified":radius_complete,"complete":complete,
+            "strict_relation_validation":strict,"exact_radius_validation":exact,
+            "reconstruction_contract":coverage,"reasons":list(dict.fromkeys(reasons)),
+            "legacy_export_automatically_certified":False}
 
 class AgentService:
     def __init__(self, settings: Settings, *, recover_running=False):
@@ -763,7 +829,9 @@ class AgentService:
                 if parameterization.get("accepted"):
                     job["completion_class"]="partial_parametric_draft"
                 elif parameterization.get("constraint_subset_accepted"):
-                    job["completion_class"]="partial_parametric_draft_unresolved_radii"
+                    job["completion_class"]=("partial_parametric_draft_unresolved_attributes" if
+                        parameterization.get("status")=="completed_with_unresolved_attributes" else
+                        "partial_parametric_draft_unresolved_radii")
                 elif parameterization.get("topology_exported"):
                     job["completion_class"]="source_topology_draft"
                 self._publish_automatic_artifacts(job,output)
@@ -839,6 +907,7 @@ class AgentService:
                      binding_candidates="binding-candidates.json",binding_overlay="binding-topology.png",
                      parametric_solution="parametric-solution.json",parameterization="parametric-stage.json",
                      radius_targets="radius-targets.json",radius_contract="radius-contract.json",
+                     reconstruction_contract="reconstruction-contract.json",
                      workflow_provenance="workflow-provenance.json",
                      baseline_dxf="baseline-drawing.dxf",baseline_svg="baseline-preview.svg",
                      baseline_overlay="baseline-overlay.png",baseline_model="baseline-model.json")
@@ -916,23 +985,43 @@ class AgentService:
             model,validation=saved
             job.update(validation=validation,automatic_completion=bool(model.get("automatic_completion")),scale=model["scale"],curve_fit=model.get("curve_fit"),
                        geometry={"entities":model["entities"],"bounds":model["bounds"],"coordinate_system":model["coordinate_system"]})
-            if model.get("parameterization",{}).get("accepted"):
-                # model.json snapshots the export. A later durable stage or
-                # binding receipt must not be replaced by older model metadata.
-                verified_stage={**model["parameterization"],**(job.get("parameterization") or {}),
-                                "accepted":True,"status":"completed",
-                                "geometry_updated_by_api":model["parameterization"].get("geometry_updated_by_api",False),
-                                "dimensions_updated_by_api":model["parameterization"].get("dimensions_updated_by_api",False)}
+            saved_stage=model.get("parameterization") or {}
+            if saved_stage.get("accepted") or saved_stage.get("constraint_subset_accepted"):
+                # Keep durable transport receipts, but certify only the CURRENT
+                # CORE's obligations against its actual native DXF. Neither old
+                # accepted=True nor a newer failed candidate's sidecar can pass.
+                try:
+                    certificate=_recover_parametric_certificate(model,ezdxf.readfile(directory/"drawing.dxf"))
+                except (ValueError,KeyError,TypeError,AttributeError,OverflowError,ezdxf.DXFError):
+                    certificate={"source":"current_published_core","complete":False,
+                                 "constraint_subset_verified":False,"annotated_radii_verified":False,
+                                 "reasons":["invalid_current_publication_certificate"],
+                                 "legacy_export_automatically_certified":False}
+                accepted=bool(saved_stage.get("accepted") is True and certificate["complete"])
+                subset=certificate["constraint_subset_verified"]
+                unresolved_status=("completed_with_unresolved_attributes" if
+                    certificate["annotated_radii_verified"] else "completed_with_unresolved_radii")
+                verified_stage={**saved_stage,**(job.get("parameterization") or {}),
+                    "accepted":accepted,"constraint_subset_accepted":subset,
+                    "status":"completed" if accepted else unresolved_status,
+                    "annotation_radius_contract":deepcopy(saved_stage.get("annotation_radius_contract")),
+                    "reconstruction_contract":certificate.get("reconstruction_contract",{}),
+                    "recovery_certificate":certificate,
+                    "geometry_updated_by_api":bool(subset and saved_stage.get("geometry_updated_by_api")),
+                    "dimensions_updated_by_api":bool(subset and saved_stage.get("dimensions_updated_by_api"))}
                 if publication:
-                    verified_stage["publication"]={**publication,"status":"committed","recovered":True}
+                    recovered_publication=deepcopy((job.get("parameterization") or {}).get("publication") or publication)
+                    recovered_publication.update(recovered=True)
+                    if recovered_publication.get("status")!="rolled_back":
+                        recovered_publication["status"]="committed"
+                    verified_stage["publication"]=recovered_publication
                 job["parameterization"]=verified_stage
-                job["completion_class"]="partial_parametric_draft"
-            elif model.get("parameterization",{}).get("constraint_subset_accepted"):
-                job["parameterization"]={**model["parameterization"],**(job.get("parameterization") or {}),
-                                         "accepted":False,"constraint_subset_accepted":True,
-                                         "status":"completed_with_unresolved_radii"}
-                job["completion_class"]="partial_parametric_draft_unresolved_radii"
-                job["status"]="needs_review"
+                job["completion_class"]=("partial_parametric_draft" if accepted else
+                    "partial_parametric_draft_unresolved_attributes" if
+                    unresolved_status=="completed_with_unresolved_attributes" else "partial_parametric_draft_unresolved_radii")
+                if not accepted:
+                    job["status"]="needs_review"
+                    job.setdefault("issues",[]).append("已保留当前CAD产物；当前原生DXF、严格关系或完整约束证书尚未全部通过，旧完成标志不作为重新认证依据。")
             elif model.get("parameterization",{}).get("topology_exported"):
                 recovered_stage=job.get("parameterization") or model["parameterization"]
                 recovered_stage.update(accepted=False,topology_exported=True,

@@ -30,7 +30,7 @@ def response(content=None,reason="stop"):
     return httpx.Response(200,json={"choices":[{"finish_reason":reason,"message":{"content":content if content is not None else '{"bindings":[],"relations":[]}'}}]})
 
 
-def test_bounded_multimodal_payload_and_single_request(monkeypatch,image):
+def test_bounded_multimodal_payload_pages_complete_record_groups(monkeypatch,image):
     options=[];payloads=[]
     def handler(request):
         payloads.append(json.loads(request.content));return response()
@@ -39,8 +39,9 @@ def test_bounded_multimodal_payload_and_single_request(monkeypatch,image):
                "candidates":[{"id":f"c{i:03d}","record_id":f"r{i%24:03d}","kind":"radius","entities":["g000"],"nodes":[],"evidence":{}} for i in range(80)],
                "relations":[],"ground_truth_secret":"MUST NOT SEND"}
     result=BindingProvider(Settings(api_key="test-private-token")).select(image,image,inventory)
-    assert result["http_success"] and result["schema_success"] and result["network_requests"]==1
-    assert result["input_records"]==24 and result["input_candidates"]==48
+    assert result["http_success"] and result["schema_success"] and result["network_requests"]==3
+    assert result["input_records"]==24 and result["input_candidates"]==80
+    assert result["inventory_coverage"]["record_ids_not_sent"] == [f"r{i:03d}" for i in range(24,40)]
     wire=payloads[0];parts=wire["messages"][1]["content"]
     assert wire["max_tokens"]==2200 and sum(p["type"]=="image_url" for p in parts)==2
     assert "MUST NOT SEND" not in json.dumps(wire) and "test-private-token" not in json.dumps(result)
@@ -110,7 +111,9 @@ def test_source_detail_panels_are_bounded_and_audited(monkeypatch,image):
     payloads=[]
     patch(monkeypatch,lambda request:(payloads.append(json.loads(request.content)) or response()))
     inventory={"records":[{"id":f"r{i:03d}","text":"R3","box":[[x,y],[x+30,y+30]],"parsed":{"kind":"radius","nominal":3}}
-                          for i,(x,y) in enumerate([(100,100),(700,100),(1400,100),(100,700),(700,700)])]}
+                          for i,(x,y) in enumerate([(100,100),(700,100),(1400,100),(100,700),(700,700)])],
+               "candidates":[{"id":f"c{i:03d}","record_id":f"r{i:03d}","kind":"radius","entities":["g000"],"nodes":[]}
+                             for i in range(5)]}
     receipt=BindingProvider(Settings(api_key="test")).select(image,image,inventory)
     assert receipt["schema_success"] and receipt["input_image_count"]==6
     assert len(receipt["detail_panels"])==4
@@ -121,7 +124,8 @@ def test_source_detail_panels_are_bounded_and_audited(monkeypatch,image):
 
 def _large_inventory():
     return {"units": "mm",
-            "records": [{"id": f"r{i:03d}", "text": "R40", "box": []} for i in range(30)],
+            "records": [{"id": f"r{i:03d}", "text": "R40", "box": [],
+                         "parsed": {"kind": "radius", "nominal": 40.}} for i in range(30)],
             "candidates": [{"id": f"c{i:03d}", "record_id": f"r{i//3:03d}",
                             "kind": "radius", "entities": ["g000"], "nodes": [], "evidence": {}}
                            for i in range(90)],
@@ -137,7 +141,7 @@ def _wire_response(wire_api, selection):
     return response(content)
 
 
-@pytest.mark.parametrize("wire_api,limits", [("responses", (16, 32, 16)), ("chat_completions", (24, 48, 24))])
+@pytest.mark.parametrize("wire_api,limits", [("responses", (16, 32, 16)), ("chat_completions", (16, 32, 16))])
 def test_receipt_ids_equal_actual_bounded_packet(monkeypatch, image, wire_api, limits):
     packets = []
 
@@ -146,23 +150,23 @@ def test_receipt_ids_equal_actual_bounded_packet(monkeypatch, image, wire_api, l
         parts = wire["input"][0]["content"] if wire_api == "responses" else wire["messages"][1]["content"]
         packet = json.loads(parts[0]["text"])
         packets.append(packet)
-        return _wire_response(wire_api, {"bindings": [{"record_id": "r000", "candidate_id": "c000",
+        return _wire_response(wire_api, {"bindings": [{"record_id": packet["records"][0]["id"], "candidate_id": packet["candidates"][0]["id"],
                                                       "observed_text": "R40"}],
-                                         "relations": [{"relation_id": "rel000"}]})
+                                         "relations": [{"relation_id": packet["relations"][0]["id"]}] if packet["relations"] else []})
 
     patch(monkeypatch, handler)
     result = BindingProvider(Settings(api_key="test", wire_api=wire_api)).select(image, image, _large_inventory())
-    assert len(packets) == result["network_requests"] == 1
+    assert len(packets) == result["network_requests"] == 3
     assert result["schema_success"] and result["semantic_success"] and result["selection_payload_verified"]
     for name, field, limit in zip(("records", "candidates", "relations"),
                                   ("input_record_ids", "input_candidate_ids", "input_relation_ids"), limits):
-        assert result[field] == [row["id"] for row in packets[0][name]]
-        assert len(result[field]) == limit
+        assert result[field] == [row["id"] for packet in packets for row in packet[name]]
+        assert all(len(packet[name]) <= limit for packet in packets)
 
 
 @pytest.mark.parametrize("selection,error", [
     ({"bindings": [{"record_id": "r016", "candidate_id": "c048"}], "relations": []}, "record_not_sent"),
-    ({"bindings": [{"record_id": "r013", "candidate_id": "c039"}], "relations": []}, "candidate_not_sent"),
+    ({"bindings": [{"record_id": "r000", "candidate_id": "c039"}], "relations": []}, "candidate_not_sent"),
     ({"bindings": [{"record_id": "r001", "candidate_id": "c000"}], "relations": []}, "record_candidate_mismatch"),
     ({"bindings": [{"record_id": "r000", "candidate_id": "c000"},
                    {"record_id": "r000", "candidate_id": "c001"}], "relations": []}, "duplicate_record_selection"),
@@ -172,10 +176,15 @@ def test_receipt_ids_equal_actual_bounded_packet(monkeypatch, image, wire_api, l
 def test_semantic_validation_rejects_unsent_or_inconsistent_ids(monkeypatch, image, selection, error):
     calls = []
     patch(monkeypatch, lambda request: (calls.append(request) or _wire_response("responses", selection)))
-    result = BindingProvider(Settings(api_key="test", wire_api="responses")).select(image, image, _large_inventory())
+    inventory = _large_inventory()
+    inventory["records"] = inventory["records"][:10]
+    inventory["candidates"] = inventory["candidates"][:30]
+    inventory["relations"] = inventory["relations"][:16]
+    result = BindingProvider(Settings(api_key="test", wire_api="responses")).select(image, image, inventory)
     assert len(calls) == result["network_requests"] == 1
     assert result["http_success"] and result["error_code"] == error
     assert not result["schema_success"] and not result["semantic_success"]
     assert not result["selection_payload_verified"]
     assert result["bindings"] == [] and result["relations"] == []
-    assert len(result["input_record_ids"]) == 16 and len(result["input_candidate_ids"]) == 32
+    assert result["input_record_ids"] == result["input_candidate_ids"] == []
+    assert len(result["sent_record_ids"]) == 10 and len(result["sent_candidate_ids"]) == 30

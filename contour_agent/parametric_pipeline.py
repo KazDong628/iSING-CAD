@@ -26,6 +26,8 @@ from .reconstruction_feedback import (reconstruction_feedback, geometry_fingerpr
                                        constraint_regression, primitive_diagnostics,
                                        source_failure_feedback, source_mask_interval_diagnostics)
 from .radius_contract import exact_radius_checks, annotation_radius_contract
+from .relation_contract import relation_checks
+from .reconstruction_contract import reconstruction_contract
 from .topology import stroke_support_fraction
 
 
@@ -108,10 +110,22 @@ def _write_workflow_provenance(output, stage, context):
                         satisfied=bool(current_verified and contract.get("satisfied")),
                         all_annotated_radii_verified=bool(current_verified and contract.get("satisfied")))
     accepted=bool(integrity and actual_stage.get("accepted") and
-                  contract and contract.get("satisfied"))
+                  contract and contract.get("satisfied") and
+                  validation.get("reconstruction_contract",{}).get("satisfied"))
+    strict_relations=validation.get("strict_relation_validation") or {}
+    # The public sidecar follows the CURRENT coherent CORE, including rollback,
+    # rather than a newer attempted candidate's coverage claim.
+    published_coverage=copy.deepcopy(validation.get("reconstruction_contract") or {})
+    published_coverage.update(satisfied=bool(integrity and published_coverage.get("satisfied")),
+                             publication_integrity_verified=integrity,
+                             prediction_dxf_sha256=hashes.get("drawing.dxf"))
+    if not validation.get("reconstruction_contract"):
+        published_coverage.update(status="not_certified",reasons=["current_export_has_no_reconstruction_contract"])
+    _write(output/"reconstruction-contract.json",published_coverage)
     current_parametric_constraints=bool(integrity and kind=="parametric" and
         actual_stage.get("constraint_subset_accepted") and contract and
-        contract.get("current_dxf_verified") and fillet.get("solver_accepted") is True)
+        contract.get("current_dxf_verified") and fillet.get("solver_accepted") is True and
+        strict_relations.get("passed") is True and strict_relations.get("dxf_readback_performed") is True)
     provenance={"schema_version":"cad-reconstruction-provenance-v1",**context,
                 "reference_dxf_used_as_prediction_geometry":False,"reference_geometry_sent_to_provider":False,
                 "initial_geometry":"local_mask_to_LINE_ARC_fitting",
@@ -122,6 +136,8 @@ def _write_workflow_provenance(output, stage, context):
                 "solver_executed":bool(stage.get("solver")),
                 "solver_status":stage.get("solver",{}).get("status"),
                 "strict_radius_contract":contract,
+                "strict_relation_contract":strict_relations,
+                "reconstruction_contract":published_coverage,
                 "published_artifact_kind":kind if integrity else "unverified_core",
                 "published_core_sha256":hashes,"published_core_manifest_match":matched,
                 "publication_integrity_verified":integrity,"published_metadata_consistent":metadata_consistent,
@@ -238,6 +254,9 @@ def export_parametric(image_path, baseline, solution, output_dir):
     exact=exact_radius_checks(entities,solution.get("constraints",[]))
     if not exact["passed"]:
         raise ValueError("Annotated ARC radius must exactly equal its source value")
+    relations=relation_checks(entities,solution.get("constraints",[]))
+    if not relations["passed"]:
+        raise ValueError("Admitted tangent relations must be strictly satisfied before export")
     for entity in entities:
         if entity.get("radius_binding"):
             verified=any(row.get("entity_id")==entity.get("id") and
@@ -250,6 +269,11 @@ def export_parametric(image_path, baseline, solution, output_dir):
     if not readback["passed"]:
         raise ValueError("Exported ARC radius differs from its source value")
     model["validation"]["exact_radius_validation"]=readback
+    native_relations=relation_checks(entities,solution.get("constraints",[]),
+                                    dxf_document=ezdxf.readfile(Path(output_dir)/"drawing.dxf"))
+    if not native_relations["passed"]:
+        raise ValueError("Exported DXF does not satisfy its strict relation obligations")
+    model["validation"]["strict_relation_validation"]=native_relations
     _write(Path(output_dir)/"validation.json",model["validation"])
     _write(Path(output_dir)/"model.json",model)
     return model
@@ -2344,11 +2368,17 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
                             current_dxf_verified=True,publication_status="committed")
             updated["validation"]["annotation_radius_contract"]=copy.deepcopy(contract)
             updated["validation"]["all_annotated_radii_verified"]=complete_radii
+            coverage=reconstruction_contract(updated["entities"],stage,updated["validation"])
+            updated["validation"]["reconstruction_contract"]=coverage
+            stage["reconstruction_contract"]=copy.deepcopy(coverage)
+            _write(candidate_dir/"reconstruction-contract.json",coverage)
             _write(candidate_dir/"validation.json",updated["validation"])
         else:complete_radii=False
-        parametric_status="completed" if complete_radii else "completed_with_unresolved_radii"
+        complete=bool(is_parametric and coverage["satisfied"])
+        parametric_status=("completed" if complete else "completed_with_unresolved_attributes" if complete_radii
+                           else "completed_with_unresolved_radii")
         published_stage={**copy.deepcopy(stage),"status":parametric_status if is_parametric else "source_topology_exported",
-                         "accepted":is_parametric and complete_radii,"constraint_subset_accepted":is_parametric,
+                         "accepted":complete,"constraint_subset_accepted":is_parametric,
                          "topology_exported":stage.get("topology_exported",False) or not is_parametric,
                          "geometry_updated_by_api":bool(is_parametric and api_geometry),
                          "dimensions_updated_by_api":bool(is_parametric and api_dimensions),
@@ -2369,7 +2399,7 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
             for name in CORE:
                 temp=output/(name+".next")
                 shutil.copyfile(candidate_dir/name,temp);temp.replace(output/name)
-            stage.update(status=parametric_status if is_parametric else "running",accepted=is_parametric and complete_radii,
+            stage.update(status=parametric_status if is_parametric else "running",accepted=complete,
                          constraint_subset_accepted=is_parametric,
                          topology_exported=published_stage["topology_exported"],
                          geometry_updated_by_api=published_stage["geometry_updated_by_api"],
@@ -2378,6 +2408,7 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
             if is_parametric:
                 stage["annotation_radius_contract"]=contract
                 _write(output/"radius-contract.json",contract)
+                _write(output/"reconstruction-contract.json",coverage)
             checkpoint(kind+"_export",f"已发布 {len(updated['entities'])} 个图元；"+(
                 ("已绑定半径经求解和DXF回读精确核验，其他尺寸与GT精度单独检查。" if complete_radii else
                  "已绑定约束子集通过求解，但仍有半径箭头或对应对象未核实，保留为未完成尺寸验证的草稿。")
@@ -2461,6 +2492,7 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
                     shutil.copyfile(diagram,output/"binding-topology.png")
                     bound["topology_artifact"]=str(output/"binding-topology.png")
                 stage.update(binding_counts=bound.get("counts",{}),constraints=bound.get("constraints",[]),
+                    solver_constraint_checks=copy.deepcopy(sol.get("constraints",[])),
                     issues=bound.get("issues",[]),radius_binding_coverage=bound.get("radius_binding_coverage"),
                     reconstruction_feedback=prepared["feedback"],solved_source_validation=prepared["source_validation"],
                     fillet_tangent_contract=prepared["feedback"].get("fillet_tangent_contract"),
@@ -2591,6 +2623,7 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
         _write(output/"reconstruction-feedback.json",feedback)
         stage["reconstruction_feedback"]=feedback
         stage["solver"]={key:value for key,value in solution.items() if key not in {"entities","nodes","candidate_entities","candidate_nodes","constraints"}}
+        stage["solver_constraint_checks"]=copy.deepcopy(solution.get("constraints",[]))
         stage["annotation_radius_contract"]=annotation_radius_contract(bindings,solution)
         stage["annotation_radius_contract"].update(
             candidate_satisfied=stage["annotation_radius_contract"]["satisfied"],

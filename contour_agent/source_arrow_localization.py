@@ -6,6 +6,7 @@ snapped hypothesis must pass the existing complete original-pixel verifier.
 from __future__ import annotations
 
 import math
+import time
 
 import cv2
 import numpy as np
@@ -597,6 +598,104 @@ def verify_source_hough_leader(gray, record, segment, boundary_points, band, con
     return {**evidence, "method": "source_hough_arrow_with_full_shaft_locally_verified",
             "proposal_origin": "source_hough", "model_proposal_used": False,
             "crossing_admission": "detected_directed_source_arrow_with_full_shaft_and_label_ray"}
+
+
+def localize_ocr_radius_arrows(gray, record, records, boundary_points, band, contours=None, *,
+                              verifier=None, seed_limit=24, time_limit_seconds=8.):
+    """Snap bounded OCR-local ink seeds independently of provider proposals.
+
+    An approximate Hough endpoint can lie on the arrow body or one shaft edge.
+    Reuse the same bounded pixel snap as a model seed, followed by unchanged
+    complete shaft/arrow and actual-glyph attachment checks. Distinct survivors
+    remain separate observations for the global ownership/target audit.
+    """
+    from .constraint_binding import _box, _label_ray_entry
+    started = time.monotonic()
+    maximum_seeds = min(24, max(0, int(seed_limit)))
+    maximum_seconds = min(8., max(0., float(time_limit_seconds)))
+    audit = {"method": "bounded_ocr_local_source_seeds_v1", "record_id": record.get("id"),
+             "status": "not_run", "maximum_seed_count": maximum_seeds,
+             "maximum_hypotheses_per_seed": 24, "maximum_native_segments": 96,
+             "maximum_roi_pixels": 2_000_000, "time_limit_seconds": maximum_seconds,
+             "attempted_seed_count": 0, "accepted_observation_count": 0,
+             "candidate_seed_count": 0, "seed_attempts": [],
+             "api_proposal_used": False, "nominal_used_to_rank": False, "ground_truth_used": False}
+    def finish(result, status):
+        exhausted = status in {"time_budget_exhausted", "seed_budget_exhausted"}
+        audit.update(status=status, verified_observation_count=len(result),
+                     accepted_observation_count=0 if exhausted else len(result),
+                     uninspected_seed_count=max(0, audit["candidate_seed_count"]-audit["attempted_seed_count"]),
+                     elapsed_seconds=round(time.monotonic()-started, 6))
+        if exhausted:
+            # Unvisited seeds may contain a competing physical arrow. A valid
+            # partial observation is diagnostic, never a uniqueness proof.
+            audit.update(acceptance_withheld_reason="uninspected_source_seed_competitors",
+                         diagnostic_only_observations=result)
+            return [], audit
+        return result, audit
+    box = _box(record)
+    boundary = np.asarray(boundary_points, float)
+    if (gray is None or gray.ndim != 2 or box is None or
+            record.get("parsed", {}).get("kind") != "radius" or
+            boundary.ndim != 2 or boundary.shape[1] != 2 or not len(boundary) or
+            not np.isfinite(boundary).all()):
+        return finish([], "invalid_source_input")
+    text_points = _source_text_pixels(gray, record)
+    if text_points is None:
+        return finish([], "source_text_ink_unavailable")
+    low, high = box.min(axis=0), box.max(axis=0)
+    size = max(12., float(np.linalg.norm(high-low)))
+    padding = min(384., max(48., size))
+    left, top = np.maximum(0, np.floor(low-padding)).astype(int)
+    right, bottom = np.minimum([gray.shape[1], gray.shape[0]], np.ceil(high+padding)).astype(int)
+    audit["seed_roi_px"] = [int(left), int(top), int(right), int(bottom)]
+    prelocalization_band = max(10., band*1.7)+.65*max(7., min(90., size*.52))
+    # Boundary proximity only bounds hypotheses. A current fitted radius or an
+    # OCR numeric value never ranks seeds or establishes their acceptance.
+    from scipy.spatial import cKDTree
+    tree = cKDTree(boundary)
+    seeds = []
+    for segment in native_radius_leader_segments(gray, record, records):
+        for shaft, tip in (segment, segment[::-1]):
+            label_gap = float(np.linalg.norm(np.maximum(low-shaft, 0.)+np.minimum(high-shaft, 0.)))
+            direction = tip-shaft
+            length = float(np.linalg.norm(direction))
+            if label_gap > max(18., size*.75) or length < 6.:
+                continue
+            direction /= length
+            ray_gap = _label_ray_entry(shaft, -direction, low-2., high+2., max(18., size*.75))
+            target_gap = float(tree.query(tip)[0])
+            if ray_gap is None or target_gap > prelocalization_band:
+                continue
+            proposal = {"record_id": record.get("id"), "shaft_px": shaft.tolist(), "tip_px": tip.tolist()}
+            seeds.append((label_gap+.5*target_gap, proposal))
+    seeds.sort(key=lambda item: (item[0], item[1]["shaft_px"], item[1]["tip_px"]))
+    audit["candidate_seed_count"] = len(seeds)
+    accepted = []
+    for _, proposal in seeds[:maximum_seeds]:
+        if time.monotonic()-started >= maximum_seconds:
+            return finish(accepted, "time_budget_exhausted")
+        audit["attempted_seed_count"] += 1
+        receipt = {"seed_segment_px": [proposal["shaft_px"], proposal["tip_px"]]}
+        evidence = localize_source_arrow_proposal(gray, record, proposal, boundary, band, contours,
+                                                 verifier=verifier)
+        if evidence is None:
+            receipt["status"] = "full_source_verification_failed"
+        else:
+            attachment = source_arrow_label_attachment(gray, record, evidence, text_points=text_points)
+            receipt["text_shaft_attachment"] = attachment
+            if not attachment.get("strong_text_adjacency"):
+                receipt["status"] = "source_text_shaft_attachment_insufficient"
+            else:
+                receipt.update(status="locally_verified_pending_global_ownership",
+                               tip_px=evidence["arrowhead"]["tip_px"])
+                accepted.append({**evidence, "method": "ocr_local_source_arrow_with_full_shaft_verified",
+                    "proposal_origin": "bounded_ocr_local_source_seeds", "model_proposal_used": False,
+                    "source_text_shaft_attachment": attachment,
+                    "source_seed": {"segment_px": receipt["seed_segment_px"],
+                                    "api_proposal_used": False, "nominal_used_to_rank": False}})
+        audit["seed_attempts"].append(receipt)
+    return finish(accepted, "seed_budget_exhausted" if len(seeds) > maximum_seeds else "completed")
 
 
 def source_arrow_hypotheses(gray, record, proposal, *, limit=24):

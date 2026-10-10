@@ -18,10 +18,13 @@ import time
 
 import numpy as np
 from scipy.optimize import OptimizeResult, least_squares, minimize
+from scipy.linalg import qr
 from scipy.sparse import lil_matrix
 from scipy.spatial import cKDTree
 from .topology import _primitive_distance
 from .vectorize import _sample_entities, _line_entities, assess_fit_quality
+from .relation_contract import (STRICT_TANGENT_CERT_TOLERANCE_DEG,
+                                STRICT_RELATION_ENDPOINT_TOLERANCE)
 
 LINEAR_TOLERANCE_MM = .05
 ANGLE_TOLERANCE_DEG = .1
@@ -458,6 +461,54 @@ def _strict_ocr_angle_contract(entities,specs):
             "binding_verified_by_solver":False,"reference_verified":False}
 
 
+def _strict_tangent_contract(entities,constraints):
+    """Certify only admitted joint relations, including finite forward traversal.
+
+    A zero cross product alone also describes reversed tangents or degenerate
+    vectors. Neither is a valid G1 joint. The directed angular measurement and
+    endpoint checks remain independent of the optimizer's equality row basis.
+    """
+    indexed={entity["id"]:entity for entity in entities};checks=[]
+    for row in constraints:
+        if row["kind"]!="tangent":continue
+        first,second=(indexed[eid] for eid in row["entities"]);joint=row["nodes"][0]
+        points=[entity["end"] if entity["end_node"]==joint else entity["start"]
+                for entity in (first,second)]
+        lengths=[math.dist(entity["start"],entity["end"]) for entity in (first,second)]
+        vectors=[_tangent(entity,entity["end_node"]==joint) for entity in (first,second)]
+        gap=math.dist(*points);dot=float(np.dot(*vectors));angle=abs(_angle(*vectors,True))
+        finite=bool(all(math.isfinite(value) and value>1e-9 for value in lengths) and
+                    all(np.isfinite(vector).all() for vector in vectors))
+        checks.append({"constraint_id":row["id"],"entity_ids":row["entities"],"joint_node":joint,
+                       "absolute_error_deg":angle,"endpoint_gap":gap,"forward_dot":dot,
+                       "finite_supports":finite,"passed":bool(finite and dot>0. and
+                       gap<=STRICT_RELATION_ENDPOINT_TOLERANCE and
+                       angle<=STRICT_TANGENT_CERT_TOLERANCE_DEG)})
+    return {"mode":"normalized_tangent_cross_equality_with_forward_orientation",
+            "scope":"supplied_validated_tangent_constraints_only",
+            "required_count":len(checks),"satisfied":all(row["passed"] for row in checks),
+            "numerical_certificate_tolerance_deg":STRICT_TANGENT_CERT_TOLERANCE_DEG,
+            "endpoint_certificate_tolerance":STRICT_RELATION_ENDPOINT_TOLERANCE,
+            "checks":checks,"unbound_joint_coverage_verified":False}
+
+
+def _independent_equality_rows(jacobian):
+    """Select a well-conditioned local row basis without discarding obligations.
+
+    SLSQP rejects redundant equality rows (even if they describe valid geometry).
+    Every original row is still measured and certified before publication. Rank
+    reduction concerns the numerical subproblem only, never annotation coverage.
+    """
+    if not len(jacobian):return np.empty(0,dtype=int),0.
+    norms=np.linalg.norm(jacobian,axis=1)
+    scaled=jacobian/np.maximum(norms[:,None],1e-15)
+    _,triangular,pivots=qr(scaled.T,mode="economic",pivoting=True)
+    diagonal=np.abs(np.diag(triangular))
+    tolerance=max(float(diagonal[0])*1e-10,1e-12) if len(diagonal) else 1e-12
+    rank=int(np.count_nonzero(diagonal>tolerance))
+    return np.sort(pivots[:rank]),tolerance
+
+
 def _constructed_radius_invariants(graph,entities):
     """Preserve implemented geometry without treating history as a binding.
 
@@ -734,6 +785,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
         else:exact_radii[entity_id]=radius
     unverified_preservation_count=sum(row["entity_id"] not in bound_radii for row in preserved_radii)
     strict_angles=_strict_ocr_angle_specs(baseline,prepared)
+    strict_tangents=[row for row in prepared if row["kind"]=="tangent"]
     strict_angle_setup_issues=[{"record_id":spec["row"]["record_id"],
                                 "reason":spec["setup_issue"]} for spec in strict_angles if spec["setup_issue"]]
     initial,lower,upper,decode,scale,node_indices,arc_params,branches=_model(nodes,baseline,exact_radii)
@@ -753,6 +805,8 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                            "strict_ocr_angle_certificate_tolerance_deg":STRICT_OCR_ANGLE_CERT_TOLERANCE_DEG,
                            "strict_ocr_angle_record_count":len(strict_angles),
                            "strict_ocr_angle_equality_count":len({spec["entity_id"] for spec in strict_angles}),
+                           "strict_tangent_certificate_tolerance_deg":STRICT_TANGENT_CERT_TOLERANCE_DEG,
+                           "strict_tangent_constraint_count":len(strict_tangents),
                            "radius_tolerance_mm":0.,"eliminated_exact_radius_constraint_count":len(bound_radii),
                            "eliminated_constructed_geometry_radius_count":unverified_preservation_count,
                            "preserved_geometry_is_dimensional_evidence":False,
@@ -762,6 +816,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                            "prior_weight":.1,"variable_count":count,"max_displacement_fraction":MAX_DISPLACEMENT_FRACTION},
             "strict_radius_contract":_strict_radius_contract(baseline,prepared),
             "strict_ocr_angle_contract":_strict_ocr_angle_contract(baseline,strict_angles),
+            "strict_tangent_contract":_strict_tangent_contract(baseline,strict_tangents),
             "constructed_radius_preservation":_constructed_radius_receipt(baseline,preserved_radii,ignored_preservation),
             "all_dimensions_verified":False,"dimension_solve_success":False,"engineering_verified":False}
     if conflicting_radii:
@@ -794,7 +849,14 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
         residuals=[]
         for row in prepared:
             spec=strict_angle_by_id.get(row["id"])
-            if spec is None:
+            if row["kind"]=="tangent":
+                first,second=(emap[eid] for eid in row["entities"]);joint=row["nodes"][0]
+                a=_tangent(first,first["end_node"]==joint)
+                b=_tangent(second,second["end_node"]==joint)
+                # Smooth through zero; directed forward orientation is a
+                # separate optimizer inequality and final certificate.
+                residuals.append(math.degrees(float(a[0]*b[1]-a[1]*b[0])))
+            elif spec is None:
                 residuals.append(_constraint_residual(row,_constraint_value(row,nmap,emap)))
             else:
                 # Signed, smooth endpoint-direction residual. The ordinary
@@ -894,10 +956,17 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
     source_lengths=np.array([math.dist(entity["start"],entity["end"]) if entity["type"]=="LINE" else
                              entity["radius"]*_sweep(entity) for entity in initial_entities])
     shape_weights=SOURCE_CURVE_PRIOR_WEIGHT*np.sqrt(len(nodes)*source_lengths/max(float(source_lengths.sum()),1e-12)/shape_sample_count)
+    strict_relation_indices=[index for index,row in enumerate(prepared)
+                             if row["kind"]=="tangent" or row["id"] in strict_angle_by_id]
     def objective(reduced):
         if source_budget.enabled and source_budget.search_active:source_budget.guard(objective=True)
         vector=expand(reduced)
-        residuals=[constraint_residuals(vector),prior_weights[active]*(reduced-initial[active])]
+        dimensional_residuals=constraint_residuals(vector)
+        # Exact relation rows are imposed by the constrained optimizer. Adding
+        # their steep short-LINE derivatives to the soft objective as well
+        # needlessly damages conditioning and can overwhelm source priors.
+        dimensional_residuals[strict_relation_indices]=0.
+        residuals=[dimensional_residuals,prior_weights[active]*(reduced-initial[active])]
         if supported_shapes:
             _,decoded=decode(vector)
             residuals.extend((shape_weights[index]*(_sample_entity(decoded[index],shape_sample_count)-source_shapes[index])/scale).ravel()
@@ -912,13 +981,30 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
     try:
         linear_options={} if len(active)<=96 else {"jac_sparsity":sparse_active.tocsr(),"tr_solver":"lsmr",
                                                    "tr_options":{"atol":1e-12,"btol":1e-12,"maxiter":max(100,len(active)*5)}}
+        if strict_tangents and not exact_radii and raw_prior is None and not source_budget.enabled:
+            # With unconstrained ARC radii, a very short adjacent LINE can have
+            # an angular derivative thousands of times larger than the arc.
+            # A bounded least-squares seed approaches the relation manifold
+            # before SLSQP enforces the exact equalities. This is initialization
+            # only: no approximate seed is accepted or used as a certificate.
+            def relation_seed_objective(reduced):
+                return np.r_[constraint_residuals(expand(reduced)),
+                             prior_weights[active]*(reduced-initial[active])]
+            seed=least_squares(relation_seed_objective,starting[active],
+                bounds=(lower[active],upper[active]),max_nfev=200,
+                ftol=1e-11,xtol=1e-11,gtol=1e-9,x_scale=1.,**linear_options)
+            if np.isfinite(seed.x).all():starting[active]=seed.x
+            result["diagnostics"]["strict_relation_initialization"]={
+                "method":"bounded_relation_least_squares_seed_then_equality_solve",
+                "evaluations":int(seed.nfev),"converged":bool(seed.success),
+                "seed_is_accepted_solution":False,"thresholds_changed":False}
         # Coordinates and free center offsets share one bounding-box-normalized
         # length unit. Jacobian column rescaling would distort their common
         # source-prior metric, especially for short lines next to large arcs.
         # The unannotated path retains bounded least squares. Exact radii need
         # a constrained optimizer because their endpoint chords must fit their
         # annotated diameters; neither branch relaxes the acceptance checks.
-        if exact_radii or strict_angles or raw_prior is not None or source_budget.enabled:
+        if exact_radii or strict_angles or strict_tangents or raw_prior is not None or source_budget.enabled:
             def scalar_objective(reduced):
                 residuals=objective(reduced)
                 return float(np.dot(residuals,residuals)/2)
@@ -935,6 +1021,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                     jacobian[index,a:a+2]=delta;jacobian[index,b:b+2]=-delta
                 return jacobian[:,active]
             optimizer_constraints=[{"type":"ineq","fun":chord_feasibility,"jac":chord_jacobian}] if exact_radii else []
+            equality_functions=[];equality_jacobians=[];equality_ids=[]
             if strict_angles:
                 # One fixed, source-graph quadrant turns an acute unsigned
                 # angle into a linear equation on the LINE's shared endpoints.
@@ -970,9 +1057,59 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                         jacobian[index,a:a+2]=-direction/length
                         jacobian[index,b:b+2]=direction/length
                     return jacobian[:,active]
-                optimizer_constraints.extend([
-                    {"type":"eq","fun":angle_direction_equalities,"jac":angle_direction_jacobian},
-                    {"type":"ineq","fun":angle_quadrant_feasibility,"jac":angle_quadrant_jacobian}])
+                equality_functions.append(angle_direction_equalities)
+                equality_jacobians.append(angle_direction_jacobian)
+                equality_ids.extend(next(spec["row"]["id"] for spec in strict_angles
+                                         if spec["entity_id"]==entity_id) for entity_id in
+                                    dict.fromkeys(spec["entity_id"] for spec in strict_angles))
+                optimizer_constraints.append(
+                    {"type":"ineq","fun":angle_quadrant_feasibility,"jac":angle_quadrant_jacobian})
+            if strict_tangents:
+                def tangent_vectors(reduced):
+                    _,decoded=decode(expand(reduced));indexed={entity["id"]:entity for entity in decoded}
+                    return [tuple(_tangent(indexed[eid],indexed[eid]["end_node"]==row["nodes"][0])
+                                  for eid in row["entities"]) for row in strict_tangents]
+                def tangent_equalities(reduced):
+                    return np.array([a[0]*b[1]-a[1]*b[0] for a,b in tangent_vectors(reduced)])
+                def tangent_jacobian(reduced):
+                    return _finite_difference_jacobian(tangent_equalities,reduced)
+                def tangent_forward_feasibility(reduced):
+                    return np.array([float(np.dot(a,b))-1e-8 for a,b in tangent_vectors(reduced)])
+                equality_functions.append(tangent_equalities);equality_jacobians.append(tangent_jacobian)
+                equality_ids.extend(row["id"] for row in strict_tangents)
+                optimizer_constraints.append({"type":"ineq","fun":tangent_forward_feasibility})
+            if equality_functions:
+                def all_equalities(reduced):
+                    return np.concatenate([function(reduced) for function in equality_functions])
+                def all_equality_jacobians(reduced):
+                    return np.vstack([function(reduced) for function in equality_jacobians])
+                equality_basis,equality_rank_tolerance=_independent_equality_rows(
+                    all_equality_jacobians(starting[active]))
+                omitted=np.setdiff1d(np.arange(len(equality_ids)),equality_basis)
+                if len(equality_basis):
+                    optimizer_constraints.append({"type":"eq",
+                        "fun":lambda value:all_equalities(value)[equality_basis],
+                        "jac":lambda value:all_equality_jacobians(value)[equality_basis]})
+                if len(omitted):
+                    # Numerically dependent rows cannot all enter SLSQP's
+                    # equality matrix. Keep them guarded well inside the same
+                    # strict floating-point certificate and recheck ALL rows.
+                    reserve=.25*math.sin(math.radians(min(STRICT_TANGENT_CERT_TOLERANCE_DEG,
+                                                         STRICT_OCR_ANGLE_CERT_TOLERANCE_DEG)))
+                    def dependent_equality_guard(value):
+                        residual=all_equalities(value)[omitted]
+                        return np.r_[reserve-residual,reserve+residual]
+                    def dependent_equality_jacobian(value):
+                        jacobian=all_equality_jacobians(value)[omitted]
+                        return np.vstack([-jacobian,jacobian])
+                    optimizer_constraints.append({"type":"ineq","fun":dependent_equality_guard,
+                                                  "jac":dependent_equality_jacobian})
+                result["diagnostics"]["strict_equality_system"]={
+                    "required_count":len(equality_ids),"optimizer_basis_count":len(equality_basis),
+                    "basis_constraint_ids":[equality_ids[index] for index in equality_basis],
+                    "dependent_constraint_ids":[equality_ids[index] for index in omitted],
+                    "rank_tolerance":equality_rank_tolerance,
+                    "dependent_rows_numerically_guarded":True,"all_original_rows_finally_certified":True}
             if source_budget.enabled:
                 # Unlike RMS penalties, a dimensional inequality cannot trade
                 # a correctly bound annotation against a better source fit.
@@ -1005,6 +1142,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                 source_budget.diagnostics.update(maximum_feasibility_iterations_per_round=120,
                     maximum_RMS_iterations_per_round=180,maximum_warm_RMS_iterations=80,dimensional_tolerances_changed=False,
                     strict_ocr_angle_equalities_active=bool(strict_angles),
+                    strict_tangent_equalities_active=bool(strict_tangents),
                     feasibility_objective="minimum_movement_regularizer; annotations, boundary and unchanged displacement guard are inequalities")
                 def feasibility_objective(value):
                     source_budget.guard(objective=True)
@@ -1021,7 +1159,9 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                     return bool(np.max(np.abs(constraint_residuals(expand(value))))<=1. and
                                 (not exact_radii or np.min(chord_feasibility(value))>=-1e-10) and
                                 (not strict_angles or _strict_ocr_angle_contract(
-                                    decode(expand(value))[1],strict_angles)["satisfied"]))
+                                    decode(expand(value))[1],strict_angles)["satisfied"]) and
+                                (not strict_tangents or _strict_tangent_contract(
+                                    decode(expand(value))[1],strict_tangents)["satisfied"]))
                 def complete_geometry_passed(value):
                     nmap,decoded=decode(expand(value));guard=_geometry_validation(decoded,branches,scale)
                     node_distance=max(float(np.linalg.norm(nmap[node["id"]]-np.array([node["x"],node["y"]]))) for node in nodes)
@@ -1097,6 +1237,8 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                                     "acceptance_basis":"independently_verified_feasible_checkpoint",
                                     "strict_ocr_angle_contract":_strict_ocr_angle_contract(
                                         decode(expand(reduced))[1],strict_angles),
+                                    "strict_tangent_contract":_strict_tangent_contract(
+                                        decode(expand(reduced))[1],strict_tangents),
                                     "source_image_gate_not_evaluated":True,"ground_truth_used":False,
                                     "round":round_index+1},ensure_ascii=False,indent=2),encoding="utf8")
                             if not feasibility_fit.success:
@@ -1157,17 +1299,23 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
         if not np.isfinite(solved_vector).all():raise FloatingPointError("Nonfinite optimization result")
         entity_map={entity["id"]:entity for entity in candidate};checks=[]
         candidate_angle_contract=_strict_ocr_angle_contract(candidate,strict_angles)
+        candidate_tangent_contract=_strict_tangent_contract(candidate,strict_tangents)
+        strict_tangent_checks={row["constraint_id"]:row for row in candidate_tangent_contract["checks"]}
         strict_angle_checks={row["constraint_id"]:row for row in candidate_angle_contract["checks"]}
         for index,row in enumerate(prepared):
             actual=_constraint_value(row,node_map,entity_map);residual=_constraint_residual(row,actual)
             strict_angle=strict_angle_checks.get(row["id"])
+            strict_tangent=strict_tangent_checks.get(row["id"])
             tolerance=(0. if row["kind"]=="radius" else
+                       STRICT_TANGENT_CERT_TOLERANCE_DEG if strict_tangent else
                        STRICT_OCR_ANGLE_CERT_TOLERANCE_DEG if strict_angle else float(normalizers[index]))
             checks.append({**row,"actual":float(actual),"signed_residual":float(residual),"absolute_residual":float(abs(residual)),
                            "tolerance":tolerance,"residual_unit":"mm" if row["kind"] in _DIMENSIONAL else "degree",
                            "enforcement":"exact" if row["kind"]=="radius" else
+                                         "normalized_tangent_cross_equality" if strict_tangent else
                                          "linear_endpoint_direction_equality" if strict_angle else "fixed_tolerance",
                            "passed":bool(abs(residual)<=tolerance and
+                                         (strict_tangent is None or strict_tangent["passed"]) and
                                          (strict_angle is None or strict_angle["passed"])),
                            "binding_verified_by_solver":False})
         candidate_nodes=[{**node,"x":float(node_map[node["id"]][0]),"y":float(node_map[node["id"]][1])} for node in nodes]
@@ -1227,6 +1375,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
         validation.update(passed=accepted,geometry_valid=validation["passed"],constraint_subset_satisfied=all_passed,
                           strict_radius_satisfied=all(check["passed"] for check in checks if check["kind"]=="radius"),
                           strict_ocr_angle_satisfied=candidate_angle_contract["satisfied"],
+                          strict_tangent_satisfied=candidate_tangent_contract["satisfied"],
                           exact_radius_chords_feasible=chords_feasible,exact_radius_chord_checks=chord_checks,
                           all_dimensions_verified=False,dimensions_verified=False,reference_verified=False,engineering_certified=False,
                           underconstrained=underconstrained,source_displacement_passed=moved_safely,winding_preserved=same_winding,issues=issues)
@@ -1239,6 +1388,8 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
         result["strict_radius_contract"]=_strict_radius_contract(result["entities"],prepared)
         result["candidate_strict_ocr_angle_contract"]=candidate_angle_contract
         result["strict_ocr_angle_contract"]=_strict_ocr_angle_contract(result["entities"],strict_angles)
+        result["candidate_strict_tangent_contract"]=candidate_tangent_contract
+        result["strict_tangent_contract"]=_strict_tangent_contract(result["entities"],strict_tangents)
         result["candidate_constructed_radius_preservation"]=_constructed_radius_receipt(candidate,preserved_radii,ignored_preservation)
         result["constructed_radius_preservation"]=_constructed_radius_receipt(result["entities"],preserved_radii,ignored_preservation)
         result["diagnostics"].update(converged=optimizer_converged,optimizer_converged=optimizer_converged,
@@ -1248,7 +1399,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                                      optimizer_message=str(fit.message),
                                      optimizer_parameter_scaling="common_bbox_normalized_length_unit",
                                      cost=float(fit.cost),optimality=float(fit.optimality),constraint_rank=rank,rank_tolerance=rank_tolerance,
-                                     optimality_measure="feasibility_movement_gradient_inf_norm_not_RMS_optimality_or_KKT" if source_budget.enabled and not source_budget.diagnostics.get("RMS_refinement_accepted") else "objective_gradient_inf_norm_not_KKT" if exact_radii or strict_angles or raw_prior is not None else "least_squares_first_order_optimality",
+                                     optimality_measure="feasibility_movement_gradient_inf_norm_not_RMS_optimality_or_KKT" if source_budget.enabled and not source_budget.diagnostics.get("RMS_refinement_accepted") else "objective_gradient_inf_norm_not_KKT" if exact_radii or strict_angles or strict_tangents or raw_prior is not None else "least_squares_first_order_optimality",
                                      singular_values=singular.tolist(),remaining_dof=remaining,rigid_gauge_dof=int(gauge_dof),remaining_shape_dof=shape_dof,
                                      numerical_remaining_shape_dof=numerical_shape_dof,
                                      rank_excludes_soft_prior=True,independent_dimension_record_count=len(dimensional_checks),
@@ -1263,8 +1414,8 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                                                          "weighting":"source_arclength_quadrature",
                                                          "admission":"finite_nonnegative_source_fit_error_receipt",
                                                          "source":"input_graph_entities","hard_constraint":False},
-                                     optimizer="SLSQP_bounded_source_budget_feasibility_then_RMS" if source_budget.enabled else "SLSQP_exact_radius_chord_inequalities" if exact_radii else "SLSQP_strict_ocr_angle_equalities" if strict_angles else "SLSQP_source_observation" if raw_prior is not None else "bounded_least_squares",
-                                     linear_subsolver="SLSQP" if exact_radii or strict_angles or raw_prior is not None else "exact_dense" if len(active)<=96 else "bounded_sparse_lsmr",
+                                     optimizer="SLSQP_bounded_source_budget_feasibility_then_RMS" if source_budget.enabled else "SLSQP_strict_joint_equalities" if strict_tangents else "SLSQP_exact_radius_chord_inequalities" if exact_radii else "SLSQP_strict_ocr_angle_equalities" if strict_angles else "SLSQP_source_observation" if raw_prior is not None else "bounded_least_squares",
+                                     linear_subsolver="SLSQP" if exact_radii or strict_angles or strict_tangents or raw_prior is not None else "exact_dense" if len(active)<=96 else "bounded_sparse_lsmr",
                                      maximum_node_displacement=displacement,maximum_parameterized_curve_displacement=shape_displacement,
                                      displacement_limit=movement_limit,displacement_unit=graph["units"],
                                      distance_axis_semantics="signed nodes[1] minus nodes[0]; x right, y up",
