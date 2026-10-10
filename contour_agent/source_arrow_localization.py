@@ -67,7 +67,7 @@ def source_label_shaft_ownership(gray, record, tip, direction, *, inspect_parall
     if not through_label and not inspect_parallel_family:
         return result
     offsets = []
-    for segment in native_radius_leader_segments(gray, record):
+    for segment in native_radius_leader_segments(gray, record, parallel_context=True):
         delta = segment[1]-segment[0]
         length = float(np.linalg.norm(delta))
         if length < max(30., .45*size) or abs(float(np.dot(delta/length, away))) < math.cos(math.radians(5.)):
@@ -542,20 +542,25 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
     return accepted, rejected, audit
 
 
-def native_radius_leader_segments(gray, record, records=(), *, limit=96):
+def native_radius_leader_segments(gray, record, records=(), *, limit=96, audit=None, parallel_context=False):
     """Observe short label-adjacent strokes without shrinking the source image.
 
     These are detection hypotheses only. They must subsequently pass the full
     source arrow, label ray and shaft verifier, including unmasked text strokes.
     """
-    from .constraint_binding import _box
+    from .constraint_binding import _box, _label_ray_entry
+    receipt = audit if audit is not None else {}
+    receipt.update(status="invalid_source_input", search_complete=False,
+                   raw_segment_counts=[], maximum_detector_roi_pixels=2_000_000,
+                   maximum_native_segments=min(96, max(1, limit)))
     if gray is None or gray.ndim != 2 or record.get("parsed", {}).get("kind") != "radius":
         return []
     box = _box(record)
     if box is None:
         return []
     low, high = box.min(axis=0), box.max(axis=0)
-    padding = min(384., max(48., float(np.linalg.norm(high-low))))
+    label_size = max(12., float(np.linalg.norm(high-low)))
+    padding = min(384., max(48., label_size))
     left, top = np.maximum(0, np.floor(low-padding)).astype(int)
     right, bottom = np.minimum([gray.shape[1], gray.shape[0]], np.ceil(high+padding)).astype(int)
     if right <= left or bottom <= top or (right-left)*(bottom-top) > 2_000_000:
@@ -567,15 +572,41 @@ def native_radius_leader_segments(gray, record, records=(), *, limit=96):
         if other is not None:
             cv2.fillPoly(masked, [np.rint(other-[left, top]).astype(np.int32)], 255)
     segments = []
+    def could_belong_to_label(points):
+        for shaft, tip in (points, points[::-1]):
+            gap = float(np.linalg.norm(np.maximum(low-shaft, 0.)+np.minimum(high-shaft, 0.)))
+            direction = tip-shaft
+            length = float(np.linalg.norm(direction))
+            if gap <= max(18., label_size*.75) and length >= 6.:
+                if _label_ray_entry(shaft, -direction/length, low-2., high+2.,
+                                    max(18., label_size*.75)) is not None:
+                    return True
+        return False
     for observed in (masked, original):
         raw = cv2.HoughLinesP(cv2.Canny(observed, 70, 180), 1., np.pi/720,
                               threshold=22, minLineLength=22, maxLineGap=6)
-        for item in ([] if raw is None else raw[:500]):
+        receipt["raw_segment_counts"].append(0 if raw is None else len(raw))
+        for item in ([] if raw is None else raw):
             points = np.asarray(item[0], float).reshape(2, 2)+[left, top]
+            if not parallel_context and not could_belong_to_label(points):
+                continue
             if not any(np.max(np.linalg.norm(points-old, axis=1)) < 1.5 or
                        np.max(np.linalg.norm(points[::-1]-old, axis=1)) < 1.5 for old in segments):
                 segments.append(points)
-    return sorted(segments, key=lambda pair: -float(np.linalg.norm(pair[1]-pair[0])))[:min(96, max(1, limit))]
+    ordered = sorted(segments, key=lambda pair: -float(np.linalg.norm(pair[1]-pair[0])))
+    if parallel_context:
+        # This view supplies surrounding strokes solely to detect a rejecting
+        # repetitive pattern. It is never an inventory of arrow candidates or
+        # a claim that a surviving arrow has unique label/target ownership.
+        return ordered[:receipt["maximum_native_segments"]]
+    incomplete = len(ordered) > receipt["maximum_native_segments"]
+    receipt.update(status="native_segment_budget_exhausted" if incomplete else "completed",
+                   search_complete=not incomplete, observed_native_segment_count=len(ordered))
+    if incomplete:
+        receipt.update(acceptance_withheld_reason="uninspected_source_segment_competitors",
+                       diagnostic_only_segments=[p.tolist() for p in ordered[:receipt["maximum_native_segments"]]])
+        return []
+    return ordered
 
 
 def verify_source_hough_leader(gray, record, segment, boundary_points, band, contours=None, *, verifier=None):
@@ -621,7 +652,7 @@ def localize_ocr_radius_arrows(gray, record, records, boundary_points, band, con
              "candidate_seed_count": 0, "seed_attempts": [],
              "api_proposal_used": False, "nominal_used_to_rank": False, "ground_truth_used": False}
     def finish(result, status):
-        exhausted = status in {"time_budget_exhausted", "seed_budget_exhausted"}
+        exhausted = status in {"time_budget_exhausted", "seed_budget_exhausted", "inner_search_incomplete"}
         audit.update(status=status, verified_observation_count=len(result),
                      accepted_observation_count=0 if exhausted else len(result),
                      uninspected_seed_count=max(0, audit["candidate_seed_count"]-audit["attempted_seed_count"]),
@@ -655,7 +686,12 @@ def localize_ocr_radius_arrows(gray, record, records, boundary_points, band, con
     from scipy.spatial import cKDTree
     tree = cKDTree(boundary)
     seeds = []
-    for segment in native_radius_leader_segments(gray, record, records):
+    native_audit = {}
+    native_segments = native_radius_leader_segments(gray, record, records, audit=native_audit)
+    audit["native_segment_search"] = native_audit
+    if native_audit.get("search_complete") is False:
+        return finish([], "inner_search_incomplete")
+    for segment in native_segments:
         for shaft, tip in (segment, segment[::-1]):
             label_gap = float(np.linalg.norm(np.maximum(low-shaft, 0.)+np.minimum(high-shaft, 0.)))
             direction = tip-shaft
@@ -677,8 +713,14 @@ def localize_ocr_radius_arrows(gray, record, records, boundary_points, band, con
             return finish(accepted, "time_budget_exhausted")
         audit["attempted_seed_count"] += 1
         receipt = {"seed_segment_px": [proposal["shaft_px"], proposal["tip_px"]]}
+        inner_audit = {}
         evidence = localize_source_arrow_proposal(gray, record, proposal, boundary, band, contours,
-                                                 verifier=verifier)
+                                                 verifier=verifier, audit=inner_audit)
+        receipt["source_localization_search"] = inner_audit
+        if inner_audit.get("search_complete") is False:
+            receipt["status"] = "inner_search_incomplete"
+            audit["seed_attempts"].append(receipt)
+            return finish(accepted, "inner_search_incomplete")
         if evidence is None:
             receipt["status"] = "full_source_verification_failed"
         else:
@@ -698,9 +740,14 @@ def localize_ocr_radius_arrows(gray, record, records, boundary_points, band, con
     return finish(accepted, "seed_budget_exhausted" if len(seeds) > maximum_seeds else "completed")
 
 
-def source_arrow_hypotheses(gray, record, proposal, *, limit=24):
+def source_arrow_hypotheses(gray, record, proposal, *, limit=24, audit=None):
     """Find nearby native-resolution shaft strokes, retaining tight pixel bounds."""
     from .constraint_binding import _box, _label_ray_entry
+    receipt = audit if audit is not None else {}
+    maximum = min(24, max(1, limit))
+    receipt.update(status="invalid_source_input", search_complete=False,
+                   maximum_hypotheses=maximum, maximum_detector_roi_pixels=2_000_000,
+                   raw_segment_counts=[], enumerated_hypothesis_count=0)
     if (record.get("parsed", {}).get("kind") != "radius" or not isinstance(proposal, dict) or
             proposal.get("record_id", record.get("id")) != record.get("id")):
         return []
@@ -740,9 +787,11 @@ def source_arrow_hypotheses(gray, record, proposal, *, limit=24):
     for observed in (crop, unmasked):
         raw_segments = cv2.HoughLinesP(cv2.Canny(observed, 70, 180), 1., np.pi/1440,
                                       threshold=12, minLineLength=12, maxLineGap=5)
+        receipt["raw_segment_counts"].append(0 if raw_segments is None else len(raw_segments))
         if raw_segments is not None:
-            segments.extend(raw_segments[:500])
+            segments.extend(raw_segments)
     if not segments:
+        receipt.update(status="completed", search_complete=True)
         return []
     choices = []
     for raw in segments:
@@ -793,21 +842,38 @@ def source_arrow_hypotheses(gray, record, proposal, *, limit=24):
                math.dist(candidate["shaft_px"], old["proposal"]["shaft_px"]) < 1.5 for old in result):
             continue
         result.append({"proposal": candidate, "localization": audit})
-        if len(result) >= min(24, max(1, limit)):
+        # Inspect one extra distinct hypothesis to distinguish an exactly full
+        # completed search from a truncated set with unchecked competitors.
+        if len(result) > maximum:
             break
+    incomplete = len(result) > maximum
+    receipt.update(status="hypothesis_budget_exhausted" if incomplete else "completed",
+                   search_complete=not incomplete, enumerated_hypothesis_count=len(result),
+                   observed_choice_count=len(choices))
+    if incomplete:
+        receipt.update(acceptance_withheld_reason="uninspected_source_hypothesis_competitors",
+                       diagnostic_only_hypotheses=result[:maximum])
+        return []
     return result
 
 
-def localize_source_arrow_proposal(gray, record, proposal, boundary_points, band, contours=None, *, verifier=None):
+def localize_source_arrow_proposal(gray, record, proposal, boundary_points, band, contours=None, *, verifier=None, audit=None):
     """Verify directly, then search bounded ink corrections without weaker gates."""
     if verifier is None:
         from .constraint_binding import verify_source_arrow_proposal
         verifier = verify_source_arrow_proposal
+    receipt = audit if audit is not None else {}
     direct = verifier(gray, record, proposal, boundary_points, band, contours)
     if direct is not None:
+        receipt.update(status="direct_proposal_verified", search_complete=True,
+                       local_search_performed=False)
         return direct
     accepted = []
-    for candidate in source_arrow_hypotheses(gray, record, proposal):
+    hypotheses = source_arrow_hypotheses(gray, record, proposal, audit=receipt)
+    receipt["local_search_performed"] = True
+    if receipt.get("search_complete") is False:
+        return None
+    for candidate in hypotheses:
         evidence = verifier(gray, record, candidate["proposal"], boundary_points, band, contours)
         if evidence is not None:
             accepted.append({**evidence, "source_pixel_localization": candidate["localization"]})

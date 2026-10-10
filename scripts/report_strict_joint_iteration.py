@@ -177,6 +177,92 @@ def _binding_receipt(stage):
             "scope": "Latest online binding attempt; selected publication may retain an earlier verified numerical result."}
 
 
+def _solution_publication_link(model, solution, manifest, frozen_receipts):
+    """Geometry equality alone also matches a rejected solver's baseline."""
+    published = model.get("parameterization") or {}
+    checks = {"solution_accepted": solution.get("accepted") is True,
+              "published_solver_accepted": (published.get("solver") or {}).get("accepted") is True,
+              "published_subset_accepted": published.get("constraint_subset_accepted") is True or published.get("accepted") is True,
+              "frozen_export_and_receipts_verified": frozen_receipts.get("passed") is True,
+              "solution_geometry_matches": False, "candidate_geometry_matches": False,
+              "source_obligations_match": False,
+              "solver_diagnostics_agree": all((solution.get("diagnostics") or {}).get(key) ==
+                  ((published.get("solver") or {}).get("diagnostics") or {}).get(key)
+                  for key in ("remaining_shape_dof", "remaining_dof", "constraint_rank"))}
+    def geometry(values):
+        if not isinstance(values, list) or not values: raise ValueError("missing_geometry")
+        normalized = [_geometry(entity) for entity in values]
+        if len({entity["id"] for entity in normalized}) != len(normalized): raise ValueError("duplicate_entity_id")
+        return normalized
+    def obligations(values, entities):
+        if not isinstance(values, list) or not values: raise ValueError("no_formal_constraints")
+        indexed = {entity["id"]: entity for entity in entities}
+        result = {}
+        fields = ("kind", "entities", "nodes", "value", "record_id", "source", "reference_axis",
+                  "required", "nominal_source", "source_arrow_verified")
+        for row in values:
+            cid = row.get("id")
+            if not isinstance(cid, str) or not cid or cid in result: raise ValueError("invalid_constraint_identity")
+            item = {key: row.get(key) for key in fields}
+            item["entities"], item["nodes"] = row.get("entities", []), row.get("nodes", [])
+            if row.get("kind") in {"horizontal", "vertical"} and not item["nodes"] and len(item["entities"]) == 1:
+                entity = indexed[item["entities"][0]]
+                item["nodes"] = [entity["start_node"], entity["end_node"]]
+            if row.get("kind") == "angle": item["angle_mode"] = row.get("angle_mode", "unsigned")
+            result[cid] = item
+        return result
+    try:
+        current = geometry(model.get("entities"))
+        checks["solution_geometry_matches"] = geometry(solution.get("entities")) == current
+        checks["candidate_geometry_matches"] = geometry(solution.get("candidate_entities")) == current
+        checks["source_obligations_match"] = obligations(published.get("constraints"), current) == obligations(solution.get("constraints"), current)
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        issue = str(error)
+    else:
+        issue = None
+    return {"verified": all(checks.values()), "checks": checks, "issue": issue,
+            "prediction_sha256": manifest.get("prediction_sha256"),
+            "solution_receipt_sha256": (manifest.get("frozen_artifacts") or {}).get("parametric-solution.json"),
+            "scope": "Accepted solution and candidate geometry, source obligations, and immutable export receipts must agree; a rejected baseline match is insufficient."}
+
+
+def _attribute_scopes(published, solution, bindings, inventory, link):
+    constraints = published.get("constraints") or []
+    counts = published.get("binding_counts") or {}
+    records = inventory.get("all_records", inventory.get("records", []))
+    supported = {"radius", "diameter", "length", "angle"}
+    recognized_ids = {r.get("id") for r in records if isinstance(r, dict) and isinstance(r.get("id"), str)
+                      and (r.get("parsed") or {}).get("kind") in supported}
+    def count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    recognized = count(counts.get("recognized_dimensions"))
+    if recognized is None:
+        recognized = count((inventory.get("counts") or {}).get("recognized_dimensions"))
+        if recognized is None and records: recognized = len(recognized_ids)
+    attribute_kinds = {"radius", "distance", "distance_x", "distance_y", "angle"}
+    bound_ids = {c.get("record_id") for c in constraints if isinstance(c, dict) and
+                 c.get("kind") in attribute_kinds and isinstance(c.get("record_id"), str) and c["record_id"]}
+    diagnostics = (published.get("solver") or {}).get("diagnostics") or {}
+    solver_applies = bool(constraints and (published.get("solver") or {}).get("accepted") is True and
+                          (published.get("constraint_subset_accepted") is True or published.get("accepted") is True))
+    current = {"recognized_dimensions": recognized, "bound_source_records": len(bound_ids),
+               "unbound_dimensions": max(0, recognized - len(bound_ids)) if recognized is not None else None,
+               "formal_constraint_count": len(constraints), "bound_record_ids": sorted(bound_ids),
+               "remaining_shape_dof": diagnostics.get("remaining_shape_dof") if solver_applies else None,
+               "dof_source": "published_model_solver" if solver_applies else "not_certified_for_current_export",
+               "recognized_source": "published_model" if count(counts.get("recognized_dimensions")) is not None else "source_ocr_inventory",
+               "scope": "Current published model obligations only; no binding or DOF fallback to a later candidate."}
+    attempt_counts = bindings.get("counts") or {}
+    attempted = {key: attempt_counts.get(key) for key in ("recognized_dimensions", "bound_source_records", "unbound_dimensions")}
+    attempted.update(formal_constraint_count=len(bindings.get("constraints") or []),
+                     remaining_shape_dof=(solution.get("diagnostics") or {}).get("remaining_shape_dof"),
+                     solver_status=solution.get("status"), solver_accepted=solution.get("accepted") is True,
+                     applies_to_current_core=link["verified"],
+                     diagnostics_geometry="accepted_solution" if solution.get("accepted") is True else "rejected_candidate",
+                     scope="Latest binding and optimization attempt; rejected candidate diagnostics do not describe the retained DXF.")
+    return current, attempted
+
+
 def collect_slot(root, version, suffix, case_id):
     run = root / f"angle-semantics-{version}-{suffix}"
     manifest = read(run / "run-manifest.json")
@@ -205,23 +291,30 @@ def collect_slot(root, version, suffix, case_id):
     model, stage = read(after / "model.json"), read(after / "parametric-stage.json")
     solution, bindings = read(after / "parametric-solution.json"), read(after / "constraint-bindings.json")
     published = model.get("parameterization") or {}
+    inventory = read(after / "binding-candidates.json")
     entities, constraints = model.get("entities", []), published.get("constraints", [])
     try:
         import ezdxf
         document = ezdxf.readfile(after / "drawing.dxf")
         strict = relation_checks(entities, constraints, dxf_document=document)
-        angles = _native_angle_checks(entities, constraints, read(after / "binding-candidates.json"), document)
+        angles = _native_angle_checks(entities, constraints, inventory, document)
         curved = _curved_join_audit(entities, constraints, document, strict)
         row.update(strict_audit_status="read_back", strict_relations=strict, angles=angles, curved_joins=curved)
     except (OSError, ValueError, TypeError, KeyError, IndexError) as error:
         row.update(strict_audit_status="readback_failed", strict_audit_failure_type=type(error).__name__)
         return row
-    diagnostics = (published.get("solver") or {}).get("diagnostics") or {}
-    if base["published_parameterization"].get("current_solution_receipt_matches_model"):
-        diagnostics = solution.get("diagnostics") or diagnostics
-    counts = published.get("binding_counts") or bindings.get("counts") or {}
-    row["attributes"] = {key: counts.get(key) for key in ("recognized_dimensions", "bound_source_records", "unbound_dimensions")}
-    row["attributes"]["remaining_shape_dof"] = diagnostics.get("remaining_shape_dof")
+    link = _solution_publication_link(model, solution, manifest, before)
+    row["solution_publication_link"] = link
+    row["attributes"], row["attempt_attributes"] = _attribute_scopes(published, solution, bindings, inventory, link)
+    # collect_attempt is a legacy collector: its geometry-only equality can
+    # match rejected solver baseline_entities. Correct the report's copy, not
+    # the collector or any historical/evaluation artifact.
+    current_receipt = base["published_parameterization"]
+    current_receipt["geometry_only_solution_match"] = current_receipt.get("current_solution_receipt_matches_model")
+    current_receipt["current_solution_receipt_matches_model"] = link["verified"]
+    current_receipt.update({key: row["attributes"][key] for key in ("recognized_dimensions", "bound_source_records", "remaining_shape_dof")})
+    if not link["verified"]:
+        current_receipt["maximum_recorded_constraint_residual_by_unit"] = {"mm": None, "degree": None}
     row["online_binding"] = _binding_receipt(stage)
     row["source_reconstruction_contract"] = (model.get("validation") or {}).get("reconstruction_contract")
     row["files"].update({"binding_receipt": f"{run.name}/after/parametric-stage.json",
@@ -229,6 +322,7 @@ def collect_slot(root, version, suffix, case_id):
     final_integrity = _frozen_receipts(run, manifest)
     row["audit_inputs_unchanged"] = final_integrity == before
     row["full_user_target_passed"] = bool(base.get("full_user_target_passed") and
+        row["attributes"]["formal_constraint_count"] > 0 and row["attributes"]["remaining_shape_dof"] == 0 and
         strict.get("passed") and strict.get("dxf_readback_performed") and not curved["mapping_issues"] and
         curved["unknown_count"] == 0 and angles["strict_native_satisfied_count"] == angles["recognized_count"] and
         row["audit_inputs_unchanged"])
@@ -306,6 +400,7 @@ def render(report):
     for row in report["rows"]:
         native, angles, strict = [row.get(key, {}) for key in ("native", "angles", "strict_relations")]
         reference, attributes, curved = [row.get(key, {}) for key in ("reference", "attributes", "curved_joins")]
+        attempt = row.get("attempt_attributes", {})
         types = native.get("native_types", {})
         object_count = native.get("native_object_count")
         cells = [row["case_id"], row["version"], row["status"],
@@ -317,7 +412,10 @@ def render(report):
                  val(reference.get("registered_max_mm")), val(reference.get("registered_rms_mm")),
                  ratio(reference.get("matched_primitive_count_1mm"), object_count),
                  ratio(attributes.get("bound_source_records"), attributes.get("recognized_dimensions")),
-                 val(attributes.get("remaining_shape_dof")), val(row.get("elapsed", {}).get("prediction_seconds")),
+                 val(attributes.get("remaining_shape_dof")),
+                 ratio(attempt.get("bound_source_records"), attempt.get("recognized_dimensions")),
+                 val(attempt.get("remaining_shape_dof")), val(attempt.get("solver_status")),
+                 val(row.get("elapsed", {}).get("prediction_seconds")),
                  "完整通过" if row["full_user_target_passed"] else "未完整达标"]
         table_rows.append("<tr>" + "".join(f"<td>{esc(value)}</td>" for value in cells) + "</tr>")
         online = row.get("online_binding", {})
@@ -336,6 +434,9 @@ def render(report):
         overlay = row.get("files", {}).get("overlay")
         image = f'<a href="{esc(quote(overlay, safe="/"))}"><img loading="lazy" src="{esc(quote(overlay, safe="/"))}" alt="{esc(row["case_id"])} {esc(row["version"])} 独立比较叠图"></a>' if overlay else ""
         details.append(f'<section><h2>{esc(row["case_id"])} · {esc(row["version"])}</h2><p>{links(row)}</p><p>{online_text}</p>{image}'
+                       '<details><summary>当前发布义务与最新候选诊断（分别记录）</summary><pre>' +
+                       esc(json.dumps({"current_export_attributes": attributes, "latest_attempt_attributes": attempt,
+                                       "solution_publication_link": row.get("solution_publication_link")}, ensure_ascii=False, indent=2)) + '</pre></details>'
                        f'<details><summary>所有含圆弧的接点（包括 ARC–ARC）</summary>{tables}</details>'
                        '<details><summary>API 分页与阶段收据</summary><pre>' + esc(json.dumps({"binding": online, "stages": row.get("transport", [])}, ensure_ascii=False, indent=2)) + '</pre></details></section>')
     coverage = report["coverage"]
@@ -353,10 +454,12 @@ def render(report):
                         '<th>完整图元变化</th><th>严格 G1 通过数变化</th><th>未知接点变化</th><th>形状自由度变化</th></tr></thead><tbody>'
                         + "".join(comparison_rows) + '</tbody></table></div></section>')
     headings = ["图纸", "版本", "运行状态", "原生对象", "精确 R / 已识别", "精确角 / 已识别", "严格 G1 / 已准入", "未知接点 / 含弧接点",
-                "最大误差 mm", "RMS mm", "完整图元 1 mm", "绑定尺寸 / 已识别", "形状自由度", "预测秒数", "完整目标"]
+                "最大误差 mm", "RMS mm", "完整图元 1 mm", "当前绑定 / 已识别", "当前形状自由度",
+                "最新候选绑定 / 已识别", "最新候选自由度", "最新求解状态", "预测秒数", "完整目标"]
     return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>标注与严格接点约束：{esc(version_title)} 在线测试</title><style>body{{font:15px/1.6 system-ui,sans-serif;margin:28px;color:#243540;background:#f6f8fa}}h1{{font-size:25px}}h2{{font-size:20px}}section{{margin:28px 0;padding:18px;background:white;border:1px solid #dfe5ea}}table{{border-collapse:collapse;width:100%;font-size:12px;background:white}}th,td{{border:1px solid #dfe5ea;padding:8px;text-align:left;white-space:nowrap}}th{{background:#eaf1f4}}.scroll{{overflow:auto}}a{{color:#086b7a}}img{{display:block;max-width:100%;max-height:600px;margin:14px auto}}pre{{white-space:pre-wrap;font-size:12px}}details{{margin-top:16px}}p{{max-width:1200px}}</style>'
             f'<h1>标注与严格接点约束：{esc(version_title)} 在线测试</h1><p>固定原图、OCR 和 GT 派生栅格掩膜的开发实验。轮廓接近不等于对象属性、连接关系或标注覆盖完整。该报告只重新审计已冻结的产物。</p>'
+            '<p>当前绑定与自由度仅描述已发布 DXF。最新候选即使已绑定标注，求解失败后也不能把其绑定数或自由度计入保留的轮廓；当前未认证自由度显示“—”。</p>'
             f'<p><strong>完整目标通过 {coverage["fully_passed_slots"]} / {coverage["expected_slots"]}</strong>；冻结原生审计 {coverage["frozen_audited_slots"]} 项，未运行 {coverage["not_run_slots"]} 项。失败与缺失结果没有从分母删除。</p>'
             '<div class="scroll"><table><thead><tr>' + "".join(f"<th>{esc(value)}</th>" for value in headings) + '</tr></thead><tbody>' + "".join(table_rows) + '</tbody></table></div>'
             + comparison_table + "".join(details) + '<section><h2>判读边界</h2><ul>' + "".join(f"<li>{esc(value)}</li>" for value in report["limits"]) + '</ul></section></html>')
@@ -374,6 +477,7 @@ def write_report(root, output_prefix="strict-joint-review-20261010", versions=VE
             continue
         filename = row["run"] + "-" + row["native"]["sha256"][:12] + ".json"
         audit = {key: row.get(key) for key in ("run", "version", "case_id", "strict_relations", "angles", "curved_joins",
+                                             "attributes", "attempt_attributes", "solution_publication_link",
                                              "frozen_receipt_integrity", "audit_inputs_unchanged")}
         audit.update(prediction_sha256=row["native"]["sha256"], created_at=report["created_at"],
                      ground_truth_opened=False, online_api_called=False,

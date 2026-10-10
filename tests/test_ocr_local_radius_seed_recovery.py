@@ -111,3 +111,24 @@ def test_verified_partial_result_is_not_admitted_with_uninspected_competing_seed
     assert receipt["accepted_observation_count"] == 0 and receipt["uninspected_seed_count"] > 0
     assert receipt["diagnostic_only_observations"][0]["arrowhead_verified"] is True
     assert receipt["acceptance_withheld_reason"] == "uninspected_source_seed_competitors"
+
+
+def test_inner_incomplete_seed_withholds_earlier_verified_observations(monkeypatch):
+    gray, row, boundary = source()
+    verified, receipt = localize_ocr_radius_arrows(gray, row, [row], boundary, 5.)
+    assert verified and receipt["candidate_seed_count"] > 1
+    attempts = []
+    def local_search(*args, audit=None, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            audit.update(search_complete=True, status="completed")
+            return deepcopy(verified[0])
+        audit.update(search_complete=False, status="hypothesis_budget_exhausted",
+                     enumerated_hypothesis_count=25)
+        return None
+    monkeypatch.setattr(localization, "localize_source_arrow_proposal", local_search)
+    admitted, receipt = localize_ocr_radius_arrows(gray, row, [row], boundary, 5.)
+    assert admitted == [] and receipt["status"] == "inner_search_incomplete"
+    assert receipt["accepted_observation_count"] == 0 and receipt["verified_observation_count"] == 1
+    assert receipt["seed_attempts"][-1]["source_localization_search"]["enumerated_hypothesis_count"] == 25
+    assert receipt["diagnostic_only_observations"]

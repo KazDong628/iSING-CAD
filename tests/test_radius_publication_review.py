@@ -23,7 +23,9 @@ def setup_radius_pipeline(tmp_path, monkeypatch, *, nominal=5., source_passed=Tr
     coverage = {"all_radius_records_resolved": complete, "all_confirmed_arrows_bound": True,
                 "unknown_arrow_records": [] if complete else ["r002"],
                 "bound_mappings": [{"record_id": "r001", "entity_id": "g002", "nominal": nominal}]}
-    constraints = [equation(nominal)]
+    # Integration bindings follow the complete solver protocol. The minimal
+    # equation() helper intentionally only covers standalone radius audits.
+    constraints = [{**equation(nominal), "id": "radius_r001", "source": "ocr_local_binding", "nodes": []}]
     monkeypatch.setattr("contour_agent.constraint_binding.analyze_constraint_bindings", lambda *a, **k: {
         "constraints": constraints, "radius_binding_coverage": coverage,
         "provider": {"status": "disabled", "network_requests": 0}})
@@ -77,6 +79,10 @@ def test_restart_preserves_unresolved_radius_review_status(tmp_path, monkeypatch
         assert not job["parameterization"]["accepted"]
         assert job["parameterization"]["status"] == ("completed_with_unresolved_attributes" if complete else
                                                        "completed_with_unresolved_radii")
+        audit = job["parameterization"]["recovery_certificate"]
+        assert audit["numerical_constraint_validation"]["passed"]
+        assert audit["radius_subset_verified"]
+        assert audit["annotated_radii_verified"] is complete
         assert job["status"] == "needs_review"
     finally:
         service.executor.shutdown(wait=True)

@@ -632,11 +632,11 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
                           editor_provider=None, evaluator_provider=None, use_api=False,
                           round_index=1, feedback=None, verifier=None, operation_filter=None,
                           candidate_namespace=None, provider_guard=None,
-                          defer_after_primary_progress=False):
+                          defer_after_primary_progress=False, defer_for_source_exploration=False):
     """Propose, execute and independently evaluate bounded local topology edits."""
     from .planning_provider import evaluate_candidates
     from .topology_editing import execute_topology_edits, propose_annotation_arc_edits
-    from .topology_search import preflight_order
+    from .topology_search import preflight_admissible, preflight_order
 
     # The current candidate was preflighted without the newly discovered
     # source coordinates. They may suggest edits on this temporary parent,
@@ -702,6 +702,8 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
     preflight_queue=[]
     deferred_preflight_candidate_ids=[]
     progress_candidate_id=None
+    exploration_candidate_id=None
+    completed_source_preflights=0
     if verifier:
         # Source checks are bounded by the edit kernel's five operations plus
         # one combined candidate. Check all before costly binding and solving,
@@ -723,8 +725,16 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
         accepts_source_check="source_validation" in inspect.signature(verifier).parameters
         for row in queued:
             source_check=source_checks[row["id"]]
-            deferred=bool(defer_after_primary_progress and primary_ids and
-                          primary_ids<=completed_primary_ids and progress_candidate_id and
+            certified_deferral=bool(defer_after_primary_progress and primary_ids and
+                                    primary_ids<=completed_primary_ids and progress_candidate_id)
+            # Numerical infeasibility of one unfinished edit is not proof that
+            # its source-valid topology cannot become feasible after another
+            # edit. Reserve a later round instead of exhausting every sibling.
+            # The intermediate remains diagnostic, with no publishable coverage.
+            exploratory_deferral=bool(defer_for_source_exploration and exploration_candidate_id and
+                                      completed_source_preflights>=2 and
+                                      primary_ids<=completed_primary_ids)
+            deferred=bool((certified_deferral or exploratory_deferral) and
                           source_check.get("passed") is True)
             if deferred:
                 reason="topology_preflight_deferred_for_next_round"
@@ -750,6 +760,11 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
                 else:
                     row["constraint_regression_gate"]=constraint_regression(feedback or {},report)
                     queue_status="passed" if row["constraint_regression_gate"]["passed"] else "rejected"
+                    if source_check.get("passed") is True:
+                        completed_source_preflights+=1
+                        if (not preflight_admissible(report) and report.get("binding_status")!="not_run" and
+                                geometry_fingerprint(row["graph"])!=geometry_fingerprint(selected["graph"])):
+                            exploration_candidate_id=exploration_candidate_id or row["id"]
                 if row["id"] in primary_ids:
                     completed_primary_ids.add(row["id"])
                     if (defer_after_primary_progress and
@@ -849,8 +864,10 @@ def _topology_edit_stage(image_path, document, baseline, selected, bundle, outpu
             "evaluator":evaluator_receipt,"acceptance_gate":gate,
              "local_annotation_operations":local_annotation_operations,
              "preflight_queue":preflight_queue,
-             "deferred_preflight_candidate_ids":deferred_preflight_candidate_ids,
-             "deferred_for_next_round_after_candidate_id":progress_candidate_id if deferred_preflight_candidate_ids else None,
+              "deferred_preflight_candidate_ids":deferred_preflight_candidate_ids,
+              "deferred_for_next_round_after_candidate_id":progress_candidate_id if deferred_preflight_candidate_ids else None,
+              "deferred_for_exploration_after_candidate_id":exploration_candidate_id if deferred_preflight_candidate_ids and defer_for_source_exploration else None,
+              "completed_source_preflights":completed_source_preflights,
             "executed_operation_count":len(operations),
              "edited_candidate_ids":[row["id"] for row in edited],"ground_truth_used":False,
              "trusted_candidate_ids":[row["id"] for row in trusted],"branch_acceptance_gates":branch_gates,
@@ -1685,7 +1702,8 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
                 editor_provider=editor_provider,evaluator_provider=evaluator_provider,use_api=use_api,
                 round_index=number,feedback=feedback,verifier=verify,operation_filter=operation_filter,
                 candidate_namespace=f"r{number:02d}-b{branch_index:02d}",provider_guard=provider_guard,
-                defer_after_primary_progress=number<max_rounds)
+                defer_after_primary_progress=number<max_rounds,
+                defer_for_source_exploration=number<max_rounds and beam_width>1)
             step.update(round=number,branch=branch_index,parent_geometry_sha256=parent_hash,feedback=feedback)
             if step["acceptance_gate"].get("accepted") and geometry_fingerprint(proposed["graph"])==parent_hash:
                 step["acceptance_gate"].update(accepted=False,reason="repeated_geometry")
@@ -1718,6 +1736,12 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
             for row in options:
                 row["constraint_feedback"]=verify(row)
                 if (row["constraint_feedback"].get("topology_source_validation") or {}).get("passed") is True and preflight_admissible(row["constraint_feedback"]):
+                    incumbent_feedback=selected.get("constraint_feedback") or {}
+                    if preflight_admissible(incumbent_feedback) and incumbent_feedback.get("solver_accepted") is True:
+                        incumbent_gate=constraint_regression(incumbent_feedback,row["constraint_feedback"])
+                        row["incumbent_constraint_regression_gate"]=incumbent_gate
+                        if not incumbent_gate["passed"]:
+                            continue
                     row.pop("diagnostic_only",None)
                     next_pool.append(row)
             for name in step.get("exploratory_candidate_ids",[]):
@@ -1749,6 +1773,10 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
             beam.append(row);beam_hashes.add(key)
             if len(beam)>=beam_width:break
         beam=beam[:beam_width]
+        # Expand unfinished source-valid repairs before spending another round
+        # on the unchanged fallback. Search order does not change `selected` or
+        # promote a diagnostic graph to a publishable candidate.
+        beam.sort(key=lambda row:not bool(row.get("diagnostic_only")))
         signature=geometry_fingerprint(selected["graph"])
         changed=signature!=geometry_fingerprint(previous_selected["graph"])
         step=copy.deepcopy(branches[0])
@@ -1793,7 +1821,9 @@ def _topology_edit_loop(image_path, document, baseline, selected, bundle, output
         "validation":_topology_source_validation(image_path,baseline,row["graph"])} for row in beam]
     passing={row["candidate_id"] for row in record["final_source_rechecks"] if row["validation"].get("passed") is True}
     if selected["id"] not in passing:
-        selected=next((row for row in beam if row["id"] in passing),previous_selected if record["rounds"] else selected)
+        selected=next((row for row in beam if row["id"] in passing and not row.get("diagnostic_only") and
+                       preflight_admissible(row.get("constraint_feedback") or {})),
+                      previous_selected if record["rounds"] else selected)
         record["stop_reason"]="final_source_recheck_failed"
     record["final_candidate_id"]=selected["id"]
     record["final_selection_origin"]=("initial_seed_promotion" if selected["id"] in admitted_seed_ids else

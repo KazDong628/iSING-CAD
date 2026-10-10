@@ -30,13 +30,15 @@ def _fixture(root, version="v11", *, tangent=True, dimensions=False):
     if tangent:
         constraints += [dict(id="left", kind="tangent", entities=["upper", "lower"], nodes=["b"], value=None),
                         dict(id="right", kind="tangent", entities=["upper", "lower"], nodes=["a"], value=None)]
-    published = {"status": "completed", "constraints": constraints, "all_dimensions_verified": dimensions,
+    published = {"status": "completed", "accepted": True, "constraint_subset_accepted": True,
+                 "constraints": constraints, "all_dimensions_verified": dimensions,
                  "binding_counts": {"recognized_dimensions": 2, "bound_source_records": 2, "unbound_dimensions": 0},
                  "solver": {"status": "accepted", "accepted": True, "diagnostics": {"remaining_shape_dof": 0},
                             "validation": {"geometry_valid": True}},
                  "radius_binding_coverage": {"recognized_count": 2, "required_count": 2, "all_radius_records_resolved": True}}
     _write(after / "model.json", {"entities": entities, "parameterization": published})
-    _write(after / "parametric-solution.json", {"entities": entities, "diagnostics": {"remaining_shape_dof": 0}, "constraints": constraints})
+    _write(after / "parametric-solution.json", {"entities": entities, "candidate_entities": entities,
+        "accepted": True, "diagnostics": {"remaining_shape_dof": 0}, "constraints": constraints})
     _write(after / "constraint-bindings.json", {"constraints": constraints, "counts": published["binding_counts"]})
     _write(after / "parametric-stage.json", {"status": "completed", "provider": {"network_requests": 1, "http_success": True,
         "schema_success": True, "input_record_ids": ["r0", "r1"], "input_relation_ids": ["left", "right"],
@@ -208,3 +210,98 @@ def test_cli_passes_requested_versions_to_written_report(tmp_path, capsys):
     assert report["coverage"]["expected_slots"] == printed["coverage"]["expected_slots"] == 6
     assert report["rows"][2]["version"] == "v13" and report["rows"][2]["strict_audit_status"] == "read_back"
     assert "V11 / V12 / V13" in Path(printed["html"]).read_text(encoding="utf8")
+
+
+def _freeze_changed_synthetic_receipts(run):
+    manifest = reporter.read(run / "run-manifest.json")
+    manifest["frozen_artifacts"] = {name: reporter.digest(run/"after"/name) for name in reporter.REQUIRED_FILES}
+    _write(run / "run-manifest.json", manifest)
+
+
+def test_retained_topology_draft_never_inherits_failed_candidate_bindings_or_dof(tmp_path):
+    run = _fixture(tmp_path)
+    model = reporter.read(run / "after/model.json")
+    model["parameterization"] = dict(status="source_topology_exported", accepted=False,
+                                     constraint_subset_accepted=False, topology_exported=True)
+    _write(run / "after/model.json", model)
+    solution = reporter.read(run / "after/parametric-solution.json")
+    # Rejected solvers return baseline entities as their retained output. The
+    # DOF and candidate_entities still describe the failed numerical proposal.
+    solution.update(accepted=False, status="source_budget_search_failed", diagnostics=dict(remaining_shape_dof=27))
+    solution["candidate_entities"][0]["radius"] = 2.
+    _write(run / "after/parametric-solution.json", solution)
+    _freeze_changed_synthetic_receipts(run)
+    before = {p.relative_to(run).as_posix(): reporter.digest(p) for p in run.rglob("*") if p.is_file()}
+    report, _, html_path = reporter.write_report(tmp_path)
+    row = report["rows"][0]
+    assert row["attributes"]["recognized_dimensions"] == 2
+    assert row["attributes"]["bound_source_records"] == row["attributes"]["formal_constraint_count"] == 0
+    assert row["attributes"]["unbound_dimensions"] == 2
+    assert row["attributes"]["remaining_shape_dof"] is None
+    assert row["attempt_attributes"]["bound_source_records"] == 2
+    assert row["attempt_attributes"]["remaining_shape_dof"] == 27
+    assert not row["attempt_attributes"]["solver_accepted"]
+    assert not row["attempt_attributes"]["applies_to_current_core"]
+    assert row["published"]["geometry_only_solution_match"] is True
+    assert not row["published"]["current_solution_receipt_matches_model"]
+    assert row["published"]["remaining_shape_dof"] is None
+    assert row["published"]["maximum_recorded_constraint_residual_by_unit"] == {"mm": None, "degree": None}
+    assert not row["full_user_target_passed"]
+    assert before == {p.relative_to(run).as_posix(): reporter.digest(p) for p in run.rglob("*") if p.is_file()}
+    page = html_path.read_text(encoding="utf8")
+    assert "当前绑定 / 已识别" in page and "最新候选绑定 / 已识别" in page
+    assert "最新候选自由度" in page and "source_budget_search_failed" in page
+
+
+def test_current_published_solver_diagnostics_are_not_overridden_even_by_matching_solution(tmp_path):
+    run = _fixture(tmp_path)
+    solution = reporter.read(run / "after/parametric-solution.json")
+    solution["diagnostics"]["remaining_shape_dof"] = 27
+    _write(run / "after/parametric-solution.json", solution)
+    bindings = reporter.read(run / "after/constraint-bindings.json")
+    bindings["counts"].update(bound_source_records=13, recognized_dimensions=37, unbound_dimensions=24)
+    _write(run / "after/constraint-bindings.json", bindings)
+    _freeze_changed_synthetic_receipts(run)
+    row = reporter.assemble(tmp_path)["rows"][0]
+    assert row["solution_publication_link"]["checks"]["solution_geometry_matches"]
+    assert row["solution_publication_link"]["checks"]["candidate_geometry_matches"]
+    assert not row["solution_publication_link"]["checks"]["solver_diagnostics_agree"]
+    assert not row["solution_publication_link"]["verified"]
+    assert row["attributes"]["remaining_shape_dof"] == 0
+    assert row["attributes"]["bound_source_records"] == 2
+    assert row["attempt_attributes"]["remaining_shape_dof"] == 27
+    assert row["attempt_attributes"]["bound_source_records"] == 13
+
+
+@pytest.mark.parametrize("defect", ["rejected", "candidate_mismatch", "obligation_mismatch", "node_mismatch", "unaccepted_publication"])
+def test_equal_baseline_geometry_is_insufficient_to_associate_solution_receipt(tmp_path, defect):
+    run = _fixture(tmp_path)
+    solution = reporter.read(run / "after/parametric-solution.json")
+    if defect == "rejected": solution["accepted"] = False
+    elif defect == "candidate_mismatch": solution["candidate_entities"][0]["id"] = "other"
+    elif defect == "node_mismatch": solution["entities"][0]["start_node"] = "other"
+    elif defect == "obligation_mismatch": solution["constraints"][0]["value"] = 2.
+    else:
+        model = reporter.read(run / "after/model.json")
+        model["parameterization"].update(accepted=False, constraint_subset_accepted=False)
+        _write(run / "after/model.json", model)
+    _write(run / "after/parametric-solution.json", solution)
+    _freeze_changed_synthetic_receipts(run)
+    row = reporter.assemble(tmp_path)["rows"][0]
+    assert row["published"]["geometry_only_solution_match"] is True
+    assert not row["solution_publication_link"]["verified"]
+    assert not row["published"]["current_solution_receipt_matches_model"]
+    assert not row["attempt_attributes"]["applies_to_current_core"]
+
+
+def test_topology_without_formal_constraints_has_unknown_dof_even_with_stale_cached_solver(tmp_path):
+    run = _fixture(tmp_path, dimensions=True)
+    model = reporter.read(run / "after/model.json")
+    model["parameterization"]["constraints"] = []
+    model["parameterization"]["status"] = "source_topology_exported"
+    _write(run / "after/model.json", model)
+    _freeze_changed_synthetic_receipts(run)
+    row = reporter.assemble(tmp_path)["rows"][0]
+    assert row["attributes"]["remaining_shape_dof"] is None
+    assert row["attributes"]["bound_source_records"] == 0
+    assert not row["full_user_target_passed"]

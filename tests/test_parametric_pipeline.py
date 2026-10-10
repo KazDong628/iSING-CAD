@@ -174,8 +174,10 @@ def test_restart_uses_already_persisted_binding_receipt_without_retry(tmp_path,m
     service=recover(tmp_path,monkeypatch)
     try:
         job=service.store.get("persisted")
-        assert job["parameterization"]["provider"]["http_success"] is True
-        assert job["parameterization"]["provider"]["network_requests"]==1
+        attempt=job["parameterization"]["attempt_diagnostics"]
+        assert not attempt["applies_to_current_core"]
+        assert attempt["parameterization"]["provider"]["http_success"] is True
+        assert attempt["parameterization"]["provider"]["network_requests"]==1
         assert not job["parameterization"]["accepted"]
     finally:service.close()
 

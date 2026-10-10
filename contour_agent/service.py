@@ -55,6 +55,93 @@ def _parameterization_needs_review(job):
                                           contract.get("publication_status")=="candidate_only")))
 
 
+def _recover_numerical_constraints(model, document, strict):
+    """Re-evaluate every published equation on model and native geometry.
+
+    Use the solver's input protocol and fixed tolerances, without solving or
+    trusting its stored residuals. Shared nodes come from the current native
+    endpoints, not a possibly stale graph or a later candidate's sidecar.
+    """
+    from .parametric_solver import (ANGLE_TOLERANCE_DEG, LINEAR_TOLERANCE_MM,
+        STRICT_OCR_ANGLE_CERT_TOLERANCE_DEG, _DIMENSIONAL, _constraint_residual,
+        _constraint_value, _strict_ocr_angle_contract, _strict_ocr_angle_specs,
+        _validate_inputs)
+    from .relation_contract import (STRICT_RELATION_ENDPOINT_TOLERANCE,
+        STRICT_TANGENT_CERT_TOLERANCE_DEG, _geometry, _native_geometry)
+
+    constraints=(model.get("parameterization") or {}).get("constraints",[])
+    audit={"schema_version":"current-core-numerical-readback-v1", "passed":False,
+           "required_count":len(constraints) if isinstance(constraints,list) else None,
+           "satisfied_count":0,"checks":[],"issues":[],"dxf_readback_performed":False,
+           "native_mapping_verified":False,"solver_called":False,"reference_geometry_used":False}
+    try:
+        if strict.get("native_mapping_verified") is not True:
+            raise ValueError("native_entity_mapping_not_verified")
+        entities=[_geometry(entity) for entity in model["entities"]]
+        primitives=list(document.modelspace())
+        audit["dxf_readback_performed"]=True
+        if len(primitives)!=len(entities):raise ValueError("native_entity_count_mismatch")
+        native=[_native_geometry(primitive,entity) for primitive,entity in zip(primitives,entities)]
+        audit["native_mapping_verified"]=True
+
+        def graph(values):
+            nodes={}
+            for entity in values:
+                for endpoint in ("start","end"):
+                    node_id=entity[endpoint+"_node"];point=entity[endpoint]
+                    if node_id in nodes and math.dist(point,nodes[node_id])>STRICT_RELATION_ENDPOINT_TOLERANCE:
+                        raise ValueError("shared_native_node_endpoints_disagree")
+                    nodes.setdefault(node_id,point)
+            return {"units":(model.get("coordinate_system") or {}).get("units"),"entities":values,
+                    "nodes":[{"id":key,"x":point[0],"y":point[1]} for key,point in nodes.items()]}
+
+        model_nodes,entities,prepared=_validate_inputs(graph(entities),constraints)
+        native_nodes,native,native_prepared=_validate_inputs(graph(native),constraints)
+        if prepared!=native_prepared:raise ValueError("native_constraint_inventory_mismatch")
+        specs=_strict_ocr_angle_specs(entities,prepared)
+        model_angles={r["constraint_id"]:r for r in _strict_ocr_angle_contract(entities,specs)["checks"]}
+        native_angles={r["constraint_id"]:r for r in _strict_ocr_angle_contract(native,specs)["checks"]}
+        tangent_checks={r["constraint_id"]:r for r in strict.get("checks",[])}
+        contexts=[({n["id"]:np.array([n["x"],n["y"]]) for n in nodes},
+                   {entity["id"]:entity for entity in values})
+                  for nodes,values in ((model_nodes,entities),(native_nodes,native))]
+        for row in prepared:
+            tolerance=(0. if row["kind"]=="radius" else
+                       STRICT_TANGENT_CERT_TOLERANCE_DEG if row["kind"]=="tangent" else
+                       STRICT_OCR_ANGLE_CERT_TOLERANCE_DEG if row["id"] in model_angles else
+                       LINEAR_TOLERANCE_MM if row["kind"] in _DIMENSIONAL else ANGLE_TOLERANCE_DEG)
+            samples=[]
+            for nodes,indexed in contexts:
+                nids=row["nodes"]
+                # atan2(0, 0) must not certify a collapsed direction/angle.
+                pairs=([(nids[0],nids[1])] if row["kind"] in {"horizontal","vertical"} else
+                       [(nids[0],nids[1]),(nids[2],nids[1])] if row["kind"]=="angle" and len(nids)==3 else [])
+                if any(float(np.linalg.norm(nodes[a]-nodes[b]))<=1e-12 for a,b in pairs):
+                    raise ValueError("degenerate_constraint_direction")
+                actual=float(_constraint_value(row,nodes,indexed))
+                residual=float(_constraint_residual(row,actual))
+                if not math.isfinite(actual) or not math.isfinite(residual):
+                    raise ValueError("nonfinite_constraint_measurement")
+                samples.append({"actual":actual,"signed_residual":residual,"absolute_residual":abs(residual),
+                                "passed":abs(residual)<=tolerance})
+            if row["kind"]=="tangent":
+                current=tangent_checks.get(row["id"],{})
+                for sample,key in zip(samples,("model","dxf")):
+                    sample["passed"] &= current.get("passed") is True and (current.get(key) or {}).get("passed") is True
+            if row["id"] in model_angles:
+                for sample,angles in zip(samples,(model_angles,native_angles)):
+                    sample["passed"] &= angles[row["id"]]["passed"] is True
+            audit["checks"].append({**row,**samples[1],"model":samples[0],"dxf":samples[1],
+                "passed":all(sample["passed"] for sample in samples),"tolerance":tolerance,
+                "residual_unit":"mm" if row["kind"] in _DIMENSIONAL else "degree",
+                "binding_verified_by_solver":False,"recomputed_from_current_native_dxf":True})
+        audit["satisfied_count"]=sum(row["passed"] for row in audit["checks"])
+        audit["passed"]=audit["satisfied_count"]==audit["required_count"]
+    except (ValueError,KeyError,TypeError,AttributeError,IndexError,OverflowError) as error:
+        audit["issues"].append(str(error))
+    return audit
+
+
 def _recover_parametric_certificate(model, document):
     """Recheck current CORE obligations; an old accepted flag is not a certificate.
 
@@ -67,7 +154,7 @@ def _recover_parametric_certificate(model, document):
     from .reconstruction_contract import reconstruction_contract
     from .relation_contract import relation_checks
 
-    stage=model.get("parameterization") or {}
+    stage=deepcopy(model.get("parameterization") or {})
     validation=model.get("validation") or {}
     constraints=stage.get("constraints") or []
     entities=model.get("entities") or []
@@ -77,6 +164,11 @@ def _recover_parametric_certificate(model, document):
     stored_radii=validation.get("annotation_radius_contract") or {}
     strict=relation_checks(entities,constraints,dxf_document=document)
     exact=exact_radius_checks(entities,constraints,dxf_document=document)
+    numerical=_recover_numerical_constraints(model,document,strict)
+    stage["solver_constraint_checks"]=numerical["checks"]
+    solver=stage.setdefault("solver",{})
+    solver["accepted"]=bool(solver.get("accepted") is True and numerical["passed"])
+    solver.setdefault("validation",{})["constraint_subset_satisfied"]=numerical["passed"]
     current_subset=bool(
         model.get("algorithm_version")=="source-topology-bound-parametric-v1" and
         stored_strict.get("schema_version")=="strict-relation-contract-v1" and
@@ -87,26 +179,42 @@ def _recover_parametric_certificate(model, document):
         stored_exact.get("passed") is True and stored_exact.get("dxf_readback_performed") is True and
         stored_exact.get("required_count")==exact.get("required_count") and
         strict.get("passed") is True and strict.get("native_mapping_verified") is True and
-        exact.get("passed") is True)
-    radii=annotation_radius_contract(stage,{
-        "entities":entities,"accepted":(stage.get("solver") or {}).get("accepted") is True})
-    radius_complete=bool(current_subset and stored_radii.get("satisfied") is True and
+        exact.get("passed") is True and numerical["passed"])
+    # A failed angle, distance or G1 equation must not relabel exact, covered
+    # radii as missing. Radius certification has its own native readback and
+    # published source-coverage prerequisites; overall acceptance still needs
+    # every numerical and relationship certificate above.
+    current_radius_subset=bool(
+        model.get("algorithm_version")=="source-topology-bound-parametric-v1" and
+        strict.get("native_mapping_verified") is True and strict.get("dxf_readback_performed") is True and
+        stored_exact.get("passed") is True and stored_exact.get("dxf_readback_performed") is True and
+        stored_exact.get("required_count")==exact.get("required_count") and
+        exact.get("passed") is True and exact.get("dxf_readback_performed") is True)
+    radii=annotation_radius_contract(stage,{"entities":entities,"accepted":current_radius_subset})
+    radius_complete=bool(current_radius_subset and stored_radii.get("satisfied") is True and
         stored_radii.get("current_dxf_verified") is True and radii.get("satisfied") is True)
     checked_validation={**deepcopy(validation),"strict_relation_validation":strict,
                         "exact_radius_validation":exact,
-                        "annotation_radius_contract":{**radii,"satisfied":radius_complete}}
+                        "numerical_constraint_validation":numerical,
+                        "annotation_radius_contract":{**radii,"satisfied":radius_complete,
+                            "all_annotated_radii_verified":radius_complete,"current_dxf_verified":radius_complete}}
     coverage=reconstruction_contract(entities,stage,checked_validation)
     complete=bool(current_subset and stored_coverage.get("schema_version")=="source-reconstruction-contract-v1" and
         stored_coverage.get("satisfied") is True and coverage.get("satisfied") is True)
     reasons=list(coverage.get("reasons") or [])
+    if not numerical["passed"]:reasons.append("current_native_numerical_constraints_failed")
     if not current_subset:reasons.append("current_native_subset_certificate_missing_or_failed")
     if stored_coverage.get("schema_version")!="source-reconstruction-contract-v1":
         reasons.append("current_reconstruction_certificate_missing")
     elif stored_coverage.get("satisfied") is not True:
         reasons.append("published_reconstruction_was_not_complete")
     return {"source":"current_published_core","constraint_subset_verified":current_subset,
+            "radius_subset_verified":current_radius_subset,
             "annotated_radii_verified":radius_complete,"complete":complete,
             "strict_relation_validation":strict,"exact_radius_validation":exact,
+            "numerical_constraint_validation":numerical,
+            "annotation_radius_contract":checked_validation["annotation_radius_contract"],
+            "solver_constraint_checks":stage["solver_constraint_checks"],"solver":solver,
             "reconstruction_contract":coverage,"reasons":list(dict.fromkeys(reasons)),
             "legacy_export_automatically_certified":False}
 
@@ -986,6 +1094,15 @@ class AgentService:
             job.update(validation=validation,automatic_completion=bool(model.get("automatic_completion")),scale=model["scale"],curve_fit=model.get("curve_fit"),
                        geometry={"entities":model["entities"],"bounds":model["bounds"],"coordinate_system":model["coordinate_system"]})
             saved_stage=model.get("parameterization") or {}
+            # The latest attempt may describe an entirely different rejected
+            # candidate. Retain its receipts as diagnostics, never overlay its
+            # constraints, solver state or coverage onto the published CORE.
+            attempted_stage=deepcopy(job.get("parameterization") or {})
+            attempt_diagnostics=attempted_stage.pop("attempt_diagnostics",None)
+            attempted_stage.pop("recovery_certificate",None)
+            if attempt_diagnostics is None and attempted_stage and attempted_stage!=saved_stage:
+                attempt_diagnostics={"source":"latest_attempt_sidecar","applies_to_current_core":False,
+                                     "parameterization":attempted_stage}
             if saved_stage.get("accepted") or saved_stage.get("constraint_subset_accepted"):
                 # Keep durable transport receipts, but certify only the CURRENT
                 # CORE's obligations against its actual native DXF. Neither old
@@ -1001,11 +1118,13 @@ class AgentService:
                 subset=certificate["constraint_subset_verified"]
                 unresolved_status=("completed_with_unresolved_attributes" if
                     certificate["annotated_radii_verified"] else "completed_with_unresolved_radii")
-                verified_stage={**saved_stage,**(job.get("parameterization") or {}),
+                verified_stage={**deepcopy(saved_stage),
                     "accepted":accepted,"constraint_subset_accepted":subset,
                     "status":"completed" if accepted else unresolved_status,
-                    "annotation_radius_contract":deepcopy(saved_stage.get("annotation_radius_contract")),
+                    "annotation_radius_contract":certificate.get("annotation_radius_contract",{}),
                     "reconstruction_contract":certificate.get("reconstruction_contract",{}),
+                    "solver_constraint_checks":certificate.get("solver_constraint_checks",[]),
+                    "solver":certificate.get("solver",{**deepcopy(saved_stage.get("solver") or {}),"accepted":False}),
                     "recovery_certificate":certificate,
                     "geometry_updated_by_api":bool(subset and saved_stage.get("geometry_updated_by_api")),
                     "dimensions_updated_by_api":bool(subset and saved_stage.get("dimensions_updated_by_api"))}
@@ -1015,7 +1134,14 @@ class AgentService:
                     if recovered_publication.get("status")!="rolled_back":
                         recovered_publication["status"]="committed"
                     verified_stage["publication"]=recovered_publication
+                if attempt_diagnostics:verified_stage["attempt_diagnostics"]=attempt_diagnostics
                 job["parameterization"]=verified_stage
+                # Keep the persisted CORE read-only; the recovered job exposes
+                # current measurements instead of its old validation flags.
+                for field in ("strict_relation_validation","exact_radius_validation",
+                              "numerical_constraint_validation","annotation_radius_contract","reconstruction_contract"):
+                    job["validation"][field]=certificate.get(field,{"passed":False,"satisfied":False})
+                job["validation"]["all_annotated_radii_verified"]=certificate["annotated_radii_verified"]
                 job["completion_class"]=("partial_parametric_draft" if accepted else
                     "partial_parametric_draft_unresolved_attributes" if
                     unresolved_status=="completed_with_unresolved_attributes" else "partial_parametric_draft_unresolved_radii")
@@ -1023,11 +1149,22 @@ class AgentService:
                     job["status"]="needs_review"
                     job.setdefault("issues",[]).append("已保留当前CAD产物；当前原生DXF、严格关系或完整约束证书尚未全部通过，旧完成标志不作为重新认证依据。")
             elif model.get("parameterization",{}).get("topology_exported"):
-                recovered_stage=job.get("parameterization") or model["parameterization"]
+                recovered_stage=deepcopy(saved_stage)
                 recovered_stage.update(accepted=False,topology_exported=True,
                                        geometry_updated_by_api=False,dimensions_updated_by_api=False)
+                if attempt_diagnostics:recovered_stage["attempt_diagnostics"]=attempt_diagnostics
+                if publication:
+                    recovered_stage["publication"]=deepcopy((job.get("parameterization") or {}).get("publication") or publication)
                 job["parameterization"]=recovered_stage
                 job["completion_class"]="source_topology_draft"
+            elif attempted_stage:
+                recovered_stage={**deepcopy(saved_stage),"accepted":False,"constraint_subset_accepted":False,
+                                 "status":"current_core_not_parameterized","geometry_updated_by_api":False,
+                                 "dimensions_updated_by_api":False}
+                if attempt_diagnostics:recovered_stage["attempt_diagnostics"]=attempt_diagnostics
+                if publication:
+                    recovered_stage["publication"]=deepcopy((job.get("parameterization") or {}).get("publication") or publication)
+                job["parameterization"]=recovered_stage
             job["extraction"]={k:v for k,v in model.get("extraction",{}).items() if k not in {"polyline_px","raw_polyline_px","candidates"}}
             if model.get("complete_material_exterior") is False:
                 job["completion_class"]="incomplete_material_exterior_draft"
