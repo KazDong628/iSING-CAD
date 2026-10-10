@@ -2089,7 +2089,17 @@ def _binding_evidence_sha256(inventory):
           "radius_source_observations","angle_source_observations","relations","source_arrow_ownership")
     if not isinstance(inventory,dict) or any(key not in inventory for key in ("all_records","all_candidates")):
         return None
-    return _canonical_sha256({key:inventory.get(key) for key in keys})
+    evidence={key:inventory.get(key) for key in keys}
+    ownership=evidence.get("source_arrow_ownership")
+    if isinstance(ownership,dict) and isinstance(ownership.get("ocr_local_candidate_searches"),list):
+        # This one field is measured wall time, not a source observation.
+        # Keep budgets/deadlines, completion/truncation status, rejected
+        # hypotheses and all geometry. Never drop timing keys recursively.
+        evidence["source_arrow_ownership"]={**ownership,"ocr_local_candidate_searches":[
+            {key:value for key,value in search.items() if key!="elapsed_seconds"}
+            if isinstance(search,dict) else search
+            for search in ownership["ocr_local_candidate_searches"]]}
+    return _canonical_sha256(evidence)
 
 
 def _constraint_signature(row):
