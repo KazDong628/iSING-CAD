@@ -42,6 +42,16 @@ def test_proposal_reserves_angle_type_correction_without_case_or_value_constants
     assert propose_annotation_arc_edits(graph, _inventory(), limit=1) == proposed
 
 
+def test_unresolved_angle_filter_is_applied_before_bounded_candidate_limit():
+    graph=_graph()
+    second=copy.deepcopy(graph['angle_source_observations'][0])
+    second.update(record_id='angle-b',source_line={'start_px':[0.,0.],'end_px':[0.,15.]})
+    graph['angle_source_observations'].append(second)
+    inventory=[*_inventory(),{'record_id':'angle-b','kind':'angle','nominal':15.}]
+    proposed=propose_annotation_line_edits(graph,inventory,limit=1,required_record_ids={'angle-b'})
+    assert len(proposed)==1 and proposed[0]['record_id']=='angle-b'
+
+
 @pytest.mark.parametrize("change", [
     {"verified": False}, {"reference_axis": "unidentified"}, {"nominal": 12.},
     {"target_candidates": [{"entity_id": "other"}]},

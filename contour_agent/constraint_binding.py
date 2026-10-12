@@ -7,6 +7,7 @@ Unbound and rejected source dimensions remain in the inventory/denominator.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 import hashlib
 from itertools import product
 import json
@@ -18,10 +19,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from .binding_provider import validate_selection
-from .dimension_evidence import _axis_lines, _linear_witnesses
+from .binding_provider import validate_receipt_selection
+from .dimension_evidence import _axis_lines, _linear_witnesses, binding_linear_witnesses
+from .measurement_anchors import (virtual_corner_locations, source_derived_locations,
+                                  source_curve_center_locations, validate_derived_anchor, anchor_entity_ids)
 from .ocr import canonical_records, parse_dimension
-from .structural_evidence import structural_evidence, source_ink, _ink_trace
+from .structural_evidence import structural_evidence, source_ink, _source_ink_tangent_trace
 
 
 def _write(path, value):
@@ -36,6 +39,10 @@ def _box(row):
         return points
     except (TypeError, ValueError):
         return None
+
+
+def _source_text_withheld(row):
+    return (row.get("source_text_admission") or {}).get("status") == "withheld"
 
 
 def _source_text_evidence(gray, row):
@@ -114,36 +121,109 @@ def _samples(entity, transform):
     return transform(center + float(entity["radius"]) * np.c_[np.cos(theta), np.sin(theta)])
 
 
-def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band, relations):
+def _annotated_line_arc_tangent(ink, adjacent, node, samples, path, band, grid, observations):
+    """Measure a curved side against a separately source-verified straight side.
+
+    A short LINE need not provide a quadratic curve window. Its independently
+    detected straight stroke supplies direction; the ARC still needs the
+    unchanged source-ink coverage, stability and three-degree tangent gates.
+    Neither the fitted LINE slope nor the annotation's nominal is measured.
+    """
+    failure={"method":"source_angle_line_and_raw_arc_tangent_v1", "verified":False,
+             "reason":"independent_annotated_line_support_unavailable",
+             "mask_derivatives_used_for_admission":False, "ground_truth_geometry_used":False}
+    if sorted(e.get("type") for e in adjacent)!=["ARC","LINE"]:return failure
+    li=next(i for i,e in enumerate(adjacent) if e["type"]=="LINE"); ai=1-li
+    line=adjacent[li]
+    candidates=[]
+    for row in observations:
+        evidence=row.get("evidence") or {}
+        if (row.get("verified") is not True or
+                evidence.get("method")!="source_angular_arrows_axis_and_straight_support_v1" or
+                any((evidence.get(role) or {}).get("verified") is not True
+                    for role in ("reference_arrow","target_arrow"))):continue
+        targets=[target for target in row.get("target_candidates",[]) if
+                 target.get("entity_id")==line["id"] and target.get("entity_type")=="LINE"
+                 and target.get("whole_line_supported") is True]
+        if len(targets)==1:candidates.append(row)
+    if len(candidates)!=1:return failure
+    observation=candidates[0]
+    source=observation.get("source_line") or {}
+    try:
+        ends=np.asarray([source["start_px"],source["end_px"]],float)
+        direction=ends[1]-ends[0];length=float(np.linalg.norm(direction))
+        if ends.shape!=(2,2) or not np.isfinite(ends).all() or length<=1e-7:return failure
+        direction/=length
+        line_points=samples[li] if line.get("start_node")==node else samples[li][::-1]
+        distances=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(line_points,axis=0),axis=1))]
+        probe=min(12.,float(distances[-1])*.5)
+        if probe<=grid:return failure
+        interior=np.array([np.interp(probe,distances,line_points[:,axis]) for axis in (0,1)])
+        side_gaps=[(float(np.linalg.norm(path(side,np.asarray([probe]))[0]-interior)),side)
+                   for side in (-1.,1.)]
+        side_gaps.sort()
+        if side_gaps[0][0]>band or side_gaps[1][0]-side_gaps[0][0]<=grid:
+            return {**failure,"reason":"short_line_raw_boundary_side_ambiguous"}
+        arc_length=float(np.linalg.norm(np.diff(samples[ai],axis=0),axis=1).sum())
+        span=min(96.,arc_length*.45)
+        if span<max(24.,4*band,8*grid):
+            return {**failure,"reason":"insufficient_curved_source_span"}
+        trace=_source_ink_tangent_trace(ink,path(-side_gaps[0][1],np.linspace(0.,span/.45,129)),band)
+        result={**failure,"record_id":observation.get("record_id"),"line_entity_id":line["id"],
+                "arc_entity_id":adjacent[ai]["id"],"straight_source_direction_px":direction.tolist(),
+                "straight_source_evidence":observation,"curved_side":trace,
+                "line_raw_side_gaps_px":[row[0] for row in side_gaps],
+                "source_ink_measurement_performed":True,"independent_source_tangent_measurement":True,
+                "nominal_angle_used_for_measurement":False,"tolerance_degrees":3.}
+        if trace.get("verified") is not True:
+            return {**result,"reason":"source_curved_tangent_evidence_insufficient"}
+        angle=math.degrees(math.acos(float(np.clip(abs(np.dot(direction,trace["tangent_direction_px"])),0.,1.))))
+        return {**result,"observed_deviation_degrees":angle,"verified":angle<=3.,
+                "reason":None if angle<=3. else "source_junction_is_not_tangent"}
+    except (ValueError,TypeError,KeyError,IndexError,ArithmeticError):return failure
+
+
+def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band, relations,
+                                   *, angle_observations=()):
     """Inspect source boundary joints without using fitted curve tangency as proof.
 
-    The immutable extraction boundary locates two exterior paths. Its quadratic
-    derivatives must agree at three scales before original ink is measured on
-    those paths. A mask alone, a fitted arc or a model verdict cannot admit a
-    tangent constraint. Existing source-verified relations stay unchanged.
+    The immutable extraction boundary only locates two inspection paths. Mask
+    derivatives are diagnostics, never an admission veto or proof. Only the
+    unchanged independent source-ink measurements can certify tangency.
+    Existing source-verified relations stay unchanged.
     """
+    def unavailable(reason):
+        # Preserve the earlier source receipt and expose why a raw-path retry
+        # could not run; absence of a path never creates a new relation.
+        return [{**row, "evidence": {"method": "raw_boundary_source_ink_tangent_v2",
+                    "verified": False, "reason": reason,
+                    "source_ink_measurement_performed": False,
+                    "mask_derivatives_used_for_admission": False,
+                    "previous_geometry_seeded_evidence": row.get("evidence")}}
+                if row.get("type") == "tangent" and not row.get("local_reliable") else row
+                for row in relations]
     raw = (model.get("extraction") or {}).get("raw_polyline_px")
     if raw is None:
-        return relations
+        return unavailable("raw_boundary_unavailable")
     try:
         ring = np.asarray(raw, float)
         if ring.ndim != 2 or ring.shape[1] != 2 or len(ring) < 12 or not np.isfinite(ring).all():
-            return relations
+            return unavailable("raw_boundary_invalid")
         if np.linalg.norm(ring[-1] - ring[0]) >= 1e-7:
-            return relations
+            return unavailable("raw_boundary_not_closed")
         ring = ring[:-1]
         ring = ring[np.r_[True, np.linalg.norm(np.diff(ring, axis=0), axis=1) > 1e-7]]
         delta = np.roll(ring, -1, axis=0) - ring
         length = np.linalg.norm(delta, axis=1)
         if len(ring) < 12 or np.any(length <= 1e-7):
-            return relations
+            return unavailable("raw_boundary_degenerate")
         cumulative = np.r_[0., np.cumsum(length)]
         perimeter = float(cumulative[-1])
         grid = float(graph.get("source_grid_pitch_px", 1.))
         if not math.isfinite(grid) or grid <= 0:
-            return relations
+            return unavailable("source_grid_pitch_invalid")
     except (ValueError, TypeError, IndexError):
-        return relations
+        return unavailable("raw_boundary_invalid")
     closed = np.vstack([ring, ring[0]])
     incident = defaultdict(list)
     for entity in graph.get("entities", []):
@@ -153,6 +233,23 @@ def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band
     by_joint = {(frozenset(row["entities"]), tuple(row.get("nodes", []))): index
                 for index, row in enumerate(result) if row["type"] == "tangent"}
     used_ids = {row["id"] for row in result}
+    def record(index, node, adjacent, evidence):
+        if index is not None:
+            item = dict(result[index])
+            evidence["previous_geometry_seeded_evidence"] = item.get("evidence")
+        else:
+            number = len(result)
+            while f"rel{number:03d}" in used_ids:
+                number += 1
+            item = {"id": f"rel{number:03d}", "type": "tangent",
+                    "entities": [entity["id"] for entity in adjacent], "nodes": [node],
+                    "source": "source_boundary_hypothesis", "required": False}
+            used_ids.add(item["id"])
+        item.update(local_reliable=bool(evidence["verified"]), evidence=evidence)
+        if index is None:
+            result.append(item)
+        else:
+            result[index] = item
     ink = None
     for node, adjacent in incident.items():
         if len(adjacent) != 2 or len({entity["id"] for entity in adjacent}) != 2:
@@ -170,8 +267,13 @@ def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band
         samples = [_samples(entity, transform) for entity in adjacent]
         spans = [float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum()) for points in samples]
         span = min(96., min(spans) * .45, perimeter * .05)
-        if span < max(24., 4 * band, 8 * grid):
-            continue
+        evidence = {"method": "raw_boundary_source_ink_tangent_v2",
+                    "verified": False, "shared_node": node, "span_px": span,
+                    "source_ink_measurement_performed": False,
+                    "mask_derivatives_used_for_admission": False,
+                    "mask_role": "joint_localization_and_sampling_paths_only",
+                    "boundary_observation": "immutable_extraction_raw_polyline_px",
+                    "ground_truth_geometry_used": False}
         entity = adjacent[0]
         endpoint = entity["end"] if entity.get("end_node") == node else entity["start"]
         point = transform([endpoint])[0]
@@ -179,14 +281,22 @@ def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band
         projections = ring + fraction[:, None] * delta
         gaps = np.linalg.norm(projections - point, axis=1)
         segment = int(np.argmin(gaps))
+        evidence["joint_to_raw_boundary_px"] = float(gaps[segment])
         if float(gaps[segment]) > band:
+            record(index, node, adjacent, {**evidence, "reason": "joint_outside_source_boundary_band"})
             continue
         station = float(cumulative[segment] + fraction[segment] * length[segment])
         def path(direction, distances):
             positions = (station + direction * distances) % perimeter
             return np.c_[np.interp(positions, cumulative, closed[:, 0]),
                          np.interp(positions, cumulative, closed[:, 1])]
-        directions, mask_sides = [], []
+        if span < max(24., 4 * band, 8 * grid):
+            if ink is None:_,ink=source_ink(gray,records)
+            retry=_annotated_line_arc_tangent(ink,adjacent,node,samples,path,band,grid,angle_observations)
+            record(index,node,adjacent,({**evidence,**retry} if retry.get("verified") else
+                   {**evidence,"reason":"insufficient_local_source_span","annotated_line_retry":retry}))
+            continue
+        directions, mask_sides, mask_reasons = [], [], []
         for side in (-1., 1.):
             fits = []
             for ratio in (.5, .75, 1.):
@@ -201,23 +311,26 @@ def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band
                     break
                 fits.append((vector / norm, float(np.percentile(np.linalg.norm(points - predicted, axis=1), 90))))
             if len(fits) != 3:
-                break
+                mask_sides.append({"side": side, "span_px": span, "direction_available": False})
+                mask_reasons.append("mask_derivative_unavailable")
+                continue
             disagreement = max(math.degrees(math.acos(float(np.clip(a[0] @ b[0], -1., 1.))))
                                for a, b in product(fits, fits))
             residual = max(item[1] for item in fits)
-            mask_sides.append({"scale_disagreement_degrees": disagreement,
+            mask_sides.append({"side": side, "scale_disagreement_degrees": disagreement,
                                "fit_residual_p90_px": residual, "span_px": span})
-            if disagreement > 2. or residual > max(1.25, grid * .75):
-                break
+            if disagreement > 2.:
+                mask_reasons.append("mask_tangent_scale_disagreement")
+            if residual > max(1.25, grid * .75):
+                mask_reasons.append("mask_curve_fit_residual_exceeded")
             directions.append(fits[-1][0])
-        if len(directions) != 2:
-            continue
-        mask_angle = math.degrees(math.acos(float(np.clip(-directions[0] @ directions[1], -1., 1.))))
-        if mask_angle > 3.:
-            continue
+        mask_angle = (math.degrees(math.acos(float(np.clip(-directions[0] @ directions[1], -1., 1.))))
+                      if len(directions) == 2 else None)
+        if mask_angle is not None and mask_angle > 3.:
+            mask_reasons.append("mask_observed_tangent_deviation_exceeded")
         if ink is None:
             _, ink = source_ink(gray, records)
-        traces = [_ink_trace(ink, path(side, np.linspace(0., span / .45, 129)), band)
+        traces = [_source_ink_tangent_trace(ink, path(side, np.linspace(0., span / .45, 129)), band)
                   for side in (-1., 1.)]
         ink_angle = None
         verified = False
@@ -225,29 +338,37 @@ def _raw_boundary_tangent_relations(gray, records, model, graph, transform, band
             ink_angle = math.degrees(math.acos(float(np.clip(-np.dot(
                 traces[0]["tangent_direction_px"], traces[1]["tangent_direction_px"]), -1., 1.))))
             verified = ink_angle <= 3.
-        evidence = {"method": "raw_mask_multiscale_and_two_sided_source_ink_tangent_v1",
-                    "verified": verified, "shared_node": node, "sides": traces,
+            if not verified:
+                from .structural_evidence import remeasure_finite_source_joint
+                retry=remeasure_finite_source_joint(ink,
+                    [path(side,np.linspace(0.,span/.45,129)) for side in (-1.,1.)],band)
+                evidence['finite_window_retry']=retry
+                if retry['verified']:
+                    evidence['short_window_sides']=traces
+                    evidence['short_window_deviation_degrees']=ink_angle
+                    traces=retry['sides'];ink_angle=retry['observed_deviation_degrees'];verified=True
+        else:
+            from .structural_evidence import remeasure_finite_source_joint
+            retry=remeasure_finite_source_joint(ink,
+                [path(side,np.linspace(0.,span/.45,129)) for side in (-1.,1.)],band)
+            evidence['finite_window_retry']=retry
+            if retry['verified']:
+                evidence['short_window_sides']=traces
+                traces=retry['sides'];ink_angle=retry['observed_deviation_degrees'];verified=True
+        evidence.update(verified=verified, source_ink_measurement_performed=True, sides=traces,
+                    mask_diagnostic_passed=not mask_reasons,
+                    mask_diagnostic_reasons=sorted(set(mask_reasons)))
+        evidence.update({
                     "mask_sides": mask_sides, "mask_observed_deviation_degrees": mask_angle,
                     "observed_deviation_degrees": ink_angle, "tolerance_degrees": 3.,
-                    "boundary_observation": "immutable_extraction_raw_polyline_px",
-                    "ground_truth_geometry_used": False,
-                    "reason": None if verified else "source_tangent_evidence_insufficient"}
-        if index is not None:
-            item = dict(result[index])
-            evidence["previous_geometry_seeded_evidence"] = item.get("evidence")
-        else:
-            number = len(result)
-            while f"rel{number:03d}" in used_ids:
-                number += 1
-            item = {"id": f"rel{number:03d}", "type": "tangent",
-                    "entities": [entity["id"] for entity in adjacent], "nodes": [node],
-                    "source": "source_boundary_hypothesis", "required": False}
-            used_ids.add(item["id"])
-        item.update(local_reliable=verified, evidence=evidence)
-        if index is None:
-            result.append(item)
-        else:
-            result[index] = item
+                    "reason": None if verified else ("source_junction_is_not_tangent" if ink_angle is not None
+                                                      else "source_tangent_evidence_insufficient")})
+        if ink_angle is None:
+            retry=_annotated_line_arc_tangent(ink,adjacent,node,samples,path,band,grid,angle_observations)
+            if retry.get("verified"):evidence={**evidence,**retry,"previous_two_curve_measurement":evidence}
+            elif retry.get("reason")!="independent_annotated_line_support_unavailable":
+                evidence["annotated_line_retry"]=retry
+        record(index, node, adjacent, evidence)
     return result
 
 
@@ -322,6 +443,20 @@ def _arrowhead_evidence(gray, endpoint, direction, label_size, band, target_poin
             # A valid taper gets stronger towards its base; a terminal T or X
             # intersection usually widens at the tip and fails this condition.
             if middle>1.35*body:continue
+            # A one-pixel widening on a rasterized hatch can imitate the five
+            # sparse sections above. Require the wide arrow body to persist
+            # axially, using the same body/shaft test on nearby sections. Do
+            # not resample the tip: its neighbouring contour can legitimately
+            # dominate cross sections immediately beside the actual point.
+            section_offsets=(-.04,-.02,0.,.02,.04)
+            persistent_sections=[
+                [width_at(tip-direction*length*(depth+offset),max(5.,.6*length))
+                 for offset in section_offsets]
+                for depth in (.72,1.20,1.55)]
+            persistent_body,persistent_shaft,persistent_tail=(
+                float(np.median(section)) for section in persistent_sections)
+            if persistent_body<max(3.,1.65*max(persistent_shaft,persistent_tail,1.)):
+                continue
             ahead=tip+np.asarray([.35,.60,.85])[:,None]*length*direction
             ahead_ink=[]
             for point in ahead:
@@ -334,6 +469,10 @@ def _arrowhead_evidence(gray, endpoint, direction, label_size, band, target_poin
             score=float(body/max(shaft,1.) + body/max(narrow,1.)-abs(shift)/max(length,1.))
             item={"method":"directed_source_ink_taper_and_shaft","tip_px":tip.tolist(),
                   "direction_px":direction.tolist(),"length_px":length,"cross_section_widths_px":widths,
+                  "body_persistence":{"method":"axial_median_body_and_shaft",
+                      "relative_offsets":list(section_offsets),"widths_px":persistent_sections,
+                      "body_width_px":persistent_body,
+                      "shaft_width_px":max(persistent_shaft,persistent_tail,1.),"verified":True},
                   "forward_ink_fraction":forward_ink,"score":score,"verified":True}
             if best is None or score>best["score"]:best=item
     return best
@@ -475,13 +614,12 @@ def _annotation_leader_segments(graph, record_id):
     return result
 
 
-def verify_source_arrow_proposal(gray, record, proposal, boundary_points, band, contours=None):
-    """Locally verify a provider's source-pixel hypothesis, never its verdict.
+def _verify_source_arrow_ink(gray, record, proposal, band, *, target_points=None):
+    """Prove a source taper/shaft/label ray without requiring any CAD target.
 
-    Radius leaders may cross material before reaching their real arrowhead.
-    Crossing admission requires the entire shaft, label ray and a filled
-    source arrow. Source Hough callers may use this identical proof; the
-    proposal origin does not substitute for or weaken any pixel check.
+    Optional target_points retains the old target-conditioned detector path.
+    A scope observation must omit it so a real off-mask arrow cannot be
+    silently replaced by an in-mask stroke before source evidence is checked.
     """
     if record.get("parsed", {}).get("kind") != "radius" or not isinstance(proposal, dict):
         return None
@@ -491,12 +629,10 @@ def verify_source_arrow_proposal(gray, record, proposal, boundary_points, band, 
     try:
         shaft = np.asarray(proposal.get("shaft_px"), float)
         tip = np.asarray(proposal.get("tip_px"), float)
-        boundary = np.asarray(boundary_points, float)
     except (TypeError, ValueError, AttributeError):
         return None
     if (box is None or shaft.shape != (2,) or tip.shape != (2,) or
-            not np.isfinite([shaft, tip]).all() or boundary.ndim != 2 or
-            boundary.shape[1] != 2 or not len(boundary) or not np.isfinite(boundary).all()):
+            not np.isfinite([shaft, tip]).all()):
         return None
     if any(not (0 <= point[0] < gray.shape[1] and 0 <= point[1] < gray.shape[0]) for point in (shaft, tip)):
         return None
@@ -510,7 +646,7 @@ def verify_source_arrow_proposal(gray, record, proposal, boundary_points, band, 
     ray_gap = _label_ray_entry(shaft, -direction, lo-2., hi+2., max(18., size*.75))
     if ray_gap is None:
         return None
-    arrow = _arrowhead_evidence(gray, tip, direction, size, band, boundary)
+    arrow = _arrowhead_evidence(gray, tip, direction, size, band, target_points)
     if arrow is None:
         return None
     actual_tip = np.asarray(arrow["tip_px"], float)
@@ -520,9 +656,6 @@ def verify_source_arrow_proposal(gray, record, proposal, boundary_points, band, 
         return None
     # A provider cannot point at one object and gain a stronger arrow far away.
     if math.dist(actual_tip, tip) > max(10., .55*float(arrow["length_px"])):
-        return None
-    target_gap = float(np.min(np.linalg.norm(boundary-actual_tip, axis=1)))
-    if target_gap > max(10., band*1.7):
         return None
     label_exit = shaft-direction*ray_gap
     path_length = float(np.linalg.norm(actual_tip-label_exit))
@@ -546,21 +679,40 @@ def verify_source_arrow_proposal(gray, record, proposal, boundary_points, band, 
                       "verified": bool(np.mean(support) >= .88 and longest <= maximum_gap)}
     if not shaft_evidence["verified"]:
         return None
-    visibility = _leader_contour_visibility(label_exit, actual_tip,
-                                           contours if contours is not None else [boundary], band)
     return {"method": "agent_proposed_source_arrow_locally_verified",
             "segment_px": [shaft.tolist(), tip.tolist()], "label_gap_px": ray_gap,
             "label_ray_intersection_gap_px": ray_gap, "arrowhead_verified": True,
             "arrowhead": arrow, "target_source_px": actual_tip.tolist(),
-            "arrow_tip_to_arc_gap_px": target_gap, "arc_endpoint_gap_px": target_gap,
-            "contour_visibility": visibility, "shaft_evidence": shaft_evidence,
+            "source_label_exit_px": label_exit.tolist(), "shaft_evidence": shaft_evidence,
             "source_label_association": ownership,
+            "target_conditioned_detection": target_points is not None,
+            "score": .2*ray_gap, "nominal_used_to_rank": False}
+
+
+def verify_source_arrow_proposal(gray, record, proposal, boundary_points, band, contours=None):
+    """Match independently checked shaft evidence to the supplied CAD target."""
+    try:
+        boundary=np.asarray(boundary_points,float)
+    except (TypeError,ValueError):
+        return None
+    if boundary.ndim!=2 or boundary.shape[1]!=2 or not len(boundary) or not np.isfinite(boundary).all():
+        return None
+    verified=_verify_source_arrow_ink(gray,record,proposal,band,target_points=boundary)
+    if verified is None:return None
+    actual_tip=np.asarray(verified["arrowhead"]["tip_px"],float)
+    target_gap=float(np.min(np.linalg.norm(boundary-actual_tip,axis=1)))
+    if target_gap>max(10.,band*1.7):return None
+    visibility=_leader_contour_visibility(verified["source_label_exit_px"],actual_tip,
+        contours if contours is not None else [boundary],band)
+    return {**verified,"arrow_tip_to_arc_gap_px":target_gap,"arc_endpoint_gap_px":target_gap,
+            "contour_visibility":visibility,
             "crossing_source_contour": not visibility["verified"],
             "crossing_admission": "explicit_directed_proposal_with_full_source_shaft_and_arrow",
-            "score": target_gap+.2*ray_gap, "nominal_used_to_rank": False}
+            "score":target_gap+verified["score"]}
 
 
-def _radius_source_observations(gray, records, graph, transform, leaders, band, rejections=None, ownership_audit=None):
+def _radius_source_observations(gray, records, graph, transform, leaders, band, rejections=None, ownership_audit=None,
+                                *, source_boundary_points=None, ownership_records=None):
     """Observe directed arrows before deciding whether their target is an ARC.
 
     A LINE at a radius arrow is a topology defect, not an absent dimension.
@@ -583,6 +735,9 @@ def _radius_source_observations(gray, records, graph, transform, leaders, band, 
     contours = [points for _, points in paths]
     target_band = max(10., band*1.7)
     observations = []
+    ocr_local_searches = []
+    proposal_searches = []
+    scope_audits = []
     for row in records:
         if row.get("parsed", {}).get("kind") != "radius":
             continue
@@ -598,6 +753,10 @@ def _radius_source_observations(gray, records, graph, transform, leaders, band, 
         # current-contour target_band below.
         prelocalization_band = target_band + .65*max(7., min(90., size*.52))
         found, seen = [], set()
+        proposal_cache = {}
+        from .source_arrow_localization import observe_source_arrow_scope
+        scope = observe_source_arrow_scope(gray,row,source_boundary_points,band,hypothesis_cache=proposal_cache)
+        scope_audits.append(scope)
         from .source_arrow_localization import native_radius_leader_segments, verify_source_hough_leader
         global_segments = leaders + _annotation_leader_segments(graph, row["id"])
         native_segments = native_radius_leader_segments(gray, row, records)
@@ -670,24 +829,42 @@ def _radius_source_observations(gray, records, graph, transform, leaders, band, 
                 # before the ownership audit sees the competing evidence.
                 found.append(item)
         for proposal in (row.get("source_arrow_proposals") or [])[:2]:
-            from .source_arrow_localization import localize_source_arrow_proposal
-            verified = localize_source_arrow_proposal(gray, row, proposal, boundary, band, contours,
-                                                      verifier=verify_source_arrow_proposal)
-            if verified is None:
-                continue
-            tip = np.asarray(verified["arrowhead"]["tip_px"], float)
-            targets = [{"entity_id": entity["id"], "entity_type": entity["type"],
-                        "tip_gap_px": float(np.min(np.linalg.norm(points-tip, axis=1)))}
-                       for entity, points in paths]
-            targets = sorted((target for target in targets if target["tip_gap_px"] <= target_band),
-                             key=lambda target: (target["tip_gap_px"], target["entity_id"]))
-            if not targets:
-                continue
-            item = {**verified, "record_id": row["id"], "nominal": row["parsed"].get("nominal"),
-                    "target_candidates": targets}
-            # A provider proposal is another independently verified source
-            # observation, never a reason to overwrite a nearby detected tip.
-            found.append(item)
+            from .source_arrow_localization import localize_source_arrow_candidates
+            search_receipt = {"record_id": row["id"]}
+            verified_candidates = localize_source_arrow_candidates(
+                gray, row, proposal, boundary, band, contours, verifier=verify_source_arrow_proposal,
+                audit=search_receipt, hypothesis_cache=proposal_cache)
+            proposal_searches.append(search_receipt)
+            for verified in verified_candidates:
+                tip = np.asarray(verified["arrowhead"]["tip_px"], float)
+                targets = [{"entity_id": entity["id"], "entity_type": entity["type"],
+                            "tip_gap_px": float(np.min(np.linalg.norm(points-tip, axis=1)))}
+                           for entity, points in paths]
+                targets = sorted((target for target in targets if target["tip_gap_px"] <= target_band),
+                                 key=lambda target: (target["tip_gap_px"], target["entity_id"]))
+                if targets:
+                    # Preserve physical alternatives until all OCR labels can
+                    # claim their real shafts. Local ambiguity is not absence.
+                    found.append({**verified, "record_id": row["id"], "nominal": row["parsed"].get("nominal"),
+                                  "target_candidates": targets})
+        from .source_arrow_localization import localize_ocr_radius_arrows, source_arrow_label_attachment
+        # A failed/omitted provider location must not disable bounded native
+        # shaft snapping. Supplement missing glyph-attached source evidence;
+        # retain all existing observations for the unchanged ownership audit.
+        if not any(source_arrow_label_attachment(gray, row, item).get("strong_text_adjacency") for item in found):
+            supplemented, search_receipt = localize_ocr_radius_arrows(
+                gray, row, records, boundary, band, contours, verifier=verify_source_arrow_proposal)
+            ocr_local_searches.append(search_receipt)
+            for verified in supplemented:
+                tip = np.asarray(verified["arrowhead"]["tip_px"], float)
+                targets = [{"entity_id": entity["id"], "entity_type": entity["type"],
+                            "tip_gap_px": float(np.min(np.linalg.norm(points-tip, axis=1)))}
+                           for entity, points in paths]
+                targets = sorted((target for target in targets if target["tip_gap_px"] <= target_band),
+                                 key=lambda target: (target["tip_gap_px"], target["entity_id"]))
+                if targets:
+                    found.append({**verified, "record_id": row["id"], "nominal": row["parsed"].get("nominal"),
+                                  "target_candidates": targets})
         if found:
             from .source_arrow_localization import (recover_source_attached_radius_arrow,
                                                      same_original_ink_arrow_shaft,
@@ -718,6 +895,11 @@ def _radius_source_observations(gray, records, graph, transform, leaders, band, 
                         recovered = {**recovered, "record_id": row["id"],
                                      "nominal": row["parsed"].get("nominal"),
                                      "target_candidates": targets}
+                        # Refining a positive tip must not erase the incomplete
+                        # search provenance that requires a competing-label
+                        # ownership audit before automatic binding.
+                        if seed.get("source_candidate_search") is not None:
+                            recovered["source_candidate_search"] = deepcopy(seed["source_candidate_search"])
                         chosen_targets = {target["entity_id"] for target in targets}
                         retained = []
                         for item, link in attachments:
@@ -741,14 +923,20 @@ def _radius_source_observations(gray, records, graph, transform, leaders, band, 
                             else:
                                 retained.append(item)
                         found = retained+[recovered]
+        from .source_arrow_localization import guard_source_arrow_scope
+        found, scope_rejections = guard_source_arrow_scope(gray,row,found,scope,band)
+        if rejections is not None:rejections.extend(scope_rejections)
         observations.extend(found)
     from .source_arrow_localization import resolve_source_arrow_ownership
     observations, ownership_rejections, audit = resolve_source_arrow_ownership(
-        gray, records, observations, band=band)
+        gray, records if ownership_records is None else ownership_records, observations, band=band)
     if rejections is not None:
         rejections.extend(ownership_rejections)
     if ownership_audit is not None:
         ownership_audit.update(audit)
+        ownership_audit["ocr_local_candidate_searches"] = ocr_local_searches
+        ownership_audit["provider_proposal_source_searches"] = proposal_searches
+        ownership_audit["source_scope_observations"] = scope_audits
     return observations
 
 
@@ -889,7 +1077,7 @@ def radius_binding_coverage(inventory, graph, constraints=(), decisions=()):
             "scope": "Source association only. Undetected arrows remain unresolved, never a no-arrow exemption; solver and DXF readback must separately prove exact radii."}
 
 
-def _radius_primitive_feasibility(entity, nominal, leader, model, graph, transform, band):
+def _radius_primitive_feasibility(entity, nominal, leader, model, graph, transform, band, *, gray=None,records=None):
     """Check the whole observed source interval after arrow-only target choice.
 
     A point on a coarse ARC does not prove that its full interval is one circle.
@@ -901,6 +1089,10 @@ def _radius_primitive_feasibility(entity, nominal, leader, model, graph, transfo
     from scipy.optimize import least_squares, minimize
     from scipy.spatial import cKDTree
     from .topology import _sample_path
+
+    from .source_fillet_seed import original_ink_fillet_feasibility
+    source_fillet=original_ink_fillet_feasibility(gray,records,entity,nominal,leader,model,graph,transform,band)
+    if source_fillet is not None:return source_fillet
 
     result = {"method": "fixed_nominal_radius_source_interval_v1", "entity_id": entity["id"],
               "nominal": float(nominal), "checked": False, "passed": False,
@@ -1083,6 +1275,132 @@ def _extension_support(lines, station, cross, node_cross, band):
     return options[0] if options else None
 
 
+def _derived_extension_supports(lines, station, cross, target_cross, band):
+    """Permit an observed drafting gap only between two aligned source strokes.
+
+    One stroke must reach the dimension shaft and the other the independently
+    verified finite material support. No projected pixel becomes a CAD lock.
+    Competing bridges are retained and never resolved by nominal dimensions.
+    """
+    direct = _extension_supports(lines, station, cross, target_cross, band)
+    if direct:
+        return direct
+    aligned = [line for line in lines if _interval_gap(station, _stroke_interval(line)) <= band]
+    shaft = [line for line in aligned if line["lo"]-band <= cross <= line["hi"]+band]
+    target = [line for line in aligned if line["lo"]-band <= target_cross <= line["hi"]+band]
+    bridges = []
+    seen = set()
+    for first, second in product(shaft, target):
+        if first is second:
+            continue
+        if abs(first["cross"]-second["cross"]) > max(1., min(first.get("thickness", 1), second.get("thickness", 1))):
+            continue
+        low, high = sorted((first, second), key=lambda row: row["lo"])
+        gap = float(high["lo"]-low["hi"])
+        widths = [float(row.get("thickness", 1.)) for row in (first, second)]
+        # Drafting clearances scale with the actually observed boundary pen.
+        # A thick material edge and a thin extension may be separated by more
+        # than six proposal pixels. Both finite attachments, collinearity and
+        # the unchanged 25% route-gap bound still have to pass. Broad merged
+        # components cannot grant a larger clearance budget.
+        width_budget = 6*max(widths) if max(widths) <= 12. else 0.
+        maximum_gap = max(12., 6*band, width_budget)
+        if not 0 < gap <= maximum_gap:
+            continue
+        if gap > .25*max(abs(cross-target_cross), 1.):
+            continue
+        key = tuple(float(line[k]) for line in (low, high) for k in ("cross", "lo", "hi", "thickness"))
+        if key in seen:
+            continue
+        seen.add(key)
+        bridges.append({**first, "lo": low["lo"], "hi": high["hi"],
+            "ink_station_interval_px": list(_stroke_interval(first)),
+            "intersection_gap_px": _interval_gap(station, _stroke_interval(first)),
+            "method": "two_collinear_source_strokes_with_observed_drafting_gap",
+            "observed_segments": [dict(low), dict(high)], "observed_gap_px": gap,
+            "maximum_gap_px": maximum_gap, "observed_stroke_widths_px": widths,
+            "gap_budget_basis": "bounded_observed_pen_width_and_route_fraction",
+            "nominal_used": False})
+    return bridges
+
+
+def _derived_station_groups(locations, extensions, axis, station, cross, band, *, section_lines=None):
+    groups = []
+    for location in locations:
+        point = np.asarray(location["source_px"], float).copy()
+        observation = location.get("evidence", {})
+        if "observed_source_level_px" in observation:
+            point[axis] = observation["observed_source_level_px"]
+        if "observed_source_extremum_px" in observation:
+            point = np.asarray(observation["observed_source_extremum_px"], float)
+        if "observed_source_center_px" in observation:
+            point = np.asarray(observation["observed_source_center_px"], float)
+        attachment = location.get("evidence", {}).get("source_attachment_interval_px")
+        if attachment is not None:
+            point[1-axis] = np.clip(cross, min(attachment), max(attachment))
+        gap = abs(float(point[axis])-station)
+        if gap > band*2:
+            continue
+        for support in _derived_extension_supports(extensions, station, cross, point[1-axis], band):
+            if _interval_gap(point[axis], _stroke_interval(support)) > band:
+                continue
+            # A finite curve's nearby extreme is not automatically the intended
+            # section. Require the observed turn itself to lie on the actual
+            # continuous extension stroke. A gapped or coarse projection stays
+            # an unadmitted alternative for provider/source review.
+            sections = [row for row in section_lines or []
+                if _interval_gap(point[1-axis], _stroke_interval(row)) <= band
+                and row["hi"]-row["lo"] >= max(24., 6*band)
+                and row["lo"]-band <= point[axis] <= row["hi"]+band]
+            intent_verified = bool(location["anchor"]["type"] == "support_level" or
+                (location["anchor"]["type"] in {"curve_center", "common_curve_center"} and
+                 observation.get("center_semantics_verified") is True) or
+                (support.get("method") != "two_collinear_source_strokes_with_observed_drafting_gap"
+                 and section_lines is not None and not sections
+                 and _interval_gap(point[axis], _stroke_interval(support)) == 0
+                 and support["lo"] <= point[1-axis] <= support["hi"]))
+            groups.append(((gap, abs(point[1-axis]-cross), location, support), {
+                "support_kind": "source_supported_derived_location", "extension": support,
+                "observed_station_px": support["cross"], "member_nodes": [],
+                "source_supported_entities": anchor_entity_ids(location["anchor"]),
+                "anchor": location["anchor"], "construction": location["evidence"],
+                "station_interpretation_verified": intent_verified,
+                "competing_source_section_count": len(sections),
+                "competing_source_section_check_performed": section_lines is not None,
+                "observed_attachment_px": point.tolist(), "coordinate_equality_enforced": False}))
+    return groups
+
+
+def _merge_derived_station_groups(groups, derived, graph):
+    """A proven material level replaces its arbitrary representative endpoint.
+
+    Preserve different supports as competing hypotheses; never select a level
+    merely because its fitted coordinate is closer to the nominal dimension.
+    """
+    entities = {row["id"]: row for row in graph.get("entities", [])}
+    result = list(groups)
+    for option, evidence in derived:
+        location = option[2]
+        if location["anchor"]["type"] == "support_level":
+            entity = entities[location["anchor"]["entity_id"]]
+            endpoints = {entity.get("start_node"), entity.get("end_node")}
+            equivalent = [item for item in result if item[1].get("member_nodes")
+                and set(item[1]["member_nodes"]) <= endpoints
+                and item[1]["support_kind"] != "unsupported_projection"]
+            equivalent.extend(item for item in result if
+                item[1].get("anchor", {}).get("type") == "line_intersection"
+                and entity["id"] in item[1]["anchor"]["entities"])
+            if equivalent:
+                evidence = {**evidence, "equivalent_source_endpoint_nodes": sorted({
+                    node for item in equivalent for node in item[1].get("member_nodes", [])}),
+                    "equivalent_theoretical_corners": [item[1]["anchor"] for item in equivalent
+                        if item[1].get("anchor", {}).get("type") == "line_intersection"]}
+                result = [item for item in result if not any(item is old for old in equivalent)]
+        result.append((option, evidence))
+    supported = [item for item in result if item[1]["support_kind"] != "unsupported_projection"]
+    return supported or result
+
+
 def _observed_station_groups(options, axis, band, graph):
     """Group by one measured, connected source extension, not nearby node IDs.
 
@@ -1145,11 +1463,17 @@ def _observed_station_groups(options, axis, band, graph):
             for value in sorted(unsupported,key=lambda v:(v[0],v[1]))[:5]]
 
 
-def _length_candidates(gray, records, graph, band, pixels_per_mm=None):
+def _length_candidates(gray, records, graph, band, pixels_per_mm=None, *, diagnostics=None,
+                       radius_observations=(), angle_observations=()):
     result = []
     nodes = graph.get("nodes", [])
     perpendicular = {"x": _axis_lines(gray,"y"), "y": _axis_lines(gray,"x")}
-    for witness in _linear_witnesses(gray, records, split_chains=True):
+    virtual = virtual_corner_locations(gray, records, graph, _source_transform({}, graph), band,
+                                       angle_observations=angle_observations)
+    derived_cache = {}
+    section_cache = {}
+    witnesses = binding_linear_witnesses(gray, records)
+    for witness in witnesses:
         axis = 0 if witness["axis"] == "x" else 1
         line = witness["line"]
         expected_span = witness["nominal"]*pixels_per_mm if pixels_per_mm else None
@@ -1166,7 +1490,40 @@ def _length_candidates(gray, records, graph, band, pixels_per_mm=None):
                 supports = _extension_supports(perpendicular[witness["axis"]],line[end],line["cross"],point[1-axis],band)
                 for support in supports or [None]:
                     options.append((gap, abs(point[1-axis]-line["cross"]), node, support))
-            choices.append(_observed_station_groups(options,axis,band,graph))
+            groups = _observed_station_groups(options,axis,band,graph)
+            # A dimension can refer to the removed sharp corner of a fillet.
+            # Only add this construction when no real source-supported vertex
+            # station exists; never substitute the nearest fitted coordinate.
+            if not any(g[1]["support_kind"] != "unsupported_projection" for g in groups):
+                constructions = []
+                for location in virtual:
+                    point = location["source_px"]
+                    gap = abs(float(point[axis])-line[end])
+                    if gap > band*2:
+                        continue
+                    for support in _extension_supports(perpendicular[witness["axis"]], line[end], line["cross"], point[1-axis], band):
+                        if _interval_gap(point[axis], _stroke_interval(support)) > band:
+                            continue
+                        constructions.append(((gap, abs(point[1-axis]-line["cross"]), location, support),
+                            {"support_kind": "source_supported_virtual_corner", "extension": support,
+                             "observed_station_px": support["cross"], "member_nodes": [],
+                             "source_supported_entities": location["anchor"]["entities"],
+                             "anchor": location["anchor"], "construction": location["evidence"],
+                             "coordinate_equality_enforced": False}))
+                if constructions:
+                    groups = constructions
+            if witness["axis"] not in derived_cache:
+                derived_cache[witness["axis"]] = source_derived_locations(
+                    gray, records, graph, _source_transform({}, graph), band, witness["axis"])
+                derived_cache[witness["axis"]].extend(source_curve_center_locations(
+                    gray, graph, radius_observations, witness["axis"], records=records))
+                section_cache[witness["axis"]] = _axis_lines(gray, witness["axis"])
+            derived = _derived_station_groups(derived_cache[witness["axis"]],
+                perpendicular[witness["axis"]], axis, line[end], line["cross"], band,
+                section_lines=section_cache[witness["axis"]])
+            if derived:
+                groups = _merge_derived_station_groups(groups, derived, graph)
+            choices.append(groups)
         alternatives = []
         for (first,first_group), (second,second_group) in product(*choices):
             if first[2]["id"] == second[2]["id"]:
@@ -1175,7 +1532,9 @@ def _length_candidates(gray, records, graph, band, pixels_per_mm=None):
             span = float(ordered[1]["x" if axis == 0 else "y"])-float(ordered[0]["x" if axis == 0 else "y"])
             if span <= 0:
                 continue
-            supported=first_group["support_kind"]!="unsupported_projection" and second_group["support_kind"]!="unsupported_projection"
+            supported=(first_group["support_kind"]!="unsupported_projection" and second_group["support_kind"]!="unsupported_projection"
+                       and first_group.get("station_interpretation_verified", True)
+                       and second_group.get("station_interpretation_verified", True))
             evidence = {"method": "source_dimension_line_and_observed_station_groups", "axis": witness["axis"],
                         "dimension_line": line, "line_endpoints_px": [[line["lo"],line["cross"]],[line["hi"],line["cross"]]] if axis==0 else [[line["cross"],line["lo"]],[line["cross"],line["hi"]]],
                         "endpoint_gaps_px": [first[0],second[0]], "extension_lines": [first[3],second[3]],
@@ -1183,16 +1542,45 @@ def _length_candidates(gray, records, graph, band, pixels_per_mm=None):
                         "coarse_endpoint_band_px": band*2, "fitted_value": span,
                         "expected_dimension_span_px":expected_span,"source_span_tolerance_px":span_tolerance,
                         "source_span_scale_compatible":compatible_span,
-                        "arrowhead_verified": False}
-            alternatives.append({"record_id":witness["record_id"],"kind":"distance_x" if axis==0 else "distance_y",
+                        "arrowhead_verified": witness.get("binding_evidence", {}).get("verified") is True,
+                        "dimension_span_evidence": witness.get("binding_evidence"),
+                        "axis_association": witness.get("axis_association")}
+            candidate = {"record_id":witness["record_id"],"kind":"distance_x" if axis==0 else "distance_y",
                                  "entities":[],"nodes":[n["id"] for n in ordered],"value":witness["nominal"],
-                                 "evidence":evidence,"local_reliable":bool(supported and compatible_span),
-                                 "_score": first[0]+second[0]+.005*(first[1]+second[1])})
+                                 "evidence":evidence,"local_reliable":bool(supported and compatible_span and
+                                     not witness.get("axis_association",{}).get("ambiguous",False) and
+                                     not witness.get("binding_evidence",{}).get("ambiguous",False)),
+                                 "_score": first[0]+second[0]+.005*(first[1]+second[1])}
+            if any("anchor" in n for n in ordered):
+                candidate["anchors"] = [n.get("anchor", {"type": "node", "node_id": n["id"]}) for n in ordered]
+                candidate["nodes"] = []
+                candidate["entities"] = sorted({e for a in candidate["anchors"]
+                    for e in anchor_entity_ids(a)})
+            alternatives.append(candidate)
         alternatives.sort(key=lambda row: row["_score"])
         for candidate in alternatives[:3]:
             candidate["local_reliable"] = candidate["local_reliable"] and len(alternatives)==1
             candidate["evidence"]["alternative_station_pairs"] = len(alternatives)
             result.append(candidate)
+        if diagnostics is not None:
+            reliable = any(c["local_reliable"] for c in alternatives[:3])
+            diagnostics.append({"record_id": witness["record_id"], "axis": witness["axis"],
+                "source_interval_px": [line["lo"], line["hi"]], "nominal": witness["nominal"],
+                "arrow_pair_observed": witness.get("binding_evidence",{}).get("verified") is True,
+                "source_span_scale_compatible": compatible_span,
+                "endpoint_station_candidates": [[{"support_kind": g["support_kind"],
+                    "node_or_location_id": option[2]["id"]} for option,g in group] for group in choices],
+                "candidate_count": len(alternatives), "reliable_candidate": reliable,
+                "status": "source_binding_candidate_available" if reliable else
+                    "source_span_nominal_conflict" if not compatible_span else
+                    "measurement_endpoints_not_represented" if not alternatives else
+                    "measurement_endpoint_evidence_ambiguous",
+                "scope": "Measurement interval detection is not proof of CAD association or solved dimensions."})
+    if diagnostics is not None:
+        witnessed = {w["record_id"] for w in witnesses}
+        diagnostics.extend({"record_id": row["id"], "nominal": row["parsed"].get("nominal"),
+                            "status": "source_dimension_interval_not_observed", "candidate_count": 0}
+                           for row in records if row["parsed"].get("kind") == "length" and row["id"] not in witnessed)
     return result
 
 
@@ -1219,6 +1607,48 @@ def _draw_topology(image_path, graph, model, path):
     source.save(path)
 
 
+def _short_restored_angle_line(entity, record_id, source_samples, fresh_source_line, band):
+    """Choose a finite observation window, never supply an angle certificate.
+
+    Single-ARC restoration has the same short-LINE obligation as restoration
+    between two radii. Its stored finite interval must still describe this
+    LINE in source pixels. Fresh stroke association and both arrows are
+    checked by the caller; stale source-line endpoints are not reused as ink.
+    """
+    witness = entity.get("angle_support_evidence") or {}
+    if (entity.get("type") != "LINE" or witness.get("record_id") != record_id or
+            witness.get("ground_truth_used") is not False or
+            witness.get("requires_angle_binding_and_solve") is not True):
+        return False
+    method = witness.get("method")
+    if method not in {"verified_two_radius_joint_line_topology_restore",
+                      "locally_verified_angle_ink_interval_topology_restore"}:
+        return False
+    try:
+        finite = np.asarray(witness.get("source_interval_endpoints_px"), dtype=float)
+        samples = np.asarray(source_samples, dtype=float)
+        observed = np.asarray(fresh_source_line, dtype=float)
+        if (finite.shape != (2, 2) or samples.ndim != 2 or samples.shape[1] != 2 or
+                len(samples) < 3 or observed.shape != (2, 2) or
+                not all(np.isfinite(value).all() for value in (finite, samples, observed))):
+            return False
+        endpoints = samples[[0, -1]]
+        if np.max(np.linalg.norm(endpoints-finite, axis=1)) > 1.:
+            return False
+        direction = observed[1]-observed[0]
+        length = float(np.linalg.norm(direction))
+        if length <= 0 or float(np.linalg.norm(finite[1]-finite[0])) < 12.:
+            return False
+        direction /= length
+        offsets = samples-observed[0]
+        gaps = np.abs(offsets[:, 0]*direction[1]-offsets[:, 1]*direction[0])
+        projection = offsets @ direction
+        return bool(np.max(gaps) <= max(5., band*1.7) and
+                    np.mean((projection >= -band) & (projection <= length+band)) >= .78)
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
 def _angle_source_observations(gray, records, graph, transform, band):
     """Associate angular labels with independently observed straight supports.
 
@@ -1229,6 +1659,7 @@ def _angle_source_observations(gray, records, graph, transform, band):
     ARC targets are retained as topology-repair evidence, never angle bindings.
     """
     angles = [r for r in records if r.get("parsed", {}).get("kind") == "angle"
+              and not _source_text_withheld(r)
               and isinstance(r["parsed"].get("nominal"), (int, float))
               and 0 < r["parsed"]["nominal"] < 90 and _box(r) is not None]
     if not angles:
@@ -1239,6 +1670,8 @@ def _angle_source_observations(gray, records, graph, transform, band):
     if not aligned:
         return []
     leaders = _leaders(gray, records)
+    from .angle_target_provider import verified_angle_hints, fresh_short_line_supported
+    guided = {r["id"]: verified_angle_hints(gray, r, band) for r in angles}
     boundary = [(e, _samples(e, transform)) for e in graph.get("entities", [])]
     observations = []
     for axis in ("vertical", "horizontal"):
@@ -1247,16 +1680,23 @@ def _angle_source_observations(gray, records, graph, transform, band):
         orient = lambda p: np.asarray(p, float)[..., ::-1] if swap else np.asarray(p, float)
         reference_lines = _axis_lines(oriented, "y")
         for row in angles:
+            hints = [hint for hint in guided[row["id"]] if hint["reference_axis"] == axis]
             box = orient(_box(row)); low, high = box.min(axis=0), box.max(axis=0)
             size = max(12., float(max(high-low)))
             references = [line for line in reference_lines
                           if line["lo"] <= high[1]+size*.15 and line["hi"] >= high[1]-size*.35
                           and low[0]-size*.6 <= line["cross"] <= high[0]+size*.6
                           and line["span"] >= size*1.5]
+            for hint in hints:
+                line = orient(hint["reference_line_px"])
+                cross = float(line[:, 0].mean()); lo, hi = sorted(line[:, 1])
+                if (lo <= high[1]+size*.15 and hi >= high[1]-size*.35
+                        and low[0]-size*.6 <= cross <= high[0]+size*.6 and hi-lo >= size*1.5):
+                    references.append({"cross":cross,"lo":float(lo),"hi":float(hi),"span":float(hi-lo)})
             # Merge the two detected edges and collinear pieces of a measured
             # stroke. This does not extend its finite observed support domain.
             groups = []
-            for raw in leaders:
+            for raw in [*leaders, *(np.asarray(h["source_line_px"],float) for h in hints)]:
                 line = orient(raw); delta = line[1]-line[0]
                 if abs(delta[1]) < max(24., size*.4):
                     continue
@@ -1302,31 +1742,33 @@ def _angle_source_observations(gray, records, graph, transform, band):
                     runs = np.split(ids, np.flatnonzero(np.diff(ids) != 1)+1)
                     ids = max(runs, key=len)
                     span = float(np.ptp(samples[ids, 1]))
-                    restoration = entity.get("angle_support_evidence") or {}
-                    restored_segment = restoration.get("source_line") or {}
-                    restored_points = np.asarray([restored_segment.get("start_px"),
-                                                  restored_segment.get("end_px")], dtype=float)
-                    short_restored_line = (
-                        entity["type"] == "LINE" and restoration.get("record_id") == row.get("id")
-                        and restoration.get("method") == "verified_two_radius_joint_line_topology_restore"
-                        and restoration.get("ground_truth_used") is False
-                        and restoration.get("requires_angle_binding_and_solve") is True
-                        and restored_points.shape == (2, 2) and np.isfinite(restored_points).all()
-                        and np.max(np.linalg.norm(restored_points - orient(source_line), axis=1)) <= 1.)
+                    # Witness coordinates stay in original pixels even while
+                    # horizontal-angle detection uses a transposed image.
+                    short_restored_line = _short_restored_angle_line(
+                        entity, row.get("id"), orient(samples), orient(source_line), band)
+                    fresh_guided_short_line = fresh_short_line_supported(gray,entity,row.get("id"),
+                        hints,orient(samples),orient(source_line),band)
+                    short_restored_line = short_restored_line or fresh_guided_short_line
                     # Short finite straight supports restored between two
                     # source-arrow-verified radii need a smaller observation
                     # window. The independently detected source stroke and
                     # opposing angle arrows are still checked below; numeric
                     # angle tolerances and global acceptance do not change.
-                    minimum_span = max(12., 4.*band) if short_restored_line else max(32., size*.6)
-                    if span < minimum_span:
+                    single_restoration = (entity.get("angle_support_evidence") or {}).get("method") == \
+                        "locally_verified_angle_ink_interval_topology_restore"
+                    grid = float(graph.get("source_grid_pitch_px") or 1.)
+                    minimum_span = (max(12., 8.*grid) if single_restoration else max(12., 4.*band)) \
+                        if short_restored_line else max(32., size*.6)
+                    observed_span = span*math.sqrt(1+slope*slope) if short_restored_line else span
+                    if observed_span < minimum_span:
                         continue
                     targets.append({"entity_id": entity["id"], "entity_type": entity["type"],
                                     "source_interval": [float(ids[0]/(len(samples)-1)), float(ids[-1]/(len(samples)-1))],
                                     "supported_span_px": span, "maximum_stroke_gap_px": float(max(distances[ids])),
                                     "whole_line_supported": bool(entity["type"] == "LINE" and
                                         float(max(distances)) <= max(5., band*1.7) and
-                                        span >= .78*float(np.ptp(samples[:, 1])))})
+                                         span >= .78*float(np.ptp(samples[:, 1]))),
+                                     "fresh_multimodal_short_line_reobserved":fresh_guided_short_line})
                 if not targets:
                     continue
                 for reference in references:
@@ -1336,10 +1778,29 @@ def _angle_source_observations(gray, records, graph, transform, band):
                     # A scanned angular dimension arc need not be horizontal;
                     # independently locate the two opposing tapered arrows.
                     arrow_options = {"reference": [], "target": []}
-                    for y in np.linspace(high[1]-size*.38, high[1]+size*.24, 23):
+                    # OCR boxes may extend below the dimension arc. Inspect the
+                    # whole label neighbourhood, not just a strip at its bottom.
+                    search_y = list(np.linspace(low[1]-size*.10, high[1]+size*.24, 49))
+                    for hint in hints:
+                        for key in ("reference_tip_px", "target_tip_px"):
+                            tip = orient(hint[key])
+                            # Only source-verified hints in this label's local
+                            # dimension neighbourhood can guide extra searches.
+                            if low[1]-size <= tip[1] <= high[1]+size:
+                                search_y.extend(tip[1]+np.linspace(-band,band,9))
+                    for y in search_y:
                         for role, x in (("reference", xref), ("target", slope*y+intercept)):
                             for sign in (-1., 1.):
-                                arrow = _arrowhead_evidence(oriented, np.asarray([x, y]), np.asarray([sign, 0.]), size, band)
+                                # At an angular dimension's slanted side the
+                                # arrow follows the normal to the observed ray.
+                                # Nominal OCR angles never choose this direction.
+                                direction = np.asarray([sign, -sign*slope if role == "target" else 0.])
+                                direction /= np.linalg.norm(direction)
+                                arrow = _arrowhead_evidence(oriented, np.asarray([x, y]), direction, size, band)
+                                if arrow is None and role == "target":
+                                    # Some drawings use a horizontal dimension
+                                    # line; retain that independently checked form.
+                                    arrow = _arrowhead_evidence(oriented, np.asarray([x, y]), np.asarray([sign, 0.]), size, band)
                                 if arrow is None:
                                     continue
                                 tip = np.asarray(arrow["tip_px"])
@@ -1367,14 +1828,85 @@ def _angle_source_observations(gray, records, graph, transform, band):
                                          "evidence": {"method": "source_angular_arrows_axis_and_straight_support_v1",
                                                       "verified": True, "nominal_used_to_rank": False,
                                                       "reference_arrow": original_arrow(a), "target_arrow": original_arrow(b),
+                                                      "arrow_search_window_oriented_y_px": [float(low[1]-size*.10), float(high[1]+size*.24)],
+                                                      "arrow_search_samples": 49,
+                                                       "multimodal_source_hint_count": len(hints),
+                                                       "additional_source_hint_search_samples": len(search_y)-49,
+                                                      "target_direction_method": "observed_source_line_normal_with_horizontal_fallback",
                                                       "coarse_direction_tolerance_deg": 8.,
                                                       "source_coordinate_axes_aligned": True}})
-    return observations
+    return _source_owned_angle_observations(observations, graph, transform)
 
 
-def _angle_candidates(observations, graph):
+def _source_owned_angle_observations(observations, graph, transform):
+    """Remove a cross-side extension claim only with another observed owner.
+
+    A record must already have a separate, independently witnessed alternative
+    LINE. Two different records competing for the same finite LINE are checked
+    by the existing arrow/finite-domain ownership test. This does not invent a
+    missing target, pick a nominal-nearest slope, or resolve equally close rays.
+    """
+    by_line = defaultdict(list)
+    def verified_observation(row):
+        evidence = row.get("evidence") or {}
+        return (row.get("verified") is True
+                and (evidence.get("target_arrow") or {}).get("verified") is True
+                and (evidence.get("reference_arrow") or {}).get("verified") is True)
+    for index, row in enumerate(observations):
+        if not verified_observation(row):
+            continue
+        whole = [t for t in row.get("target_candidates", []) if t.get("whole_line_supported") is True]
+        if len(whole) == 1:
+            by_line[(row.get("reference_axis"), whole[0]["entity_id"])].append(index)
+    removed = {}
+    entities = {e.get("id"): e for e in graph.get("entities", [])}
+    for (axis, entity_id), indices in by_line.items():
+        if len(indices) != 2 or observations[indices[0]]["record_id"] == observations[indices[1]]["record_id"]:
+            continue
+        for suspect in indices:
+            row = observations[suspect]
+            alternatives = {t["entity_id"] for other in observations
+                            if other is not row and verified_observation(other)
+                            and other.get("record_id") == row.get("record_id")
+                            and other.get("reference_axis") == axis
+                            for t in other.get("target_candidates", [])
+                            if t.get("whole_line_supported") is True and t["entity_id"] != entity_id
+                            and entities.get(t["entity_id"], {}).get("type") == "LINE"}
+            if not alternatives:
+                continue
+            candidates, group = {}, []
+            for index in indices:
+                candidate_id = f"angle_source_{index}"
+                observation = observations[index]
+                candidates[candidate_id] = {"evidence": {"angle_observation": observation}}
+                group.append(({"kind": "angle", "entities": [entity_id]},
+                              {"candidate_id": candidate_id, "record_id": observation["record_id"]}))
+            scoped_graph = {**graph, "entities": [e for e in graph.get("entities", [])
+                                                  if e.get("id") in alternatives | {entity_id}]}
+            owner = _source_owned_angle_conflict(group, candidates, scoped_graph, {}, transform=transform)
+            if owner is None or owner["record_id"] == row["record_id"]:
+                continue
+            removed[suspect] = {"method": "independent_angle_arrows_and_finite_line_ownership_v1",
+                                "reason": "extension_claim_owned_by_another_angle_record",
+                                "record_id": row["record_id"], "rejected_entity_id": entity_id,
+                                "owner_record_id": owner["record_id"],
+                                "independently_observed_alternative_entities": sorted(alternatives),
+                                "nominal_used_to_rank": False,
+                                "rejected_observation": row}
+    result = []
+    for index, row in enumerate(observations):
+        if index in removed:
+            continue
+        rejections = [evidence for evidence in removed.values()
+                      if evidence["record_id"] == row.get("record_id")]
+        result.append({**row, "finite_source_ownership_rejections": rejections} if rejections else row)
+    return result
+
+
+def _angle_candidates(observations, graph, *, source_radius_entities=()):
     result = []
     entity_map = {e["id"]: e for e in graph.get("entities", [])}
+    source_radius_entities = set(source_radius_entities)
     by_record = defaultdict(list)
     for observation in observations:
         if observation.get("verified"):
@@ -1415,6 +1947,20 @@ def _angle_candidates(observations, graph):
                     lo, hi = sorted(interval)
                     if (other.get("start_node") in shared and lo <= .12 and hi <= .4) or (
                             other.get("end_node") in shared and lo >= .6 and hi >= .88):
+                        return True
+                    witness = target_line.get("angle_support_evidence") or {}
+                    # The circle's separately verified arrow and whole-radius
+                    # feasibility establish its curved type. A whole witnessed
+                    # restored LINE may own the angle even when the source
+                    # extension band overlaps much of this adjacent small R.
+                    # An unverified ARC or another whole LINE remains a rival.
+                    if (other_id in source_radius_entities and
+                            witness.get("record_id") == record_id and
+                            witness.get("nominal_direction_constructed") is True and
+                            witness.get("ground_truth_used") is False and
+                            witness.get("requires_angle_binding_and_solve") is True and
+                            ((other.get("start_node") in shared and lo <= .12) or
+                             (other.get("end_node") in shared and hi >= .88))):
                         return True
                 return False
             unique = len(signatures) == 1 and all((a, e) == (axis, entity_id) or local_neighbor(a, e) for a, e in all_targets)
@@ -1458,7 +2004,7 @@ def _constructed_fillet_tangent_relations(gray, records, image_path, graph, tran
     for index, arc in enumerate(entities):
         if (arc.get("type") != "ARC" or arc.get("fillet_construction") not in {
                 "existing_finite_line_supports", "existing_lines_short_connector_redistribution",
-                "existing_line_arc_line_tangent_reinsertion"}):
+                "existing_line_arc_line_tangent_reinsertion","original_image_two_line_exact_radius_seed"}):
             continue
         refinement = arc.get("source_refinement") or {}
         binding = arc.get("radius_binding") or {}
@@ -1469,9 +2015,14 @@ def _constructed_fillet_tangent_relations(gray, records, image_path, graph, tran
                                           rel_tol=1e-8, abs_tol=1e-8) if radius is not None else False
         except (TypeError, ValueError, KeyError):
             radius_matches = False
-        if (radius is None or any(refinement.get(key) is not True for key in (
+        source_path_verified=(refinement.get('source_path_and_arrow_verified') is True or
+            (arc.get('fillet_construction')=='original_image_two_line_exact_radius_seed' and
+             refinement.get('original_image_support_verified') is True and
+             (refinement.get('original_image_check') or {}).get('passed') is True and
+             (refinement.get('original_image_check') or {}).get('ground_truth_used') is False))
+        if (radius is None or not source_path_verified or any(refinement.get(key) is not True for key in (
                 "outer_endpoints_fixed", "support_directions_fixed", "support_types_fixed",
-                "radius_exact", "source_path_and_arrow_verified"))
+                "radius_exact"))
                 or refinement.get("ground_truth_used") is not False
                 or not radius_matches):
             continue
@@ -1574,7 +2125,7 @@ def _constructed_fillet_tangent_relations(gray, records, image_path, graph, tran
     return result
 
 
-def _source_owned_angle_conflict(group, candidates, graph, model):
+def _source_owned_angle_conflict(group, candidates, graph, model, *, transform=None):
     """Resolve only a clearly nearer arrow on the same finite source LINE.
 
     Angular arrows can land on an extension of a material line. If two
@@ -1592,7 +2143,8 @@ def _source_owned_angle_conflict(group, candidates, graph, model):
     if not entity or entity.get("type") != "LINE":
         return None
     try:
-        start, end = _source_transform(model, graph)([entity["start"], entity["end"]])
+        transform = transform or _source_transform(model, graph)
+        start, end = transform([entity["start"], entity["end"]])
         direction = end - start
         length = float(np.linalg.norm(direction))
         if not math.isfinite(length) or length <= 0:
@@ -1626,7 +2178,6 @@ def _source_owned_angle_conflict(group, candidates, graph, model):
     # The farther label must have a different, finite, similarly directed
     # source-topology LINE nearer to its arrow. This witness prevents two
     # labels on the same extension from being silently forced onto one side.
-    transform = _source_transform(model, graph)
     other_line_witness = False
     for other in graph.get("entities", []):
         if other.get("type") != "LINE" or other.get("id") == entity_ids[0]:
@@ -1799,9 +2350,11 @@ def _radius_line_joint_preflight(candidate, observations, graph):
 def _radius_one_arrow_incompatible_claim_preflight(candidate, observations, candidates, graph):
     """At one shared ARC joint, an independently bound incompatible R owns its ARC.
 
-    This is only a source-constraint exclusion: one full verified shaft must
-    target exactly two adjacent ARCs and the other ARC needs its own unique,
-    feasible and source-bound radius label. It never chooses by fitted radius.
+    Multiple pixel observations can describe the same two-ARC uncertainty at
+    a thick joint. ALL must be verified and expose exactly the same adjacent
+    pair. The other ARC needs its own unique, feasible, source-bound radius
+    label. This is constraint exclusion, never ranking by fitted radius or
+    discarding a source observation that points at a different feature.
     """
     if candidate.get("kind") != "radius" or len(candidate.get("entities", [])) != 1:
         return None
@@ -1813,20 +2366,26 @@ def _radius_one_arrow_incompatible_claim_preflight(candidate, observations, cand
         return None
     chosen = candidate["entities"][0]
     observed = [row for row in observations if row.get("record_id") == candidate["record_id"]]
-    if len(observed) != 1:
+    if not observed:
         return None
-    row = observed[0]
-    if (not row.get("arrowhead_verified") or
+    if any(not row.get("arrowhead_verified") or
             not (row.get("shaft_evidence") or {}).get("verified") or
             not (row.get("source_text_shaft_attachment") or {}).get("strong_text_adjacency") or
-            (row.get("source_arrow_ownership") or {}).get("status") != "globally_unique_source_claim"):
+            (row.get("source_arrow_ownership") or {}).get("status") != "globally_unique_source_claim"
+            for row in observed):
         return None
+    row = observed[0]
     targets = row.get("target_candidates") or []
     if (len(targets) != 2 or any(target.get("entity_type") != "ARC" for target in targets) or
             len({target.get("entity_id") for target in targets}) != 2 or
             chosen not in {target.get("entity_id") for target in targets}):
         return None
     other = next(target["entity_id"] for target in targets if target["entity_id"] != chosen)
+    for observation in observed[1:]:
+        pair=observation.get("target_candidates") or []
+        if (len(pair)!=2 or any(target.get("entity_type")!="ARC" for target in pair) or
+                {target.get("entity_id") for target in pair}!={chosen,other}):
+            return None
     entities = {entity["id"]: entity for entity in graph.get("entities", [])}
     first, second = entities.get(chosen), entities.get(other)
     if (first is None or second is None or first.get("type") != "ARC" or
@@ -1845,8 +2404,10 @@ def _radius_one_arrow_incompatible_claim_preflight(candidate, observations, cand
     if len(claims) != 1 or sum(bool(item.get("local_reliable")) for item in candidates
                                if item.get("record_id") == claims[0]["record_id"]) != 1:
         return None
-    audit = {"method": "one_source_arrow_and_independent_incompatible_radius_claim_v1",
-             "entity_id": chosen, "source_observation_count": 1,
+    audit = {"method": "one_source_arrow_and_independent_incompatible_radius_claim_v1"
+                       if len(observed)==1 else "common_adjacent_arc_pair_and_independent_incompatible_radius_claim_v1",
+             "entity_id": chosen, "source_observation_count": len(observed),
+             "all_source_target_sets_preserved": True,
              "independent_incompatible_claims": [{"entity_id": other,
                                                   "record_ids": [claims[0]["record_id"]]}],
              "nominal_used_to_resolve_constraint_conflict": True,
@@ -1923,7 +2484,7 @@ def _radius_ocr_owned_target_preflight(candidate, observations, candidates):
     return audit, attached
 
 
-def _admit_joint_radius_conflicts(candidates, observations, model, graph, transform, band):
+def _admit_joint_radius_conflicts(candidates, observations, model, graph, transform, band, *, gray=None,records=None):
     """Run the original fixed-radius source gate after a source-only joint proof."""
     radius_entities = {entity["id"]: entity for entity in graph.get("entities", [])
                        if entity.get("type") == "ARC"}
@@ -1943,12 +2504,35 @@ def _admit_joint_radius_conflicts(candidates, observations, model, graph, transf
         if "whole_primitive_radius" not in evidence:
             _, unique_leader = preflight
             evidence["whole_primitive_radius"] = _radius_primitive_feasibility(
-                entity, candidate["value"], unique_leader, model, graph, transform, band)
+                entity, candidate["value"], unique_leader, model, graph, transform, band,gray=gray,records=records)
         if (evidence.get("whole_primitive_radius") or {}).get("passed"):
             candidate["local_reliable"] = True
             evidence["source_joint_radius_conflict_resolution"] = {
                 **preflight[0], "fixed_nominal_source_interval_feasible": True}
             evidence["multiple_directed_source_targets_require_review"] = False
+
+
+def _directed_radius_source_counts(observations):
+    """Count finite targets separately from accepted arrow observations.
+
+    ``_radius_source_observations`` has already checked each target against the
+    finite graph and resolved source-label ownership. Two retained physical
+    arrows may point to the same object; their count is not target ambiguity.
+    Preserve their identities rather than merging arrows to manufacture a
+    unique source claim. Rejected observations must not be supplied here.
+    """
+    targets = sorted({target["entity_id"] for row in observations
+                      for target in row.get("target_candidates", [])})
+    physical_arrows = sorted({ownership["physical_arrow_id"] for row in observations
+                             if (ownership := row.get("source_arrow_ownership") or {})
+                             .get("physical_arrow_id")})
+    return {
+        "directed_source_target_count": len(targets),
+        "directed_source_target_ids": targets,
+        "directed_source_observation_count": len(observations),
+        "directed_source_physical_arrow_count": len(physical_arrows),
+        "directed_source_physical_arrow_ids": physical_arrows,
+    }
 
 
 def build_binding_candidates(image_path, document, model, graph, output_dir):
@@ -1959,26 +2543,46 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
         raise ValueError("source image unreadable")
     all_records = canonical_records(document)
     records = [{"id":r["id"],"text":str(r.get("text","")),"parsed":r["parsed"],"box":r.get("box"),
-                "source_arrow_proposals":r.get("source_arrow_proposals", [])} for r in all_records]
+                "source_arrow_proposals":r.get("source_arrow_proposals", []),
+                "source_angle_proposals":r.get("source_angle_proposals", [])} for r in all_records]
+    for original,row in zip(all_records,records):
+        if original.get("source_text_admission") is not None:
+            row["source_text_admission"]=deepcopy(original["source_text_admission"])
     text_evidence={row["id"]:_source_text_evidence(gray,row) for row in records}
     for row in records:row["source_text_evidence"]=text_evidence[row["id"]]
     eligible = [r for r in records if r["parsed"].get("kind") in {"radius","length","diameter","angle"}
                 and r["parsed"].get("nominal") is not None and r["parsed"]["nominal"] > 0 and _box(r) is not None]
+    # Retain the original parsed values and all obligations in the denominator;
+    # unresolved, contradictory source rereads cannot propose hard attributes.
+    admitted = [r for r in eligible if not _source_text_withheld(r)]
     band = max(4.,float(graph.get("proposal_tolerance_px",max(gray.shape)/500)))
     transform = _source_transform(model,graph)
     pixels_per_mm=(model.get("scale") or {}).get("pixels_per_mm")
-    candidates = _length_candidates(gray,eligible,graph,band,pixels_per_mm)
+    length_diagnostics = []
+    candidates = []
+    # Withheld *values* cannot bind, but their glyphs must still be masked.
+    # Dropping the whole record lets nearby symbolic text become Hough ink,
+    # making the same verified angle disappear between planning and binding.
     angle_observations = _angle_source_observations(gray, records, graph, transform, band)
     candidates.extend(_angle_candidates(angle_observations, graph))
     arcs = [(entity,_samples(entity,transform),transform([entity["center"]])[0])
             for entity in graph.get("entities",[]) if entity.get("type")=="ARC"]
     contours = [_samples(entity,transform) for entity in graph.get("entities",[])]
-    leaders = _leaders(gray,eligible)
+    leaders = _leaders(gray,admitted)
     radius_rejections = []
     arrow_ownership = {}
-    radius_observations = _radius_source_observations(gray, eligible, graph, transform, leaders, band,
-                                                      radius_rejections, arrow_ownership)
-    for row in eligible:
+    radius_observations = _radius_source_observations(gray, admitted, graph, transform, leaders, band,
+                                                      radius_rejections, arrow_ownership,
+        source_boundary_points=(model.get("extraction") or {}).get("raw_polyline_px"), ownership_records=records)
+    candidates.extend(_length_candidates(gray, admitted, graph, band, pixels_per_mm,
+        diagnostics=length_diagnostics, radius_observations=radius_observations,
+        angle_observations=angle_observations))
+    from .radial_dimension_binding import radial_dimension_candidates
+    radial_candidates, radial_diagnostics = radial_dimension_candidates(
+        gray, admitted, graph, model, band, radius_observations=radius_observations,
+        angle_observations=angle_observations)
+    candidates.extend(radial_candidates)
+    for row in admitted:
         if row["parsed"]["kind"] != "radius":
             continue
         box = _box(row)
@@ -2039,7 +2643,7 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
             if independent:
                 entity = next(entity for entity, _, _ in arcs if entity["id"] == best["entities"][0])
                 feasibility = _radius_primitive_feasibility(entity, row["parsed"]["nominal"], best["evidence"]["leader"],
-                                                             model, graph, transform, band)
+                                                             model, graph, transform, band,gray=gray,records=records)
                 best["evidence"]["whole_primitive_radius"] = feasibility
                 best["local_reliable"] = bool(feasibility["passed"])
             for candidate in options[:3]:
@@ -2055,32 +2659,56 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
         candidate.pop("_score",None); candidate.pop("_stations",None)
         candidate["source"] = "source_image_geometry_candidate"
     for candidate in candidates:
+        parsed=next(row["parsed"] for row in records if row["id"]==candidate["record_id"])
+        candidate["source_dimension_semantics"]={key:parsed.get(key) for key in
+            ("kind","nominal","lower_deviation","upper_deviation")}
         candidate["evidence"]["source_text"]=text_evidence[candidate["record_id"]]
         if text_evidence[candidate["record_id"]]["symbol_confusion"]:
             candidate["local_reliable"]=False
         if candidate["kind"] == "radius":
             observed = [row for row in radius_observations if row["record_id"] == candidate["record_id"]]
-            candidate["evidence"]["directed_source_target_count"] = len(observed)
-            distinct_targets = {target["entity_id"] for row in observed for target in row.get("target_candidates", [])}
+            source_counts = _directed_radius_source_counts(observed)
+            candidate["evidence"].update(source_counts)
             candidate["evidence"]["source_arrow_ownership_rejection_reasons"] = sorted({
                 row["reason"] for row in radius_rejections if row.get("record_id") == candidate["record_id"] and row.get("reason")})
-            if len(observed) > 1 and len(distinct_targets) > 1:
+            # A single observed arrow can have coarse adjacent LINE/ARC
+            # hypotheses. The existing finite radius/shaft admission above
+            # resolves that association. Target-count metadata for provisional
+            # solving must not replace it with a new coarse-neighbor veto.
+            # Multiple independent arrows to different objects still conflict;
+            # two observations of the same finite target do not.
+            if len(observed)>1 and source_counts["directed_source_target_count"] > 1:
                 candidate["local_reliable"] = False
                 candidate["evidence"]["multiple_directed_source_targets_require_review"] = True
     # At a thick shared joint the best/runner-up tip scores can be closer than
     # the ordinary independent-leader margin. First establish the target from
     # full source arrows and a separately feasible incompatible label; only
     # then test this candidate's original raw-mask interval at its OCR radius.
-    _admit_joint_radius_conflicts(candidates, radius_observations, model, graph, transform, band)
+    _admit_joint_radius_conflicts(candidates, radius_observations, model, graph, transform, band,gray=gray,records=records)
     reliable_counts=Counter(c["record_id"] for c in candidates if c["local_reliable"])
     for candidate in candidates:
         if reliable_counts[candidate["record_id"]]>1:
             candidate["local_reliable"]=False
             candidate["evidence"]["record_has_multiple_supported_bindings"]=True
+    source_radius_entities = {candidate["entities"][0] for candidate in candidates
+        if candidate.get("kind") == "radius" and candidate.get("local_reliable") is True
+        and len(candidate.get("entities") or []) == 1
+        and (candidate.get("evidence") or {}).get("uniquely_supported_leader") is True
+        and ((candidate.get("evidence") or {}).get("whole_primitive_radius") or {}).get("passed") is True}
+    refreshed_angles = {(candidate["record_id"], tuple(candidate["entities"]), candidate["reference_axis"]): candidate
+        for candidate in _angle_candidates(angle_observations, graph, source_radius_entities=source_radius_entities)}
+    for candidate in candidates:
+        if candidate.get("kind") != "angle": continue
+        refreshed = refreshed_angles.get((candidate["record_id"], tuple(candidate["entities"]), candidate["reference_axis"]))
+        if refreshed and (candidate.get("evidence") or {}).get("source_text", {}).get("symbol_confusion") is not True:
+            candidate["local_reliable"] = refreshed["local_reliable"]
     relations=structural_evidence(gray,records,graph,transform,_samples,band)
-    relations=_raw_boundary_tangent_relations(gray,records,model,graph,transform,band,relations)
+    relations=_raw_boundary_tangent_relations(gray,records,model,graph,transform,band,relations,
+                                             angle_observations=angle_observations)
     relations=_constructed_fillet_tangent_relations(
         gray,records,image_path,graph,transform,relations,candidates)
+    from .source_contact_evidence import contact_construction_relations
+    relations=contact_construction_relations(gray,records,image_path,model,graph,transform,relations,candidates)
     # Prioritize supported records, then keep alternatives together in the packet.
     by_record=defaultdict(list)
     for candidate in candidates: by_record[candidate["record_id"]].append(candidate)
@@ -2097,6 +2725,7 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
                "all_records":records,"all_candidates":candidates,"source_image_sha256":hashlib.sha256(image_path.read_bytes()).hexdigest(),
                "artifacts":{"topology":str(topology),"inventory":str(out/"binding-candidates.json")},
                "counts":{"ocr_records":len(records),"recognized_dimensions":len(eligible),"all_candidates":len(candidates),
+                         "withheld_source_dimensions":len(eligible)-len(admitted),
                          "input_records":len(selected_records),"input_candidates":len(selected_candidates),
                          "structural_candidates":len(relations),
                          "recognized_angles":sum(r["parsed"]["kind"] == "angle" for r in eligible),
@@ -2106,11 +2735,16 @@ def build_binding_candidates(image_path, document, model, graph, output_dir):
                "annotation_diagnostics":_annotation_issues(graph,eligible,candidates),
                "radius_source_observations":radius_observations,
                "angle_source_observations":angle_observations,
+               "length_source_observations":length_diagnostics,
+               "radial_source_observations":radial_diagnostics,
                "radius_source_rejections":radius_rejections,
                "source_arrow_ownership":arrow_ownership,
                "constructed_radius_priors":_constructed_radius_priors(graph,records),
                "ground_truth_used":False,"issues":[],"proposal_tolerance_px":band}
     inventory["radius_binding_coverage"] = radius_binding_coverage(inventory, graph)
+    from .reconstruction_priority import mask_is_hard
+    if not mask_is_hard(model):
+        inventory["binding_priority"]="radius_and_angle_first"
     _write(out/"binding-candidates.json",inventory)
     return inventory
 
@@ -2124,6 +2758,18 @@ def _constraint(candidate, source):
     result = {"id":"k"+candidate["id"],"kind":candidate["kind"],"record_id":candidate["record_id"],
             "entities":candidate["entities"],"nodes":candidate["nodes"],"value":candidate["value"],"source":source,
             "candidate_id":candidate["id"]}
+    if candidate["kind"] in {"distance","distance_x","distance_y","angle"} and candidate.get("source_dimension_semantics"):
+        from .dimension_policy import source_dimension_target
+        target,policy=source_dimension_target(candidate["source_dimension_semantics"])
+        if policy is not None:
+            result.update(value=math.copysign(target,float(candidate["value"])),source_tolerance=policy)
+    if candidate["kind"] in {"distance_x", "distance_y", "distance", "angle"}:
+        result.update(required=True, enforcement="exact", nominal_source="source_ocr")
+    if candidate.get("anchors"):
+        result.update(anchors=candidate["anchors"], required=True,
+                      enforcement="exact", nominal_source="source_ocr")
+    if candidate.get("source_station_relation") is not None:
+        result["source_station_relation"] = deepcopy(candidate["source_station_relation"])
     if candidate["kind"] == "radius":
         result.update(required=True, enforcement="exact", nominal_source="source_ocr",
                       source_arrow_verified=True)
@@ -2143,7 +2789,7 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
             try:
                 receipt=provider.select(image_path,inventory["artifacts"]["topology"],inventory)
                 if receipt.get("schema_success"):
-                    validate_selection(json.dumps({"bindings":receipt.get("bindings"),"relations":receipt.get("relations")},allow_nan=False))
+                    validate_receipt_selection(receipt)
             except InterruptedError:
                 raise
             except Exception:
@@ -2159,8 +2805,8 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
     # but cannot claim an API-confirmed binding or a model abstention.
     sent_sets=[]
     sent_inventory_verified=True
-    for key, rows in (("input_record_ids",inventory["records"]),
-                      ("input_candidate_ids",inventory["candidates"]),
+    for key, rows in (("input_record_ids",inventory["all_records"]),
+                      ("input_candidate_ids",inventory["all_candidates"]),
                       ("input_relation_ids",inventory["relations"])):
         value=receipt.get(key)
         valid=(isinstance(value,list) and all(isinstance(item,str) for item in value)
@@ -2175,18 +2821,76 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
     graph_nodes={n["id"]:n for n in graph.get("nodes",[])}
     selections=receipt.get("bindings",[]) if receipt.get("schema_success") else []
     repeats=Counter(row["record_id"] for row in selections)
-    decisions=[];proposals=[]
+    # Recheck both the current reviewed input and generated inventory. A stale
+    # or provider-selected candidate must not bypass inventory withholding.
+    withheld_records={r["id"] for r in canonical_records(document) if _source_text_withheld(r)}
+    withheld_records.update(r["id"] for r in inventory["all_records"] if _source_text_withheld(r))
+    decisions=[{"record_id":rid,"candidate_id":None,"source":"source_ocr_review",
+                "accepted":False,"reason":"unresolved_source_ocr_semantics"}
+               for rid in sorted(withheld_records)];proposals=[]
 
     def check(candidate, record_id):
+        if record_id in withheld_records:return "unresolved_source_ocr_semantics"
         if candidate is None:return "unknown_candidate_id"
         row=records.get(record_id)
         if row is None:return "unknown_record_id"
         if candidate["record_id"]!=record_id:return "record_candidate_mismatch"
         expected={"radius":"radius","distance_x":"length","distance_y":"length","distance":"length","angle":"angle"}.get(candidate["kind"])
+        if candidate.get("source_station_relation") is not None:
+            from .measurement_relations import radial_station_relation
+            relation = candidate["source_station_relation"]
+            try:
+                radial_station_relation(relation,
+                    measurement_axis="x" if candidate["kind"] == "distance_x" else "y" if candidate["kind"] == "distance_y" else None)
+            except (ValueError, TypeError, KeyError, ArithmeticError):
+                return "invalid_source_station_relation"
+            if candidate["kind"] not in {"distance_x", "distance_y"} or not candidate.get("anchors"):
+                return "invalid_source_station_relation"
+            reference = records.get(relation["reference_record_id"])
+            if (not reference or reference["id"] == record_id or reference["id"] in withheld_records
+                    or reference.get("source_text_evidence", {}).get("symbol_confusion")):
+                return "unresolved_source_station_reference"
+            if relation["reference_dimension"] != {key: reference["parsed"].get(key) for key in
+                    ("kind", "nominal", "lower_deviation", "upper_deviation")}:
+                return "source_station_reference_nominal_mismatch"
+            expected = relation["primary_kind"]
         if expected!=row["parsed"]["kind"]:return "record_type_mismatch"
         if candidate["value"]!=row["parsed"].get("nominal"):return "source_nominal_mismatch"
         if inventory["units"]!="mm":return "units_unresolved"
         if any(e not in graph_entities for e in candidate["entities"]) or any(n not in graph_nodes for n in candidate["nodes"]):return "unknown_graph_id"
+        if candidate.get("anchors"):
+            anchors = candidate["anchors"]
+            if candidate["kind"] not in {"distance_x", "distance_y", "distance"} or len(anchors) != 2 or candidate["nodes"]:
+                return "invalid_measurement_anchors"
+            referenced = set()
+            for anchor in anchors:
+                if anchor.get("type") == "node":
+                    if set(anchor) != {"type", "node_id"} or anchor["node_id"] not in graph_nodes:
+                        return "invalid_measurement_anchor_node"
+                elif anchor.get("type") == "line_intersection":
+                    ids = anchor.get("entities", [])
+                    if (set(anchor) != {"type", "entities"} or len(ids) != 2 or len(set(ids)) != 2
+                            or any(graph_entities.get(e,{}).get("type") != "LINE" for e in ids)):
+                        return "invalid_measurement_anchor_lines"
+                    referenced.update(ids)
+                elif anchor.get("type") in {"support_level", "curve_extremum", "curve_center", "common_curve_center"}:
+                    try:
+                        _, support_ids = validate_derived_anchor(anchor, graph_entities,
+                            "x" if candidate["kind"] == "distance_x" else "y" if candidate["kind"] == "distance_y" else None)
+                    except (ValueError, TypeError, KeyError, ArithmeticError):
+                        return "invalid_derived_measurement_anchor"
+                    referenced.update(support_ids)
+                else:
+                    return "unsupported_measurement_anchor"
+            if referenced != set(candidate["entities"]):return "measurement_anchor_reference_mismatch"
+            # A provider selects candidate identity only; stale support lines
+            # must not turn a formerly valid intersection into solver input.
+            from .parametric_solver import _validate_measurement_anchors
+            try:
+                _validate_measurement_anchors(deepcopy(candidate),
+                    {key:np.array([value["x"],value["y"]]) for key,value in graph_nodes.items()},graph_entities)
+            except (ValueError,TypeError,KeyError,ArithmeticError):
+                return "invalid_measurement_geometry"
         if candidate["kind"]=="radius" and (len(candidate["entities"])!=1 or graph_entities[candidate["entities"][0]]["type"]!="ARC"):return "entity_type_mismatch"
         if candidate["kind"] == "angle" and candidate.get("reference_axis"):
             if (candidate["reference_axis"] not in {"horizontal", "vertical"} or len(candidate["entities"]) != 1
@@ -2237,7 +2941,9 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
     # Reject EVERY member of a contradictory group, not whichever comes later.
     groups=defaultdict(list)
     for constraint,decision in proposals:
-        groups[(constraint["kind"],tuple(constraint["entities"]),tuple(constraint["nodes"]),constraint.get("reference_axis"))].append((constraint,decision))
+        groups[(constraint["kind"],tuple(constraint["entities"]),tuple(constraint["nodes"]),constraint.get("reference_axis"),
+                json.dumps(constraint.get("anchors"), sort_keys=True),
+                json.dumps(constraint.get("source_station_relation"), sort_keys=True))].append((constraint,decision))
     constraints=[]
     for group in groups.values():
         values={float(constraint["value"]) for constraint,_ in group}
@@ -2299,10 +3005,18 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
                        row.get("entities") == [relation.get("construction_arc_entity_id")]
                        for row in constraints):
                 reason="constructed_fillet_radius_not_independently_bound"
+        if reason is None and relation.get("source")=="source_bound_design_contact":
+            evidence=relation.get("evidence") or {}
+            required=set(evidence.get("radius_record_ids") or [])
+            bound={row.get("record_id") for row in constraints if row.get("kind")=="radius"}
+            angle_record=evidence.get("angle_record_id")
+            if len(required)!=2 or not required<=bound or not any(
+                    row.get("kind")=="angle" and row.get("record_id")==angle_record for row in constraints):
+                reason="constructed_contacts_require_both_bound_radii_and_angle"
         if (reason is None and method=="local_source_fallback" and use_api and receipt.get("schema_success")
                 and selected["relation_id"] in allowed_relations):
             reason="provider_abstained_from_sent_relation"
-        source=("source_bound_design_fillet" if relation and relation.get("source") == "source_bound_design_fillet"
+        source=(relation["source"] if relation and relation.get("source") in {"source_bound_design_fillet","source_bound_design_contact"}
                 else "source_geometry")
         decision={**selected,"source":source,"admission_method":method,
                   "accepted":reason is None,"reason":reason,"evidence":relation.get("evidence") if relation else None}
@@ -2313,6 +3027,8 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
                                         "evidence_class":(relation.get("evidence") or {}).get("evidence_class"),
                                         "independent_source_tangent_measurement":(relation.get("evidence") or {}).get("independent_source_tangent_measurement"),
                                         "admission_method":method},decision))
+            if relation.get("source")=="source_bound_design_contact":
+                relation_proposals[-1][0]["source_contact_path_evidence"]=copy.deepcopy(relation["evidence"])
     seen_relations=set()
     for constraint,decision in relation_proposals:
         signature=(constraint["kind"],tuple(sorted(constraint["entities"])),tuple(sorted(constraint["nodes"])))
@@ -2321,6 +3037,8 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
             continue
         seen_relations.add(signature);constraints.append(constraint)
     bound={c["record_id"] for c in constraints if c["record_id"] is not None}
+    relative_measurements = [row for row in constraints if row.get("source_station_relation") is not None]
+    relative_dependencies = {row["source_station_relation"]["reference_record_id"] for row in relative_measurements}
     constructed_priors=inventory.get("constructed_radius_priors",[])
     for prior in constructed_priors:
         matched=next((c for c in constraints if c["kind"]=="radius" and
@@ -2339,14 +3057,23 @@ def analyze_constraint_bindings(image_path, document, model, graph, output_dir, 
                       "structural_local_accepted":sum(row["accepted"] and row.get("admission_method")=="local_source_fallback" for row in decisions),
                       "structural_api_accepted":sum(row["accepted"] and row.get("admission_method")=="api_and_source" for row in decisions),
                       "rejected":len(rejected),"bound_source_records":len(bound),
+                      "relative_station_bound_records":len(relative_measurements),
+                      "reference_diameter_dependency_records":sorted(relative_dependencies),
+                      "unsolved_reference_diameter_records":sorted(relative_dependencies-bound),
                       "bound_angle_records":sum(c["kind"] == "angle" for c in constraints),
                       "unbound_dimensions":inventory["counts"]["recognized_dimensions"]-len(bound),"constraints":len(constraints)},
             "units":inventory["units"],"inventory_artifact":inventory["artifacts"]["inventory"],"topology_artifact":inventory["artifacts"]["topology"],
             "issues":sorted({row["reason"] for row in rejected}),"ground_truth_used":False,"dimensions_verified":False,
             "annotation_diagnostics":inventory.get("annotation_diagnostics",[]),
             "angle_source_observations":inventory.get("angle_source_observations",[]),
+            "radial_source_observations":inventory.get("radial_source_observations",[]),
             "radius_binding_coverage":radius_binding_coverage(inventory, graph, constraints, decisions),
             "constructed_radius_priors":constructed_priors,
             "scope":"Only independently supported source bindings; unbound dimensions and global constraint completeness remain unverified."}
+    from .unchanged_source_obligations import retain_unchanged_obligations
+    result,retained=retain_unchanged_obligations(image_path,document,model,graph,result,inventory)
+    if retained['status']!='not_applicable':
+        _write(Path(output_dir)/'unchanged-source-obligations.json',retained)
+        _write(Path(output_dir)/'binding-candidates.json',inventory)
     _write(Path(output_dir)/"constraint-bindings.json",result)
     return result

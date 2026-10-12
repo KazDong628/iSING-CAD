@@ -232,7 +232,8 @@ def _base_source_entities(graph, design_to_source, orientation_det):
         # Display gNNN indices are scoped to one graph revision. Identity and
         # lineage survive cycle rotation and replacement of neighboring objects.
         for key in ("radius_binding", "radius_annotation_evidence", "radius_binding_status", "radius_constructed",
-                    "ancestor_stable_ids", "angle_support_evidence", "fillet_construction", "source_refinement"):
+                    "ancestor_stable_ids", "angle_support_evidence", "fillet_construction", "source_refinement",
+                    "source_contact_construction"):
             if key in entity:
                 item[key] = copy.deepcopy(entity[key])
         # Feedback from the original extraction graph uses a scoped fallback
@@ -514,7 +515,8 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
                   "parameter_source": "bounded_source_topology_candidate", "dimension_bound": False,
                   "source_fit_error_px": float(source_entity.get("fit_error_px", 0.))}
         entity["stable_id"] = source_entity.get("stable_id") or _source_entity_identity(source_entity, source_sha256)
-        for key in ("parent_entity_ids", "parent_stable_ids", "ancestor_stable_ids", "radius_binding_status", "angle_support_evidence"):
+        for key in ("parent_entity_ids", "parent_stable_ids", "ancestor_stable_ids", "radius_binding_status", "angle_support_evidence",
+                    "source_contact_construction"):
             if key in source_entity:
                 entity[key] = copy.deepcopy(source_entity[key])
         if source_entity["type"] == "ARC":
@@ -554,7 +556,8 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
             if (source_entity.get("fillet_construction") in {
                     "existing_finite_line_supports",
                     "existing_lines_short_connector_redistribution",
-                    "existing_line_arc_line_tangent_reinsertion"}
+                    "existing_line_arc_line_tangent_reinsertion",
+                    "original_image_two_line_exact_radius_seed"}
                     and isinstance(source_entity.get("source_refinement"), dict)):
                 entity["fillet_construction"] = source_entity["fillet_construction"]
                 entity["source_refinement"] = copy.deepcopy(source_entity["source_refinement"])
@@ -594,6 +597,8 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
             for old in sorted({old for entity in entities for old in entity.get("parent_entity_ids", [])})
         },
     }
+    from .unchanged_source_obligations import attach_unchanged_parent
+    attach_unchanged_parent(graph,base_graph)
     return graph
 
 

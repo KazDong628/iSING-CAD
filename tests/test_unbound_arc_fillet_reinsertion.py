@@ -87,6 +87,27 @@ def test_unique_source_claim_proposes_exact_finite_line_arc_line_reinsertion():
     assert inventory == original_inventory
 
 
+def test_exact_bound_fitted_arc_still_needs_a_fillet_construction_witness():
+    graph, inventory, source, target = _case()
+    graph["entities"][1].update(
+        center=[100., 40.], radius=20., radius_binding={"record_id": "r001", "nominal": 20.})
+    # Even an exactly tangent initial fit is only geometry, not source design
+    # proof. Reinsertion supplies the finite supports and the source witness.
+    operation = _fillet(editing.propose_annotation_arc_edits(graph, inventory, limit=4))
+    assert operation is not None
+    _, radius_px, binding = editing._radius_edit_evidence(
+        graph, operation, inventory, operation["entity_ids"], lambda points: np.asarray(points, float))
+    replacement = editing._replacement_chain(
+        source, operation["action"], .5, graph["entities"][:3],
+        annotated_radius_px=radius_px, radius_binding=binding)
+    assert replacement[1]["radius"] == 20.
+    assert replacement[1]["fillet_construction"] == "existing_line_arc_line_tangent_reinsertion"
+    assert replacement[1]["source_refinement"]["source_path_and_arrow_verified"] is True
+    assert replacement[0]["start"] == graph["entities"][0]["start"]
+    assert replacement[-1]["end"] == graph["entities"][2]["end"]
+    assert replacement[1]["radius_binding"]["record_id"] == "r001"
+
+
 @pytest.mark.parametrize("defect", [
     "missing_shaft", "missing_first_hit", "weak_arrow", "competing_claim",
     "competing_arc", "other_binding", "constructed", "unknown_visibility",

@@ -44,16 +44,19 @@ def _source_box(record, size):
     return box if box[2] > box[0] and box[3] > box[1] else None
 
 
-def _radius_crop(source, record):
+def _radius_crop(source, record, *, pad_multiplier=4., minimum_pad=220., maximum_pad=720., display_scale=1.):
     """Crop from OCR position alone, including records with no detected leader."""
     box = _source_box(record, source.size)
     if box is None:
         return None
     diagonal = math.hypot(box[2] - box[0], box[3] - box[1])
-    pad = min(720., max(220., 4 * diagonal))
+    pad = min(maximum_pad, max(minimum_pad, pad_multiplier * diagonal))
     bounds = [max(0, math.floor(box[0] - pad)), max(0, math.floor(box[1] - pad)),
               min(source.width, math.ceil(box[2] + pad)), min(source.height, math.ceil(box[3] + pad))]
     crop = source.crop(bounds)
+    if display_scale > 1.:
+        crop = crop.resize((round(crop.width*display_scale),round(crop.height*display_scale)),
+                           Image.Resampling.LANCZOS)
     crop.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
     content_size = crop.size
     margin_x, margin_y = 48, 32
@@ -187,16 +190,24 @@ def _safe_receipt(value, secret):
 
 
 class RadiusTargetProvider:
+    record_kind = "radius"
+    prompt = PROMPT
+    validate_response = staticmethod(validate_radius_target_response)
+
     def __init__(self, settings):
         self.settings = settings
 
     def locate(self, image_path, document, *, record_ids=None):
         return asyncio.run(self._locate(image_path, document, record_ids=record_ids))
 
+    def source_crops(self, source, record):
+        detail = _radius_crop(source, record)
+        return [detail] if detail is not None else []
+
     async def _locate(self, image_path, document, *, record_ids=None):
         settings, started = self.settings, time.monotonic()
         budget = min(600., max(.001, float(settings.api_timeout)))
-        records = [row for row in canonical_records(document) if row.get("parsed", {}).get("kind") == "radius"]
+        records = [row for row in canonical_records(document) if row.get("parsed", {}).get("kind") == self.record_kind]
         available_ids = {row["id"] for row in records}
         valid_selection = (record_ids is None or
             (isinstance(record_ids, (list, tuple)) and all(isinstance(rid, str) and rid in available_ids for rid in record_ids)
@@ -204,7 +215,7 @@ class RadiusTargetProvider:
         eligible = [row for row in records if record_ids is None or (valid_selection and row["id"] in record_ids)]
         selected, omitted = eligible[:12], eligible[12:]
         selected_ids = {row["id"] for row in selected}
-        receipt = {"status": "failed", "protocol": settings.wire_api + "-source-radius-target-v1",
+        receipt = {"status": "failed", "protocol": settings.wire_api + "-source-" + self.record_kind + "-target-v1",
                    "model": settings.model, "network_requests": 0, "http_success": False,
                    "schema_success": False, "image_sent": False, "ground_truth_sent": False,
                    "cad_coordinates_sent": False, "source_pixel_coordinates_sent": False,
@@ -215,6 +226,8 @@ class RadiusTargetProvider:
                    "arrowheads_verified": False, "dimensions_verified": False,
                    "anthropic_thinking_mode_requested": anthropic_thinking_mode_requested(settings),
                    "scope": "Source-pixel hypotheses only; each must pass independent original-ink verification. Missing means unknown, never no-arrow exemption."}
+        if self.record_kind != "radius":
+            receipt["total_"+self.record_kind+"_records"] = receipt.pop("total_radius_records")
 
         def finish():
             receipt["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -224,7 +237,7 @@ class RadiusTargetProvider:
             receipt.update(error_code="invalid_record_selection")
             return finish()
         if not selected:
-            receipt.update(status="skipped", error_code="no_radius_records")
+            receipt.update(status="skipped", error_code="no_" + self.record_kind + "_records")
             return finish()
         if not settings.api_key:
             receipt.update(status="not_configured", error_code="not_configured")
@@ -241,20 +254,20 @@ class RadiusTargetProvider:
             with Image.open(image_path) as loaded:
                 source = loaded.convert("RGB")
                 for record in selected:
-                    detail = _radius_crop(source, record)
-                    if detail is None:
-                        continue
-                    encoded, meta = detail
-                    images.append({"type": "image_url", "image_url": {"url": encoded}})
-                    metadata.append(meta)
-                    crop_order.append({key: meta[key] for key in ("record_id", "source_box_px", "crop_box_source_px", "input_image_size", "pixel_mapping")})
-                    crop_order[-1]["image_index"] = len(images)
+                    for encoded, meta in self.source_crops(source, record):
+                        images.append({"type": "image_url", "image_url": {"url": encoded}})
+                        meta["kind"] = self.record_kind + "_source_crop"
+                        metadata.append(meta)
+                        crop_order.append({key: meta[key] for key in ("record_id", "source_box_px", "crop_box_source_px", "input_image_size", "pixel_mapping")})
+                        crop_order[-1]["image_index"] = len(images)
             packet = {"source_image_size": source_meta["source_image_size"],
                       "coordinate_system": "original_source_pixels_top_left_x_right_y_down",
                       "record_ids": [row["id"] for row in selected], "crop_order": crop_order}
+            if self.record_kind == "angle" and getattr(self, "source_feedback", None):
+                packet["previous_source_hint_check"] = self.source_feedback
             payload = {"model": settings.model, "temperature": 0,
                        "max_tokens": output_token_budget(settings, "editing", 2400),
-                       "messages": [{"role": "system", "content": PROMPT},
+                        "messages": [{"role": "system", "content": self.prompt},
                                     {"role": "user", "content": [{"type": "text", "text": json.dumps(packet, allow_nan=False)}, *images]}]}
             endpoint, wire_payload = prepare_request(settings, payload)
             receipt.update(input_images=metadata, input_record_ids=packet["record_ids"],
@@ -278,7 +291,7 @@ class RadiusTargetProvider:
             if reason not in (None, "stop"):
                 receipt["error_code"] = "truncated_output" if reason in {"length", "incomplete"} else "incomplete_response"
                 return finish()
-            value = validate_radius_target_response(text, selected_ids, source_meta["source_image_size"],
+            value = self.validate_response(text, selected_ids, source_meta["source_image_size"],
                                                     isolate_record_errors=True)
             rejected = bool(value.get("rejected_record_ids"))
             partial = value.get("partial_schema_success") is True
@@ -332,7 +345,7 @@ def _local_radius_inventory(image_path, document, baseline):
             "reference_dxf_read": False, "dimension_binding_verified": False}
 
 
-def locate_radius_targets(image_path, document, baseline, output_dir, provider, progress=None):
+def locate_radius_targets(image_path, document, baseline, output_dir, provider, progress=None, *, record_ids=None):
     """At most two source-only calls, with a focused locally justified retry.
 
     The provider never receives ``baseline`` or the local boundary. Every
@@ -346,6 +359,10 @@ def locate_radius_targets(image_path, document, baseline, output_dir, provider, 
     enriched = copy.deepcopy(document)
     records = canonical_records(enriched)
     radius_ids = [row["id"] for row in records if row.get("parsed", {}).get("kind") == "radius"]
+    if record_ids is not None and (not isinstance(record_ids,(list,tuple)) or
+            any(rid not in radius_ids for rid in record_ids) or len(set(record_ids))!=len(record_ids)):
+        raise ValueError("invalid_radius_retry_inventory")
+    focused_ids=radius_ids if record_ids is None else list(record_ids)
     indices = {row["id"]: index for index, row in enumerate(records)}
     attempts, local_checks = [], []
     latest_model_unknown, requested = set(), set()
@@ -380,17 +397,17 @@ def locate_radius_targets(image_path, document, baseline, output_dir, provider, 
         if isinstance(row.get("source_arrow_proposals"), list):
             row["source_arrow_proposals"] = row["source_arrow_proposals"][:2]
     verified = set()
-    unresolved = list(radius_ids)
+    unresolved = list(focused_ids)
     for attempt in range(1, 3):
-        if not radius_ids or (attempt == 2 and (not unresolved or local_checks[-1]["status"] != "completed")):
+        if not focused_ids or (attempt == 2 and (not unresolved or local_checks[-1]["status"] != "completed")):
             break
-        selected_ids = radius_ids[:12] if attempt == 1 else unresolved[:12]
+        selected_ids = focused_ids[:12] if attempt == 1 else [rid for rid in unresolved if rid in focused_ids][:12]
         notify(f"radius_target_localization_attempt_{attempt:02d}",
                "读取原图半径引线；第二次仅聚焦尚未通过原像素核验的记录。")
         try:
             # Always pass an untouched OCR copy: prior model proposals/local
             # targets are not inputs to the online localization request.
-            if attempt == 1:
+            if attempt == 1 and record_ids is None:
                 receipt = provider.locate(image_path, copy.deepcopy(original))
             else:
                 receipt = provider.locate(image_path, copy.deepcopy(original), record_ids=selected_ids)
@@ -425,6 +442,7 @@ def locate_radius_targets(image_path, document, baseline, output_dir, provider, 
         unresolved = [rid for rid in radius_ids if rid not in verified]
         notify(f"radius_target_localization_attempt_{attempt:02d}_finished",
                "该轮回执与原像素核验已保存；未核实记录继续保留为未知。")
+        if not any(rid in focused_ids for rid in unresolved):break
         if receipt.get("status") == "not_configured" or receipt.get("error_code") == "invalid_endpoint":
             break
     final_proposals = [copy.deepcopy(proposal)
@@ -453,6 +471,7 @@ def locate_radius_targets(image_path, document, baseline, output_dir, provider, 
                  "attempt_artifacts": [f"radius-targets-attempt-{i:02d}.json" for i in range(1,len(attempts)+1)],
                  "attempts": attempts, "proposals": final_proposals,
                  "recognized_radius_record_ids": radius_ids,
+                 "focused_retry_record_ids": list(record_ids) if record_ids is not None else None,
                  "model_unknown_record_ids": [rid for rid in radius_ids if rid in latest_model_unknown],
                  "locally_verified_record_ids": [rid for rid in radius_ids if rid in verified],
                  "locally_unverified_record_ids": unresolved,

@@ -87,6 +87,24 @@ def test_checkpoint_requires_numerical_receipt_for_every_authoritative_constrain
     assert calls == []
 
 
+def test_native_attribute_candidate_is_inspectable_but_source_failure_never_publishes(tmp_path,monkeypatch):
+    image,baseline,graph,output,saved,calls=setup_case(tmp_path,monkeypatch)
+    measurements=[]
+    def source_check(*args):
+        measurements.append(True)
+        return {'passed':len(measurements)==1,
+                'reasons':[] if len(measurements)==1 else ['solved_source_stroke_support_degraded']}
+    monkeypatch.setattr('contour_agent.parametric_pipeline._solved_source_validation',source_check)
+    model,stage=refine_parametric(image,{},baseline,output,frozen_topology=graph,
+        trusted_preflight_dir=saved,use_api=True)
+    candidate=output/'final-binding-attempt/parametric-export/drawing.dxf'
+    assert candidate.is_file()
+    receipt=stage['final_binding_attempt']['native_attribute_candidate']
+    assert receipt['source_gate_passed'] is False and receipt['publication_approved'] is False
+    assert stage['final_binding_attempt']['replacement_gate']['replace_checkpoint'] is False
+    assert json.loads((candidate.parent/'model.json').read_text())['candidate_scope']['publication_approved'] is False
+
+
 def test_checkpoint_is_not_reused_with_changed_current_object_ids(tmp_path, monkeypatch):
     image, baseline, graph, output, saved, _ = setup_case(tmp_path, monkeypatch)
     graph["entities"][2]["id"] = "other-current-object"
@@ -100,6 +118,30 @@ def test_certification_rechecks_original_source_and_native_dxf_radius(tmp_path, 
     assert receipt["status"] == "certified" and calls == [False]
     assert result["model"]["validation"]["exact_radius_validation"]["dxf_readback_performed"]
     assert result["model"]["validation"]["exact_radius_validation"]["checks"][0]["dxf_radius"] == 5.
+
+
+@pytest.mark.parametrize('repaired_ok',[True,False])
+def test_old_axis_contract_reoptimizes_same_reverified_subset_before_certification(tmp_path,monkeypatch,repaired_ok):
+    from contour_agent import parametric_pipeline as pipeline, parametric_solver as solver
+    image,baseline,graph,output,saved,calls=setup_case(tmp_path,monkeypatch)
+    old=json.loads((saved/'parametric-solve.json').read_text())
+    constraints=json.loads((saved/'constraint-bindings.json').read_text())['constraints']
+    axis=solver.native_axis_relation_checks;checks=[];solves=[]
+    def legacy_axis(*args,**kwargs):
+        checks.append(True)
+        return {'passed':False,'checks':[{'absolute_residual':.099999}]} if len(checks)==1 else axis(*args,**kwargs)
+    def reoptimize(image,doc,base,domain,known,directory,**kwargs):
+        solves.append(True)
+        assert domain is graph and known==constraints
+        assert kwargs['initial_seed_entities']==old['entities']
+        assert kwargs['budget_seconds']==60.
+        return {**deepcopy(old),'accepted':repaired_ok}
+    monkeypatch.setattr(solver,'native_axis_relation_checks',legacy_axis)
+    monkeypatch.setattr(pipeline,'_final_source_multistart',reoptimize)
+    result,receipt=_certify_preflight_checkpoint(image,{},baseline,graph,saved,output/'cert')
+    assert len(solves)==1 and calls==[False]
+    if repaired_ok:assert receipt['status']=='certified' and result is not None
+    else:assert result is None and receipt['reason']=='checkpoint_current_axis_reoptimization_not_certified'
 
 
 def test_same_source_verified_final_candidate_can_replace_whole_checkpoint(tmp_path, monkeypatch):
@@ -137,6 +179,26 @@ def test_angle_mode_is_part_of_the_verified_equation(tmp_path,monkeypatch):
     assert _constraint_receipts_complete(bindings,{"constraints":[receipt]},graph)
     receipt["angle_mode"]="signed"
     assert not _constraint_receipts_complete(bindings,{"constraints":[receipt]},graph)
+
+
+@pytest.mark.parametrize("change",["different_node","reverse_measurement_order","reverse_support_order"])
+def test_typed_measurement_receipt_preserves_endpoint_identity_and_direction(change):
+    # The bottom/right support intersection is (10,0). Measuring to v2 gives
+    # +10 mm, to v3 gives +20 mm, and reversing the endpoints gives -10 mm.
+    xy=[[0.,0.],[10.,0.],[10.,10.],[0.,20.]]
+    graph={"units":"mm","nodes":[{"id":f"v{i}","x":p[0],"y":p[1]} for i,p in enumerate(xy)],
+           "entities":[{"id":f"g{i}","type":"LINE","start":xy[i],"end":xy[(i+1)%4],
+                        "start_node":f"v{i}","end_node":f"v{(i+1)%4}"} for i in range(4)]}
+    required={"id":"km0","kind":"distance_y","record_id":"r000","source":"ocr_local_binding",
+              "entities":["g0","g1"],"nodes":[],"value":10.,
+              "anchors":[{"type":"line_intersection","entities":["g0","g1"]},
+                         {"type":"node","node_id":"v2"}]}
+    receipt={**deepcopy(required),"passed":True}
+    if change=="different_node":receipt["anchors"][1]["node_id"]="v3"
+    elif change=="reverse_measurement_order":receipt["anchors"].reverse()
+    else:receipt["anchors"][0]["entities"].reverse()
+    assert _constraint_receipts_complete({"constraints":[required]},
+        {"constraints":[receipt]},graph) is (change=="reverse_support_order")
 
 
 def test_equal_rank_and_radius_coverage_cannot_replace_a_different_dimension(tmp_path, monkeypatch):

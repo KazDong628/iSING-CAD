@@ -88,6 +88,9 @@ def _envelope(wire, text):
 @pytest.mark.parametrize("stage", STAGES)
 @pytest.mark.parametrize("thinking_mode", ["provider_default", "disabled"])
 def test_stage_budget_is_protocol_specific_audited_and_still_single_request(monkeypatch, source, wire, stage, thinking_mode):
+    # This test checks the wire budget, not scheduler latency. Binding pages
+    # deduct preparation time from their shared deadline, tested separately.
+    monkeypatch.setattr('contour_agent.binding_provider.time.monotonic',lambda:100.)
     calls, options = _mock(monkeypatch, _envelope(wire, json.dumps(ANSWERS[stage])))
     receipt = _invoke(stage, Settings(api_key="test-key", wire_api=wire, api_timeout=600,
                                      anthropic_thinking_mode=thinking_mode), source)

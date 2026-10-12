@@ -32,8 +32,13 @@ def preflight_admissible(feedback):
     return not feedback.get("constraint_count") or feedback.get("solver_accepted") is True
 
 
-def unmet_source_angle_joint_operations(candidate, feedback, inventory, *, limit=3):
-    """Find bounded, unfinished finite LINE edits at two arrow-backed ARC tails."""
+def unmet_source_line_operations(candidate, feedback, inventory, *, limit=3):
+    """Schedule a witnessed missing LINE, including one swallowed by one ARC.
+
+    This is permission to try the edit, not proof of its topology or angle.
+    The construction, fresh binding and numerical preflight remain mandatory.
+    Two-ARC scopes additionally require both independently witnessed radii.
+    """
     if not inventory or not isinstance(feedback.get("satisfied_record_ids"), list):
         return []
     from .annotation_line_support import angle_edit_evidence, propose_annotation_line_edits
@@ -43,14 +48,15 @@ def unmet_source_angle_joint_operations(candidate, feedback, inventory, *, limit
         return []
     result = []
     for operation in propose_annotation_line_edits(graph, inventory, limit=max(3, limit * 3)):
-        if (len(operation.get("entity_ids") or []) != 2 or
+        scope_count = len(operation.get("entity_ids") or [])
+        if (scope_count not in (1, 2) or
                 operation.get("record_id") in feedback["satisfied_record_ids"]):
             continue
         try:
             observation = angle_edit_evidence(graph, inventory, operation)
         except (ValueError, TypeError, KeyError):
             continue
-        if observation.get("joint_radius_arrow_verified") is not True:
+        if scope_count == 2 and observation.get("joint_radius_arrow_verified") is not True:
             continue
         requested = set(operation["entity_ids"])
         if any(row.get("entity_id") in requested and
@@ -62,6 +68,36 @@ def unmet_source_angle_joint_operations(candidate, feedback, inventory, *, limit
             if len(result) >= limit:
                 break
     return result
+
+
+def unmet_source_angle_joint_operations(candidate, feedback, inventory, *, limit=3):
+    """Two-radius bootstrap still needs two independently arrow-backed tails."""
+    return [row for row in unmet_source_line_operations(
+        candidate, feedback, inventory, limit=max(3, limit * 3))
+        if len(row.get("entity_ids") or []) == 2][:limit]
+
+
+def source_repair_branch_priority(candidate, *, annotation_inventory=None):
+    """Visit witnessed missing objects before generic numerical improvements.
+
+    Search scheduling does not change publication ranking or promote a
+    diagnostic parent. Every child still needs its own certification.
+    """
+    graph = dict(candidate.get("graph") or {})
+    observations = candidate.get("edit_source_observations") or {}
+    for field in ("angle_source_observations", "radius_source_segment_hypotheses"):
+        if field in observations:
+            graph[field] = observations[field]
+    feedback = candidate.get("constraint_feedback") or {}
+    operations = unmet_source_line_operations(
+        {"graph": graph}, feedback, annotation_inventory, limit=1)
+    if operations:
+        return 0
+    from .topology_editing import propose_annotation_arc_edits
+    if any(row.get("action") == "insert_annotated_fillet" for row in
+           propose_annotation_arc_edits(graph, annotation_inventory, limit=4)):
+        return 1
+    return 2
 
 
 def _unmet_source_angle_joint(candidate, feedback, inventory):
@@ -192,7 +228,8 @@ def candidate_priority(candidate, feedback=None, *, preferred_id=None, annotatio
             if field in edit_observations:
                 edit_graph[field] = edit_observations[field]
         joint_candidate = {"graph": edit_graph}
-    joint = admitted and _unmet_source_angle_joint(joint_candidate, feedback, annotation_inventory)
+    joint = admitted and bool(unmet_source_line_operations(
+        joint_candidate, feedback, annotation_inventory, limit=1))
     # A feasible but untried OCR joint deserves a bounded search before an
     # extra generic structural relation. Among such joints, use the already
     # validated input-mask error to spend the first branch on the closer shape.
@@ -220,8 +257,9 @@ def preflight_order(candidates, source_validations):
     """Give one source-valid angular line repair and combined edit early slots.
 
     This only schedules local checks; source validity and eventual constraint
-    acceptance remain separate decisions. Other source-valid candidates then
-    precede source-invalid ones, retaining order within each group. No provider
+    acceptance remain separate decisions. Remaining source-valid candidates
+    with actually constructed annotation repairs precede generic/free refits.
+    This is a scheduling hint, never dimensional certification. No provider
     or reference data is used.
     """
     def edit(candidate):
@@ -230,6 +268,15 @@ def preflight_order(candidates, source_validations):
 
     def source_valid(candidate):
         return (source_validations.get(candidate.get("id")) or {}).get("passed") is True
+
+    def annotation_repair_count(candidate):
+        evidence = edit(candidate)
+        # Use local execution evidence, not an operation's requested action,
+        # API confidence, or unverified label on an unchanged free-fit ARC.
+        records = set(evidence.get("bound_record_ids") or []) if evidence.get("radius_binding_applied") is True else set()
+        if evidence.get("resegmentation_applied") is True:
+            records.update(evidence.get("angle_support_record_ids") or [])
+        return len(records)
 
     angular = next((row for row in candidates if source_valid(row) and
                     edit(row).get("action") == "restore_annotated_line_support" and
@@ -240,7 +287,9 @@ def preflight_order(candidates, source_validations):
     preferred = [row for row in (angular, combined) if row is not None]
     preferred_ids = {id(row) for row in preferred}
     remaining = [row for row in candidates if id(row) not in preferred_ids]
-    return [*preferred, *(row for row in remaining if source_valid(row)),
+    remaining_valid = sorted((row for row in remaining if source_valid(row)),
+                             key=lambda row: -annotation_repair_count(row))
+    return [*preferred, *remaining_valid,
             *(row for row in remaining if not source_valid(row))]
 
 

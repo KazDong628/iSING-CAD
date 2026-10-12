@@ -5,6 +5,7 @@ from PIL import Image, ImageDraw
 import pytest
 
 from contour_agent.constraint_binding import analyze_constraint_bindings, build_binding_candidates
+from contour_agent.measurement_anchors import derived_anchor_point
 
 
 def source(tmp_path):
@@ -28,14 +29,17 @@ def source(tmp_path):
     return path,document,model,graph
 
 
-def observed_coarse_radius_source(path, model, radius=90., center=(90., 180.)):
+def observed_coarse_radius_source(path, model, radius=90., center=(90., 180.), label="R45"):
     """R45 source arc remains near the fixture's coarse R40 proposal."""
     import numpy as np
     theta = np.linspace(-np.pi/2, np.pi/2, 361)
     points = np.c_[center[0]+radius*np.cos(theta), center[1]+radius*np.sin(theta)]
     model["extraction"] = {"raw_polyline_px": points.tolist()}
     image = Image.open(path)
-    ImageDraw.Draw(image).line([tuple(point) for point in points], fill="black", width=2)
+    draw = ImageDraw.Draw(image)
+    draw.line([tuple(point) for point in points], fill="black", width=2)
+    # Positive ownership fixtures need original glyph ink, not OCR JSON alone.
+    draw.text((240, 178), label, fill="black")
     image.save(path)
 
 
@@ -47,8 +51,9 @@ def test_source_dimension_line_binding_and_persisted_topology(tmp_path):
     constraint=result["constraints"][0]
     assert constraint["kind"]=="distance_x" and constraint["value"]==150
     assert constraint["source"]=="ocr_local_binding"
-    nodes={n["id"]:n for n in graph["nodes"]}
-    assert nodes[constraint["nodes"][1]]["x"]>nodes[constraint["nodes"][0]]["x"]
+    entities={e["id"]:e for e in graph["entities"]}
+    first,second=[derived_anchor_point(anchor,entities) for anchor in constraint["anchors"]]
+    assert second[0]-first[0]==150  # Signed CAD order, independent of pixel y direction.
     inventory=json.loads((tmp_path/"out"/"binding-candidates.json").read_text(encoding="utf-8"))
     candidate=inventory["all_candidates"][0]
     assert candidate["evidence"]["extension_lines"] and not candidate["evidence"]["arrowhead_verified"]
@@ -182,8 +187,9 @@ def test_y_dimension_uses_cad_upward_node_order(tmp_path):
     result=analyze_constraint_bindings(path,document,model,graph,tmp_path/"out")
     constraint=result["constraints"][0]
     assert constraint["kind"]=="distance_y" and constraint["value"]==100
-    nodes={n["id"]:n for n in graph["nodes"]}
-    assert nodes[constraint["nodes"][1]]["y"]>nodes[constraint["nodes"][0]]["y"]
+    entities={e["id"]:e for e in graph["entities"]}
+    first,second=[derived_anchor_point(anchor,entities) for anchor in constraint["anchors"]]
+    assert second[1]-first[1]==100
 
 
 def test_line_leader_can_bind_coarse_arc_without_old_nominal_fit_gate(tmp_path,monkeypatch):
@@ -651,7 +657,7 @@ def test_radius_edit_diagnostic_does_not_claim_nominal_applied(tmp_path):
 
 def test_constructed_fillet_metadata_cannot_force_radius_constraint(tmp_path,monkeypatch):
     path,_,model,graph=source(tmp_path)
-    observed_coarse_radius_source(path, model, radius=80., center=(100., 180.))
+    observed_coarse_radius_source(path, model, radius=80., center=(100., 180.), label="R40")
     document={"records":[{"text":"R40","box":[[240,180],[265,180],[265,200],[240,200]]}]}
     graph["entities"]=[{"id":"g009","type":"ARC","start":[40,60],"end":[0,100],"center":[0,60],
                         "radius":40,"clockwise":False,"dimension_bound":True,
@@ -721,6 +727,7 @@ def test_verified_radius_arrow_targeting_line_remains_required(tmp_path, monkeyp
     document = {"records": [{"text": "R45", "box": [[240,180],[265,180],[265,200],[240,200]]}]}
     graph["entities"] = [{"id": "g009", "type": "LINE", "start": [40,100], "end": [40,20]}]
     image = Image.open(path); draw = ImageDraw.Draw(image)
+    draw.text((240, 178), "R45", fill="black")
     draw.line((180,100,180,260), fill="black", width=2)
     draw.line((239,180,180,180), fill="black", width=2)
     draw.polygon([(180,180),(195,175),(195,185)], fill="black"); image.save(path)

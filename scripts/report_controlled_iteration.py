@@ -125,9 +125,19 @@ def native_export_check(path, model):
 def transport_receipts(after):
     """Stage-level receipts; do not double-count duplicated publication snapshots."""
     stage = read(after / "parametric-stage.json")
+    from contour_agent.binding_attempts import collect_binding_attempts
     values = [("dimension_analysis", (read(after / "dimension-analysis.json").get("provider") or {})),
               ("radius_target_localization", stage.get("radius_target_provider") or {}),
-              ("final_binding", stage.get("provider") or {})]
+              ("angle_target_localization", stage.get("angle_target_provider") or {}),
+              ("post_solve_angle_target_localization", stage.get("post_solve_angle_target_provider") or {})]
+    binding_attempts=collect_binding_attempts(after,stage)
+    values.extend((row["attempt_id"],{**row["provider"],"receipt_scope":row["receipt_scope"],
+                  "recovered_from_artifacts":row["recovered_from_artifacts"]}) for row in binding_attempts)
+    completion=read(after/'source-topology-completion/completion.json')
+    for row in completion.get('rounds',[]):
+        if row.get('provider'):
+            values.append((f"source_topology_completion_round_{row['round']}_editor",
+                {**row['provider'],'receipt_scope':'current_run_network_invocation'}))
     plan = read(after / "topology-plan.json")
     iterations = read(after / "topology-iterations.json") or plan.get("topology_editing") or {}
     rounds = iterations.get("rounds", []) if isinstance(iterations, dict) else []
@@ -156,7 +166,8 @@ def transport_receipts(after):
     keys = ("status", "http_status", "http_success", "schema_success", "any_http_success", "any_schema_success",
             "partial_schema_success", "any_partial_schema_success", "response_structure_valid",
             "schema_rejection_scope", "rejected_record_ids", "unresolved_rejected_record_ids",
-            "network_requests", "known_network_requests", "elapsed_seconds", "model", "protocol", "error_code")
+            "network_requests", "known_network_requests", "elapsed_seconds", "model", "protocol", "error_code",
+            "receipt_scope", "recovered_from_artifacts")
     return [{"stage": name, **{key: value.get(key) for key in keys if key in value}} for name, value in values if value]
 
 
@@ -178,6 +189,12 @@ def collect_attempt(root, run):
     registered = geometry.get("registered_shape_diagnostic") or {}
     direct = geometry.get("native_coordinate_frame") or {}
     target = evaluation.get("target_acceptance") or {}
+    comparisons = evaluation.get("tolerance_comparison") or []
+    # Historic receipts used a single 1 mm target. New targets must not be
+    # mislabeled as that old checkpoint in comparisons or rendered tables.
+    one_mm = next((row for row in comparisons if row.get("tolerance_mm") == 1.), {})
+    if not one_mm and target.get("tolerance_mm", 1.) == 1.:
+        one_mm = target
     feedback = published.get("reconstruction_feedback") or {}
     solver = published.get("solver") or {}
     diagnostics = solver.get("diagnostics") or {}
@@ -195,13 +212,17 @@ def collect_attempt(root, run):
     reference = {"status": evaluation.get("status"), "receipt_matches_current_dxf": evaluation_current,
                  "reference_sha256": evaluation.get("provenance", {}).get("reference_sha256"),
                  "objects": evaluation.get("objects"), "checks_0_1mm": evaluation.get("checks") if evaluation_current else None,
-                 "checks_1mm": target.get("checks") if evaluation_current else None,
+                 "checks_1mm": one_mm.get("checks") if evaluation_current else None,
+                 "requested_target_tolerance_mm": target.get("tolerance_mm"),
+                 "checks_requested_target": target.get("checks") if evaluation_current else None,
+                 "tolerance_comparison": comparisons if evaluation_current else [],
                  "target_all_checks_passed": target.get("all_requested_checks_passed") if evaluation_current else None,
                  "registered_max_mm": registered.get("conservative_max_error_mm") if evaluation_current else None,
                  "registered_rms_mm": registered.get("rms_error_mm") if evaluation_current else None,
                  "native_max_mm": direct.get("conservative_max_error_mm") if evaluation_current else None,
                  "matched_primitive_count_0_1mm": evaluation.get("primitive_matching", {}).get("matched_count"),
-                 "matched_primitive_count_1mm": target.get("primitive_matching", {}).get("matched_count")}
+                 "matched_primitive_count_1mm": one_mm.get("primitive_matching", {}).get("matched_count") if evaluation_current else None,
+                 "matched_primitive_count_requested_target": target.get("primitive_matching", {}).get("matched_count") if evaluation_current else None}
     links = {}
     for name, relative in (("dxf", "after/drawing.dxf"), ("overlay", "evaluation/overlay.svg"),
                            ("manifest", "run-manifest.json"), ("evaluation", "evaluation/summary.json")):

@@ -1,4 +1,4 @@
-"""One bounded source-image call selecting existing binding IDs, never CAD values."""
+"""Bounded source-image pages selecting existing binding IDs, never CAD values."""
 from __future__ import annotations
 
 import asyncio
@@ -24,10 +24,23 @@ Return exactly one JSON object: {"bindings":[{"record_id":"r000","candidate_id":
 For each binding, transcribe the actual dimension visible in the SOURCE IMAGE into observed_text. The supplied OCR may be wrong: Greek delta or Delta with a subscript is a symbolic variable, never the digits 4 or 41. Omit symbolic or unreadable dimensions. Do not copy OCR text without checking its source glyphs. observed_text may contain the original diameter/radius prefix, value and tolerance; it is evidence to verify, never authorization to invent or replace the OCR value.
 Use only IDs in the supplied inventory. At most one candidate per record. Select a relation only if its geometry is visibly supported. These are approximate primitives awaiting a numerical solve: a small shape or radius discrepancy is not itself a reason to reject an otherwise clearly targeted dimension. Inspect the visible line endpoints and arrow direction, choose a supported candidate when identifiable, and abstain on ambiguous records. Empty arrays are valid only when none of the supplied candidates or relations is identifiable. Never return numbers, CAD coordinates, new dimensions, explanations, or extra keys. Candidate alternatives may remain ambiguous; do not invent a missing leader or endpoint. This selection alone does not certify dimensions or geometry."""
 
+PROMPT += "\nEach candidate's admitted_by_original_source_checks reports independent source admission, not a fitted-numeric match. An evidence.source_joint_radius_conflict_resolution identifies a neighboring ARC already uniquely owned by an incompatible source radius; examine those source record IDs together. Do not select a candidate marked inadmissible merely because its fitted outline looks close. Abstain if source glyphs contradict the admitted candidate; admission hints alone never certify final geometry."
+PROMPT += "\nA source_station_relation is an explicit half-section drawing construction: the shared free axis is eliminated using an independently source-owned reference diameter. For a diameter, D = reference_D + 2 * signed(anchor2-anchor1); for an axis-to-station length, L = reference_D/2 + signed(anchor2-anchor1). Select the primary annotation only when the source supports these stations and semantics. This does not independently certify the reference diameter or absolute axis placement."
+PROMPT += "\nA common_curve_center anchor refers to two independently source-owned radius shafts whose observed finite tails terminate at the same point. Binding a dimension to it imposes both ARC center equalities as well as the dimension; no observed pixel coordinate is fixed. Check the actual common termination and dimension extension, and abstain if it is only a crossing of continuing lines."
+PROMPT += "\nlocked_known_constraints are previously independently source-verified equations retained on the same source image, OCR and object identities. They are not fitted-value suggestions or new candidate IDs. Inspect fresh candidates independently; report source glyph contradictions if present. Absence from fresh candidates or your selections is recorded separately and does not alone revoke an established source certificate. Newly proposed radii still require normal independent candidate selection and source checks."
+PROMPT += "\nWhen binding_priority is radius_and_angle_first, inspect every supplied radius and single-line angle obligation before the other dimensions. The mask and approximate geometry are initial guesses. A source-backed angle requires a finite LINE and a source-backed radius requires an ARC; report unsupported or ambiguous candidates by abstaining rather than transferring an angle to an ARC or a radius to a LINE. Their numerical attributes will be fixed to the source nominal during the subsequent joint solve; do not reject a correctly associated candidate solely because its current fitted value differs."
+PROMPT += "\nThe SOURCE GLYPH ATLAS contains enlarged original pixels from each supplied record's OCR box, labeled only by record ID. Inspect that record's own glyph tile when transcribing observed_text; do not substitute a similar nearby radius from the full drawing or a different record's tile. The atlas does not assert the OCR value or geometric ownership: use the full drawing and paired topology panels to determine the candidate, and abstain if the glyph itself is unreadable."
 
-def validate_selection(content):
+
+MAX_BINDING_PAGES = 4
+PAGE_RECORD_LIMIT = 16
+PAGE_CANDIDATE_LIMIT = 32
+PAGE_RELATION_LIMIT = 16
+
+
+def validate_selection(content, *, item_limit=24, character_limit=24000):
     """Strict independent response schema; semantic checks are separate."""
-    if not isinstance(content, str) or len(content) > 24000:
+    if not isinstance(content, str) or len(content) > character_limit:
         raise _InspectionError("invalid_output")
     try:
         value = _single_json_object(content.strip())
@@ -35,7 +48,9 @@ def validate_selection(content):
         raise _InspectionError("invalid_json") from None
     if not isinstance(value, dict) or set(value) != {"bindings", "relations"}:
         raise _InspectionError("schema_mismatch")
-    for name, keys, limit in (("bindings", {"record_id", "candidate_id"}, 24), ("relations", {"relation_id"}, 24)):
+    if not isinstance(item_limit, int) or not 1 <= item_limit <= 96:
+        raise ValueError("invalid selection row limit")
+    for name, keys, limit in (("bindings", {"record_id", "candidate_id"}, item_limit), ("relations", {"relation_id"}, item_limit)):
         rows = value[name]
         if not isinstance(rows, list) or len(rows) > limit:
             raise _InspectionError("schema_mismatch")
@@ -74,14 +89,40 @@ _LEADER = {**{key: _SCALAR for key in ("method", "arrowhead_verified", "label_ga
     "source_arrow_ownership": _OWNERSHIP,
     "source_label_association": {key: _SCALAR for key in ("checked", "repetitive_label_crossing", "reason")}}
 _SOURCE_LINE = {key: _SCALAR for key in ("lo", "hi", "cross", "thickness", "covered_fraction",
-    "maximum_projection_gap_px", "intersection_gap_px", "verified", "reason", "status")}
+    "maximum_projection_gap_px", "intersection_gap_px", "verified", "reason", "status",
+    "method", "observed_gap_px", "maximum_gap_px", "nominal_used")}
+_SOURCE_LINE["observed_segments"] = ({key: _SCALAR for key in ("lo", "hi", "cross", "thickness")}, 2)
+_ANCHOR = {"type": _SCALAR, "node_id": _SCALAR, "entities": _IDENTIFIERS,
+           "entity_id": _SCALAR, "other_entity_id": _SCALAR, "axis": _SCALAR, "sense": _SCALAR}
+_STATION_RELATION = {**{key: _SCALAR for key in ("type", "axis", "direction", "primary_kind", "reference_record_id")},
+    "reference_dimension": {key: _SCALAR for key in ("kind", "nominal", "lower_deviation", "upper_deviation")}}
 _STATION = {**{key: _SCALAR for key in ("observed_station_px", "representative_node", "support_kind",
-    "coordinate_equality_enforced")}, "member_nodes": _IDENTIFIERS, "source_supported_entities": _IDENTIFIERS}
+    "coordinate_equality_enforced", "station_interpretation_verified", "competing_source_section_count",
+    "competing_source_section_check_performed")}, "member_nodes": _IDENTIFIERS, "source_supported_entities": _IDENTIFIERS,
+    "observed_attachment_px": _POINT, "equivalent_source_endpoint_nodes": _IDENTIFIERS,
+    "extension": _SOURCE_LINE,
+    "construction": {key: _SCALAR for key in ("method", "verified", "nominal_used", "coordinates_locked",
+        "required_axis_equality", "section_interpretation_not_resolved", "source_position_uncertainty_px",
+        "source_turn_depth_px", "source_fit_p90_residual_px", "finite_arc_domain_checked")}}
+_STATION["anchor"] = _ANCHOR
+_STATION["construction"].update({
+    "center_semantics_verified": _SCALAR,
+    "observed_source_center_px": _POINT,
+    "source_radius_record_ids": _IDENTIFIERS,
+    "source_arrow_ids": _IDENTIFIERS,
+    "owner_record_id": _SCALAR,
+    "unique_arrow_target": _SCALAR,
+    "other_arc_concentricity_not_implicitly_asserted": _SCALAR,
+    "tail_support": ({key: _SCALAR for key in ("record_id", "verified",
+        "full_tail_supported_fraction", "maximum_unobserved_run_px",
+        "beyond_center_continuation_fraction", "tail_extension_px")}, 2)})
 _SOURCE_EVIDENCE = {**{key: _SCALAR for key in ("method", "axis", "uniquely_supported_leader", "alternative_arcs",
-    "directed_source_target_count", "multiple_directed_source_targets_require_review",
+    "directed_source_target_count", "directed_source_observation_count", "directed_source_physical_arrow_count",
+    "multiple_directed_source_targets_require_review",
     "legacy_leader_not_an_ownership_certificate", "arrowhead_verified", "source_span_scale_compatible",
     "alternative_station_pairs")},
     "leader": _LEADER, "whole_primitive_radius": _WHOLE_INTERVAL,
+    "directed_source_target_ids": _IDENTIFIERS, "directed_source_physical_arrow_ids": _IDENTIFIERS,
     "source_text": {key: _SCALAR for key in ("checked", "symbol_confusion", "text_confirmed", "reason")},
     "source_arrow_ownership_rejection_reasons": (_SCALAR, 16),
     "dimension_line": _SOURCE_LINE, "line_endpoints_px": _SEGMENT, "endpoint_gaps_px": _POINT,
@@ -92,6 +133,10 @@ _SOURCE_EVIDENCE = {**{key: _SCALAR for key in ("method", "axis", "uniquely_supp
         "evidence":{"method":_SCALAR,"verified":_SCALAR,"nominal_used_to_rank":_SCALAR,
             "reference_arrow":{"tip_px":_POINT,"direction_px":_POINT},
             "target_arrow":{"tip_px":_POINT,"direction_px":_POINT}}}}
+_SOURCE_EVIDENCE.update({key: _SCALAR for key in ("reference_record_id", "source_half_section_semantics",
+    "observed_signed_span_px", "expected_signed_span_px", "source_span_tolerance_px", "source_reference_selection",
+    "reference_diameter_is_dependency_not_solved_record", "absolute_axis_position_verified",
+    "coordinates_locked", "nominal_used_for_station_ownership")})
 _RELATION_EVIDENCE = {**{key: _SCALAR for key in ("method", "verified", "passed", "reason", "status",
     "observed_station_px", "span_px", "proposal_band_px", "support_kind", "shared_node",
     "boundary_observation", "observed_deviation_degrees", "mask_observed_deviation_degrees", "tolerance_degrees")},
@@ -99,6 +144,14 @@ _RELATION_EVIDENCE = {**{key: _SCALAR for key in ("method", "verified", "passed"
     "sides": ({key: _SCALAR for key in ("verified", "reason", "sample_count", "unambiguous_samples",
                                          "scale_disagreement_degrees")}, 2),
     "mask_sides": ({key: _SCALAR for key in ("verified", "reason", "sample_count", "scale_disagreement_degrees")}, 2)}
+
+_SOURCE_EVIDENCE["source_joint_radius_conflict_resolution"] = {
+    **{key:_SCALAR for key in ("method", "entity_id", "source_observation_count",
+        "all_source_target_sets_preserved", "fixed_nominal_source_interval_feasible",
+        "nominal_used_to_resolve_constraint_conflict", "nominal_used_to_rank_arrow_geometry",
+        "ground_truth_used")},
+    "independent_incompatible_claims": ({"entity_id":_SCALAR,"record_ids":_IDENTIFIERS}, 4),
+}
 
 
 def _source_summary(value, schema, audit, depth=0):
@@ -163,9 +216,16 @@ def _source_path_review_summary(paths, audit):
 
 def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relation_limit=24):
     """Explicit, recursively bounded source summaries with unchanged row IDs."""
-    records = inventory.get("records", [])[:record_limit]
+    records, candidates = [], []
+    all_packet_candidates = inventory.get("candidates", [])
+    for row in inventory.get("records", []):
+        group = [candidate for candidate in all_packet_candidates if candidate.get("record_id") == row["id"]]
+        # Never show only a prefix of a record's competing hypotheses.
+        if len(records) >= record_limit or len(candidates) + len(group) > candidate_limit:
+            continue
+        records.append(row)
+        candidates.extend(group)
     ids = {row["id"] for row in records}
-    candidates = [row for row in inventory.get("candidates", []) if row.get("record_id") in ids][:candidate_limit]
     relations = inventory.get("relations", [])[:relation_limit]
     audit = {"method": "source_evidence_whitelist_summary_v1", "full_audit_retained_locally": True,
              "omitted_nonwhitelisted_fields": 0, "truncated_strings": 0,
@@ -174,7 +234,9 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
                    "parsed": _source_summary(row.get("parsed"), {key: _SCALAR for key in
                        ("kind", "nominal", "upper_deviation", "lower_deviation", "symbol", "unit")}, audit),
                    "box": _source_summary(row.get("box"), (_POINT, 8), audit),
-                   "source_text_evidence": _source_summary(row.get("source_text_evidence"), _SOURCE_TEXT, audit)}
+                   "source_text_evidence": _source_summary(row.get("source_text_evidence"), _SOURCE_TEXT, audit),
+                   "source_text_admission": _source_summary(row.get("source_text_admission"),
+                       {key: _SCALAR for key in ("policy", "status", "reason")}, audit)}
                   for row in records]
     candidate_rows = []
     for row in candidates:
@@ -184,11 +246,26 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
             if evidence.get(key):
                 source[key+"_summary"] = _source_path_review_summary(evidence[key], audit)
         candidate_rows.append({**{key: row.get(key) for key in ("id", "record_id", "kind", "entities", "nodes", "reference_axis")},
+                               "admitted_by_original_source_checks": row.get("local_reliable") is True,
                                "evidence": source})
+        if row.get("anchors"):
+            candidate_rows[-1]["anchors"] = _source_summary(row["anchors"], (_ANCHOR, 2), audit)
+        if row.get("source_station_relation"):
+            candidate_rows[-1]["source_station_relation"] = _source_summary(
+                row["source_station_relation"], _STATION_RELATION, audit)
     all_records = inventory.get("all_records", inventory.get("records", []))
     all_candidates = inventory.get("all_candidates", inventory.get("candidates", []))
     full_relations = inventory.get("relations", [])
+    locked = inventory.get("locked_known_constraints", [])
+    if not isinstance(locked, list) or len(locked) > 96:
+        raise ValueError("locked source constraint inventory exceeds bounded contract")
+    lock_schema = {key: _SCALAR for key in ("id", "kind", "record_id", "value", "reference_axis", "angle_mode",
+        "enforcement", "nominal_source", "admission_method", "prior_binding_source", "current_API_reconfirmed")}
+    lock_schema.update(entities=(_SCALAR, 4), nodes=(_SCALAR, 4), anchors=(_ANCHOR, 2),
+                       source_station_relation=_STATION_RELATION)
     return {"units": inventory.get("units"), "records": record_rows, "candidates": candidate_rows,
+            "binding_priority": "radius_and_angle_first" if inventory.get("binding_priority")=="radius_and_angle_first" else "full_source_inventory",
+            "locked_known_constraints": [_source_summary(row, lock_schema, audit) for row in locked],
             "relations": [{**{key: row.get(key) for key in ("id", "type", "entities", "nodes")},
                            "evidence": _source_summary(row.get("evidence"), _RELATION_EVIDENCE, audit)} for row in relations],
             "inventory_coverage": {"all_record_count": len(all_records), "all_candidate_count": len(all_candidates),
@@ -199,6 +276,166 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
                 "relation_ids_not_sent": [row["id"] for row in full_relations[relation_limit:]],
                 "packet_row_limits": [record_limit, candidate_limit, relation_limit]},
             "source_evidence_summary": audit}
+
+
+def _binding_pages(inventory):
+    """Page the full source inventory, preserving every candidate group.
+
+    Unknown OCR and records without selectable targets remain in the coverage
+    denominator and exclusions; their omission is never an API abstention.
+    """
+    if not isinstance(inventory, dict):
+        raise ValueError("invalid inventory")
+    records = inventory.get("all_records", inventory.get("records", []))
+    candidates = inventory.get("all_candidates", inventory.get("candidates", []))
+    relations = inventory.get("relations", [])
+    for rows in (records, candidates, relations):
+        if not isinstance(rows, list):
+            raise ValueError("invalid inventory rows")
+        ids = [row.get("id") if isinstance(row, dict) else None for row in rows]
+        if (any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", value)
+                for value in ids) or len(ids) != len(set(ids))):
+            raise ValueError("invalid or duplicate inventory IDs")
+    record_ids = {row["id"] for row in records}
+    grouped = {row["id"]: [] for row in records}
+    for candidate in candidates:
+        record_id = candidate.get("record_id")
+        if not isinstance(record_id, str) or record_id not in grouped:
+            raise ValueError("candidate references unknown source record")
+        grouped[record_id].append(candidate)
+    eligible, selectable, exclusions = [], [], []
+    for row in records:
+        parsed = row.get("parsed") or {}
+        nominal = parsed.get("nominal") if isinstance(parsed, dict) else None
+        supported = (isinstance(parsed, dict) and parsed.get("kind") in {"radius", "length", "diameter", "angle"}
+                     and isinstance(nominal, (float, int)) and not isinstance(nominal, bool)
+                     and math.isfinite(nominal) and nominal > 0)
+        if not supported:
+            exclusions.append({"record_id": row["id"], "reason": "unsupported_or_unresolved_source_dimension"})
+            continue
+        eligible.append(row)
+        group = grouped[row["id"]]
+        if not group:
+            exclusions.append({"record_id": row["id"], "reason": "no_source_candidate"})
+        elif len(group) > PAGE_CANDIDATE_LIMIT:
+            exclusions.append({"record_id": row["id"], "reason": "complete_candidate_group_exceeds_page_limit"})
+        else:
+            selectable.append(row)
+    selectable.sort(key=lambda row: (not any(c.get("local_reliable") for c in grouped[row["id"]]), row["id"]))
+    if inventory.get("binding_priority")=="radius_and_angle_first":
+        locked={r.get("record_id") for r in inventory.get("locked_known_constraints",[])}
+        selectable.sort(key=lambda row:((row.get("parsed") or {}).get("kind") not in {"radius","angle"},
+            row["id"] in locked,not any(c.get("local_reliable") for c in grouped[row["id"]]),row["id"]))
+    pending = selectable[:]
+    remaining_relations = relations[:]
+    pages = []
+    while (pending or remaining_relations) and len(pages) < MAX_BINDING_PAGES:
+        page_records, page_candidates, next_pending = [], [], []
+        for row in pending:
+            group = grouped[row["id"]]
+            if len(page_records) >= PAGE_RECORD_LIMIT or len(page_candidates) + len(group) > PAGE_CANDIDATE_LIMIT:
+                next_pending.append(row)
+                continue
+            page_records.append(row)
+            page_candidates.extend(group)
+        page_relations, remaining_relations = remaining_relations[:PAGE_RELATION_LIMIT], remaining_relations[PAGE_RELATION_LIMIT:]
+        pages.append({"units": inventory.get("units"), "records": page_records, "candidates": page_candidates,
+                      "binding_priority": inventory.get("binding_priority"),
+                      "locked_known_constraints": inventory.get("locked_known_constraints", []),
+                      "relations": page_relations, "radius_binding_coverage": inventory.get("radius_binding_coverage", {})})
+        pending = next_pending
+    if not pages:
+        # Retain a bounded empty-inventory transport probe for existing callers.
+        pages.append({"units": inventory.get("units"), "records": [], "candidates": [], "relations": [],
+                      "locked_known_constraints": inventory.get("locked_known_constraints", [])})
+    exclusions.extend({"record_id": row["id"], "reason": "page_count_limit"} for row in pending)
+    return pages, {
+        "all_record_ids": [row["id"] for row in records],
+        "all_candidate_ids": [row["id"] for row in candidates],
+        "all_relation_ids": [row["id"] for row in relations],
+        "source_eligible_record_ids": [row["id"] for row in eligible],
+        "source_selectable_record_ids": [row["id"] for row in selectable],
+        "record_exclusions": exclusions,
+        "radius_record_denominator": inventory.get("radius_binding_coverage", {}).get("recognized_count"),
+        "packet_row_limits": [PAGE_RECORD_LIMIT, PAGE_CANDIDATE_LIMIT, PAGE_RELATION_LIMIT],
+        "relation_ids_excluded_by_page_limit": [row["id"] for row in remaining_relations],
+    }
+
+
+def _merge_page_selections(pages):
+    """Reject conflicting cross-page decisions instead of last-write wins."""
+    grouped, relations, conflicts = {}, {}, []
+    for page in pages:
+        if not page.get("selection_payload_verified") or not page.get("schema_success"):
+            continue
+        for row in page.get("bindings", []):
+            grouped.setdefault(row["record_id"], []).append(row)
+        for row in page.get("relations", []):
+            relations.setdefault(row["relation_id"], row)
+    bindings = []
+    for record_id, values in grouped.items():
+        signatures = {(row["candidate_id"], row.get("observed_text")) for row in values}
+        if len(signatures) != 1:
+            conflicts.append({"record_id": record_id, "candidate_ids": sorted({row["candidate_id"] for row in values}),
+                              "reason": "conflicting_page_selections"})
+        else:
+            bindings.append(dict(values[0]))
+    return bindings, list(relations.values()), conflicts
+
+
+def validate_receipt_selection(receipt):
+    """Validate per-page selection envelopes and the exact aggregate union.
+
+    Legacy providers retain the original single-response limit. A paged
+    response earns the larger aggregate limit only from individually verified
+    bounded pages and their actual transmitted inventories.
+    """
+    if not isinstance(receipt, dict):
+        raise _InspectionError("invalid_selection_receipt")
+    value = {"bindings": receipt.get("bindings"), "relations": receipt.get("relations")}
+    pages = receipt.get("pages")
+    if pages is None:
+        return validate_selection(json.dumps(value, allow_nan=False))
+    if not isinstance(pages, list) or not 1 <= len(pages) <= MAX_BINDING_PAGES:
+        raise _InspectionError("invalid_selection_pages")
+    successful = []
+    for page in pages:
+        if not isinstance(page, dict):
+            raise _InspectionError("invalid_selection_page")
+        if page.get("schema_success") is not True or page.get("selection_payload_verified") is not True:
+            continue
+        selection = validate_selection(json.dumps({"bindings": page.get("bindings"),
+                                                  "relations": page.get("relations")}, allow_nan=False))
+        records, candidates, relations = [page.get(f"input_{kind}_ids") for kind in ("record", "candidate", "relation")]
+        for rows, limit in ((records, PAGE_RECORD_LIMIT), (candidates, PAGE_CANDIDATE_LIMIT),
+                            (relations, PAGE_RELATION_LIMIT)):
+            if (not isinstance(rows, list) or len(rows) > limit or
+                    any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", item)
+                        for item in rows) or len(rows) != len(set(rows))):
+                raise _InspectionError("invalid_page_inventory")
+        ownership = page.get("input_candidate_record_ids")
+        if (not isinstance(ownership, dict) or set(ownership) != set(candidates) or
+                any(not isinstance(owner, str) or owner not in records for owner in ownership.values())):
+            raise _InspectionError("invalid_page_candidate_ownership")
+        _validate_selection_payload(selection, {"records": [{"id": item} for item in records],
+            "candidates": [{"id": item, "record_id": ownership[item]} for item in candidates],
+            "relations": [{"id": item} for item in relations]})
+        successful.append(page)
+    if not successful:
+        raise _InspectionError("no_verified_selection_page")
+    for kind in ("record", "candidate", "relation"):
+        field = f"input_{kind}_ids"
+        expected = list(dict.fromkeys(item for page in successful for item in page[field]))
+        if receipt.get(field) != expected:
+            raise _InspectionError("aggregate_inventory_mismatch")
+    bindings, relations, conflicts = _merge_page_selections(successful)
+    if conflicts or receipt.get("conflicting_selections"):
+        raise _InspectionError("conflicting_page_selections")
+    selection = validate_selection(json.dumps(value, allow_nan=False), item_limit=MAX_BINDING_PAGES * 24,
+                                   character_limit=MAX_BINDING_PAGES * 24000)
+    if selection != {"bindings": bindings, "relations": relations}:
+        raise _InspectionError("aggregate_selection_mismatch")
+    return selection
 
 
 def _validate_selection_payload(selection, payload):
@@ -225,10 +462,54 @@ def _validate_selection_payload(selection, payload):
         seen_relations.add(row["relation_id"])
 
 
+def _source_glyph_panel(image_path, inventory):
+    """One bounded atlas of original glyphs; captions never reproduce OCR values."""
+    with Image.open(image_path) as loaded:source=loaded.convert("RGB")
+    crops=[]
+    for row in inventory.get("records",[])[:PAGE_RECORD_LIMIT]:
+        try:
+            points=row.get("box") or []
+            if len(points)<2:continue
+            xs=[float(p[0]) for p in points];ys=[float(p[1]) for p in points]
+            if not all(math.isfinite(v) for v in xs+ys):continue
+            margin=4
+            box=(max(0,math.floor(min(xs))-margin),max(0,math.floor(min(ys))-margin),
+                 min(source.width,math.ceil(max(xs))+margin),min(source.height,math.ceil(max(ys))+margin))
+            if box[2]<=box[0] or box[3]<=box[1]:continue
+            crop=source.crop(box)
+            crops.append((str(row["id"]),box,crop))
+        except (TypeError,ValueError,IndexError,KeyError,OverflowError):continue
+    if not crops:return [],[]
+    columns=min(4,len(crops));rows=math.ceil(len(crops)/columns)
+    canvas=Image.new("RGB",(columns*256,32+rows*160),"white");draw=ImageDraw.Draw(canvas)
+    draw.text((12,8),"SOURCE GLYPH ATLAS | original pixels / record IDs only",fill="black")
+    receipt=[]
+    for index,(record_id,box,crop) in enumerate(crops):
+        x=(index%columns)*256;y=32+(index//columns)*160
+        draw.text((x+8,y+4),record_id,fill="black")
+        ratio=min(4.,240/crop.width,128/crop.height)
+        crop=crop.resize((max(1,round(crop.width*ratio)),max(1,round(crop.height*ratio))),Image.Resampling.NEAREST)
+        origin=(x+(256-crop.width)//2,y+24+(132-crop.height)//2)
+        canvas.paste(crop,origin)
+        receipt.append({"record_id":record_id,"source_box_px":list(box),
+                        "atlas_box_px":[*origin,origin[0]+crop.width,origin[1]+crop.height],
+                        "nominal_drawn_in_caption":False})
+    stream=BytesIO();canvas.save(stream,format="PNG");raw=stream.getvalue()
+    digest=hashlib.sha256(raw).hexdigest()
+    for row in receipt:row.update(input_image_sha256=digest,bytes=len(raw))
+    return [{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(raw).decode("ascii")}}],receipt
+
+
 def _detail_panels(image_path, topology_path, inventory, *, limit=4):
     """Up to four source-only paired closeups; no external files or CAD input."""
     rows=[r for r in inventory.get("records",[]) if isinstance(r.get("box"),list) and len(r["box"])>=2]
     if not rows:return [],[]
+    locked={r.get("record_id") for r in inventory.get("locked_known_constraints",[])}
+    # Spend the limited high-resolution panels on unbound angle/radius
+    # obligations before already certified dimensions. Full images still show
+    # the entire drawing; this changes visual attention, never numeric gates.
+    rows=sorted(rows,key=lambda r:(r.get("id") in locked,
+        {"angle":0,"radius":1}.get((r.get("parsed") or {}).get("kind"),2)))
     with Image.open(image_path) as loaded: source=loaded.convert("RGB")
     with Image.open(topology_path) as loaded: topology=loaded.convert("RGB")
     width,height=source.size; sx,sy=topology.width/width,topology.height/height
@@ -265,6 +546,115 @@ class BindingProvider:
         return asyncio.run(self._select(image_path, topology_path, inventory))
 
     async def _select(self, image_path, topology_path, inventory):
+        started = time.monotonic()
+        budget = min(600., max(.001, float(self.settings.api_timeout)))
+        try:
+            page_inputs, coverage = _binding_pages(inventory)
+        except (TypeError, ValueError, KeyError):
+            return {"status": "failed", "protocol": self.settings.wire_api + "-source-constraint-binding-v3-paged",
+                    "model": self.settings.model, "error_code": "invalid_inventory", "network_requests": 0,
+                    "http_success": False, "schema_success": False, "semantic_success": False,
+                    "selection_payload_verified": False, "bindings": [], "relations": [], "pages": [],
+                    "input_record_ids": [], "input_candidate_ids": [], "input_relation_ids": [],
+                    "ground_truth_sent": False, "dimensions_verified": False}
+        pages, stopped = [], None
+        for index, page in enumerate(page_inputs):
+            remaining = budget - (time.monotonic() - started)
+            if remaining <= 0:
+                stopped = "total_deadline_exhausted"
+                break
+            result = await self._select_page(image_path, topology_path, page, remaining)
+            result["page_index"] = index + 1
+            pages.append(result)
+            if result.get("error_code")=="timeout":
+                # Every page received the entire remaining shared deadline.
+                # Do not spend timer-rounding residue on another request.
+                stopped="total_deadline_exhausted"
+                break
+            if result.get("error_code") in {"not_configured", "invalid_endpoint", "authentication", "permission", "rate_limit"}:
+                stopped = result["error_code"]
+                break
+        successful = [page for page in pages if page.get("schema_success") is True and
+                      page.get("selection_payload_verified") is True]
+        bindings, relations, conflicts = _merge_page_selections(pages)
+        # The compatibility input_* fields describe only valid-response pages:
+        # downstream callers use these IDs to infer actual model abstention.
+        # sent_* separately records all attempted packets, including failures.
+        def ids_from(receipts, field):
+            return list(dict.fromkeys(value for receipt in receipts for value in receipt.get(field, [])))
+        attempted = [page for page in pages if page.get("network_requests", 0) > 0]
+        aggregate = dict(pages[0]) if pages else {
+            "model": self.settings.model, "http_success": False, "schema_success": False,
+            "semantic_success": False, "selection_payload_verified": False, "image_sent": False,
+            "ground_truth_sent": False, "dimensions_verified": False, "bindings": [], "relations": []}
+        aggregate.pop("page_index", None)
+        aggregate.update(protocol=self.settings.wire_api + "-source-constraint-binding-v3-paged",
+                         pages=pages, bindings=bindings, relations=relations,
+                         network_requests=sum(page.get("network_requests", 0) for page in pages),
+                         http_success=bool(attempted) and all(page.get("http_success") is True for page in attempted),
+                         schema_success=bool(successful), semantic_success=bool(successful) and not conflicts,
+                         selection_payload_verified=bool(successful),
+                         selection_subset_verified=bool(successful),
+                         all_pages_succeeded=len(successful) == len(page_inputs) and not conflicts,
+                         all_pages_http_success=bool(attempted) and len(attempted) == len(page_inputs)
+                                                and all(page.get("http_success") is True for page in attempted),
+                         all_pages_schema_success=len(successful) == len(page_inputs),
+                         conflicting_selections=conflicts,
+                         max_pages=MAX_BINDING_PAGES, planned_pages=len(page_inputs), completed_pages=len(pages),
+                         total_timeout_seconds=budget, elapsed_seconds=round(time.monotonic() - started, 3),
+                         pagination_stop_reason=stopped)
+        for name in ("record", "candidate", "relation"):
+            field = f"input_{name}_ids"
+            aggregate[field] = ids_from(successful, field)
+            aggregate[f"sent_{name}_ids"] = ids_from(attempted, field)
+            coverage[f"sent_{name}_ids"] = aggregate[f"sent_{name}_ids"]
+            coverage[f"verified_response_{name}_ids"] = aggregate[field]
+            coverage[f"{name}_ids_not_sent"] = [value for value in coverage[f"all_{name}_ids"]
+                                               if value not in set(aggregate[f"sent_{name}_ids"])]
+            coverage[f"{name}_ids_without_valid_response"] = [value for value in coverage[f"all_{name}_ids"]
+                                                             if value not in set(aggregate[field])]
+            coverage[f"all_{name}_count"] = len(coverage[f"all_{name}_ids"])
+            coverage[f"sent_{name}_count"] = len(aggregate[f"sent_{name}_ids"])
+        aggregate["input_candidate_record_ids"] = {
+            candidate_id: owner for page in successful
+            for candidate_id, owner in page.get("input_candidate_record_ids", {}).items()}
+        aggregate["input_image_count"] = sum(page.get("input_image_count", 0) for page in attempted)
+        aggregate["detail_panels"] = [{**panel, "page_index": page["page_index"]}
+                                      for page in attempted for panel in page.get("detail_panels", [])]
+        aggregate["source_glyph_tiles"] = [{**tile,"page_index":page["page_index"]}
+                                          for page in attempted for tile in page.get("source_glyph_tiles",[])]
+        coverage["source_eligible_record_count"] = len(coverage["source_eligible_record_ids"])
+        coverage["source_selectable_record_count"] = len(coverage["source_selectable_record_ids"])
+        coverage["all_source_eligible_records_sent"] = set(coverage["source_eligible_record_ids"]) <= set(aggregate["sent_record_ids"])
+        coverage["all_source_eligible_records_have_valid_response"] = set(coverage["source_eligible_record_ids"]) <= set(aggregate["input_record_ids"])
+        coverage["all_relations_sent"] = not coverage["relation_ids_not_sent"]
+        aggregate.update(inventory_coverage=coverage, input_records=len(aggregate["input_record_ids"]),
+                         input_candidates=len(aggregate["input_candidate_ids"]),
+                         status="succeeded" if aggregate["all_pages_succeeded"] else "partial" if successful else "failed")
+        aggregate["coverage_complete"] = bool(aggregate["all_pages_succeeded"] and
+                                                coverage["all_source_eligible_records_have_valid_response"] and
+                                                not coverage["relation_ids_without_valid_response"] and not conflicts)
+        if successful and not aggregate["coverage_complete"]:
+            aggregate["status"] = "partial"
+        if aggregate["status"] == "succeeded":
+            aggregate.pop("error_code", None)
+        elif aggregate["status"] == "partial":
+            aggregate["error_code"] = ("partial_page_failure" if len(successful) < len(page_inputs) else
+                                       "conflicting_page_selections" if conflicts else "partial_inventory_coverage")
+        elif not aggregate.get("error_code"):
+            aggregate["error_code"] = stopped or "binding_pages_failed"
+        # A shared request budget and page receipts disclose costs; never let
+        # the first page's usage masquerade as the whole online operation.
+        usage = {}
+        for page in pages:
+            for key, value in (page.get("usage") or {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[key] = usage.get(key, 0) + value
+        if usage:
+            aggregate["usage"] = usage
+        return aggregate
+
+    async def _select_page(self, image_path, topology_path, inventory, remaining_budget):
         settings, started = self.settings, time.monotonic()
         receipt = {"status": "failed", "protocol": settings.wire_api+"-source-constraint-binding-v2", "model": settings.model,
                    "network_requests": 0, "http_success": False, "schema_success": False,
@@ -298,14 +688,16 @@ class BindingProvider:
         if not endpoint_allowed(settings):
             receipt["error_code"] = "invalid_endpoint"
             return finish()
-        budget = min(600., max(.001, float(settings.api_timeout)))
+        budget = min(600., max(.001, float(remaining_budget)))
         receipt["total_timeout_seconds"] = budget
         try:
             source, source_meta = _image_payload(Path(image_path))
             topology, topology_meta = _image_payload(Path(topology_path))
-            inventory_payload = bounded_inventory(inventory,record_limit=16,candidate_limit=32,relation_limit=16) if settings.wire_api=="responses" else bounded_inventory(inventory)
+            inventory_payload = bounded_inventory(inventory, record_limit=PAGE_RECORD_LIMIT,
+                                                  candidate_limit=PAGE_CANDIDATE_LIMIT, relation_limit=PAGE_RELATION_LIMIT)
             details,detail_receipts = _detail_panels(image_path,topology_path,inventory_payload,
                                                      limit=2 if settings.wire_api=="responses" else 4)
+            glyphs,glyph_receipts = _source_glyph_panel(image_path,inventory_payload)
             inventory_text = json.dumps(inventory_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             receipt.update(inventory_text_chars=len(inventory_text),
                            inventory_text_bytes=len(inventory_text.encode("utf-8")),
@@ -318,8 +710,10 @@ class BindingProvider:
                            input_records=len(inventory_payload["records"]), input_candidates=len(inventory_payload["candidates"]),
                            input_relation_ids=[row["id"] for row in inventory_payload["relations"]],
                            input_record_ids=[row["id"] for row in inventory_payload["records"]],
-                           input_candidate_ids=[row["id"] for row in inventory_payload["candidates"]])
-            receipt.update(detail_panels=detail_receipts,input_image_count=2+len(details))
+                           input_candidate_ids=[row["id"] for row in inventory_payload["candidates"]],
+                           input_candidate_record_ids={row["id"]: row["record_id"] for row in inventory_payload["candidates"]})
+            receipt.update(detail_panels=detail_receipts,source_glyph_tiles=glyph_receipts,
+                           input_image_count=2+len(details)+len(glyphs))
         except _InspectionError as error:
             receipt["error_code"] = error.code
             return finish()
@@ -333,6 +727,7 @@ class BindingProvider:
                        {"type": "image_url", "image_url": {"url": source}},
                        {"type": "image_url", "image_url": {"url": topology}},
                        *details,
+                       *glyphs,
                    ]}]}
         endpoint,wire_payload=prepare_request(settings,payload)
         receipt["request_max_output_tokens"] = wire_payload.get("max_output_tokens", wire_payload.get("max_tokens"))
@@ -354,7 +749,7 @@ class BindingProvider:
                     receipt["finish_reason"] = reason if reason in {"stop", "length", "content_filter", "tool_calls", None} else "other"
                     if reason not in (None, "stop"):
                         raise _InspectionError("truncated_output")
-                    selection = validate_selection(message)
+                    selection = validate_selection(message, item_limit=24)
                     _validate_selection_payload(selection, inventory_payload)
                 except _InspectionError:
                     receipt["response_excerpt"] = content

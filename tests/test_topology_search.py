@@ -417,7 +417,7 @@ def test_edit_stage_uses_fresh_source_observations_only_on_proposal_copy(tmp_pat
         {"annotation_inventory": [], "candidates": [base]}, tmp_path,
         editor_provider=Editor(), use_api=True,
         provider_guard=lambda role: 10., feedback={"constraint_count": 0})
-    assert seen == ["provider", "local", "executor"]
+    assert seen == ["local", "provider", "executor"]
     assert final is base and base["graph"] == original
 
 
@@ -429,8 +429,8 @@ def test_joint_priority_uses_edit_observations_without_mutating_ranked_graph(mon
     base["constraint_feedback"] = {"solver_accepted": True, "constraint_count": 0,
         "satisfied_record_ids": [], "source_validation": {"passed": True}}
     base["edit_source_observations"] = {"angle_source_observations": [{"record_id": "a1"}]}
-    monkeypatch.setattr(search, "_unmet_source_angle_joint", lambda row, *args:
-        bool(row["graph"].get("angle_source_observations")))
+    monkeypatch.setattr(search, "unmet_source_line_operations", lambda row, *args, **kwargs:
+        row["graph"].get("angle_source_observations") or [])
     assert candidate_priority(base, annotation_inventory=[{"record_id": "a1"}])[3] == -1
     assert base["graph"] == original
 

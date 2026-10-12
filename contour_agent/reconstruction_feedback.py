@@ -21,6 +21,64 @@ def geometry_fingerprint(graph):
     return hashlib.sha256("\n".join(canonical).encode()).hexdigest()
 
 
+def source_object_obligations(graph, bindings, solution):
+    """Keep witnessed type obligations separate from fitting and proposal counts.
+
+    This checks the current solve, not an exporter or reference DXF. A radius
+    requires an ARC; an independently witnessed straight angle requires a
+    finite LINE. Rejected numerical candidates cannot satisfy either ledger.
+    """
+    accepted = solution.get("accepted") is True
+    entities = {row["id"]: row for row in (
+        solution.get("entities", graph.get("entities", [])) if accepted else graph.get("entities", []))}
+    constraints = bindings.get("constraints") or []
+    passed = {row.get("id") for row in solution.get("constraints") or [] if row.get("passed") is True}
+    coverage = bindings.get("radius_binding_coverage") or {}
+    radius_rows = {row["record_id"]: row for field in ("required_mappings", "unresolved")
+                   for row in coverage.get(field) or [] if row.get("record_id")}
+    confirmed = set(coverage.get("confirmed_arrow_records") or [])
+    rows = []
+    for record_id in coverage.get("recognized_radius_records") or []:
+        evidence = radius_rows.get(record_id) or {}
+        matches = [row for row in constraints if row.get("record_id") == record_id and row.get("kind") == "radius"]
+        realized = [row for row in matches if len(row.get("entities") or []) == 1 and
+                    entities.get(row["entities"][0], {}).get("type") == "ARC"]
+        satisfied = bool(accepted and record_id in confirmed and any(
+            row.get("id") in passed and entities[row["entities"][0]].get("radius") == row.get("value")
+            for row in realized))
+        target_ids = evidence.get("candidate_entity_ids") or []
+        missing = bool(record_id in confirmed and target_ids and all(
+            entities.get(entity_id, {}).get("type") == "LINE" for entity_id in target_ids))
+        rows.append({"record_id": record_id, "kind": "radius", "required_type": "ARC",
+                     "status": "solved_subset" if satisfied else "missing_object" if missing else "unresolved",
+                     "reason": None if satisfied else evidence.get("reason") or "fresh_binding_and_solve_required",
+                     "candidate_entity_ids": target_ids, "source_arrow_verified": record_id in confirmed})
+    observations = bindings.get("angle_source_observations", graph.get("angle_source_observations", [])) or []
+    for observation in observations:
+        if observation.get("verified") is not True:
+            continue
+        record_id = observation.get("record_id")
+        targets = [row.get("entity_id") for row in observation.get("target_candidates") or []]
+        whole = [row.get("entity_id") for row in observation.get("target_candidates") or []
+                 if row.get("whole_line_supported") is True and
+                 entities.get(row.get("entity_id"), {}).get("type") == "LINE"]
+        satisfied = bool(accepted and any(row.get("kind") == "angle" and
+            row.get("record_id") == record_id and row.get("id") in passed and
+            len(row.get("entities") or []) == 1 and row["entities"][0] in whole for row in constraints))
+        rows.append({"record_id": record_id, "kind": "angle", "required_type": "LINE",
+                     "nominal": observation.get("nominal"), "reference_axis": observation.get("reference_axis"),
+                     "candidate_entity_ids": targets,
+                     "status": "solved_subset" if satisfied else "missing_object" if not whole else "unresolved",
+                     "reason": None if satisfied else "restore_annotated_line_then_bind_and_solve" if not whole
+                               else "fresh_angle_binding_and_solve_required"})
+    return {"schema_version": "source-object-obligations-v1", "ground_truth_used": False,
+            "solver_accepted": accepted, "obligations": rows,
+            "missing_object_record_ids": sorted({row["record_id"] for row in rows if row["status"] == "missing_object"}),
+            "unresolved_record_ids": sorted({row["record_id"] for row in rows if row["status"] != "solved_subset"}),
+            "satisfied": bool(rows and all(row["status"] == "solved_subset" for row in rows)),
+            "scope": "Witnessed primitive types and solved annotation subset; native readback and complete source coverage require separate contracts."}
+
+
 def reconstruction_feedback(graph, bindings=None, solution=None):
     bindings, solution = bindings or {}, solution or {}
     effective_entities=solution.get("entities",graph.get("entities",[])) if solution.get("accepted") else graph.get("entities",[])
@@ -88,6 +146,13 @@ def reconstruction_feedback(graph, bindings=None, solution=None):
         if row.get("accepted") is False and row.get("reason") in {"conflicting_constraints", "conflicting_relations"}:
             issues.append({"code": row["reason"], "record_id": row.get("record_id"),
                            "relation_id": row.get("relation_id")})
+    object_obligations = source_object_obligations(graph, bindings, solution)
+    for row in object_obligations["obligations"]:
+        if row["kind"] == "angle" and row["status"] == "missing_object":
+            issues.append({"code": "angle_requires_finite_line_restoration", "record_id": row["record_id"],
+                           "entity_ids": row["candidate_entity_ids"], "nominal": row["nominal"],
+                           "reference_axis": row["reference_axis"], "binding_verified": False,
+                           "constraint_satisfied": False, "required_action": row["reason"]})
     constraints = bindings.get("constraints", [])
     satisfied_records = {row.get("record_id") for row in solution.get("constraints", [])
                          if row.get("passed") is True and row.get("record_id") in bound}
@@ -133,6 +198,7 @@ def reconstruction_feedback(graph, bindings=None, solution=None):
             "remaining_shape_dof": solution.get("diagnostics", {}).get("remaining_shape_dof"),
             "unbound_dimensions": bindings.get("counts", {}).get("unbound_dimensions"),
             "radius_binding_coverage":coverage,
+            "source_object_obligation_contract":object_obligations,
             "dimensions_verified": False, "reference_verified": False}
 
 

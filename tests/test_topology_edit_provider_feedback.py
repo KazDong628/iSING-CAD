@@ -21,6 +21,18 @@ def _operation(action, ids, record_id=None):
     return {"action": action, "entity_ids": ids, "record_id": record_id, "evidence_tags": ["source_boundary"]}
 
 
+def test_obligation_focus_is_allowlisted_and_contacts_are_not_declared_tangent():
+    result=bounded_iteration_feedback({'required_angle_record_ids':['r035','r035','bad'],
+        'required_radius_record_ids':['r007'],
+        'source_contact_review_pairs':[['g000','g001'],['g000','g003'],['bad','g001']],
+        'private_coordinates':[1.,2.]},_graph(),{'r035','r007'})
+    assert result['required_angle_record_ids']==['r035']
+    assert result['required_radius_record_ids']==['r007']
+    assert result['source_contact_review_pairs']==[{'entity_ids':['g000','g001'],
+        'source_review_required':True,'tangency_required':False}]
+    assert 'private_coordinates' not in result
+
+
 def test_rejected_source_diagnostics_are_visible_without_coordinates_or_private_data():
     feedback={"previous_operations":[{**_operation("split_chain_at_source_features",["g001"],"r003"),
         "status":"rejected","reason":"source_stroke_support_degraded",

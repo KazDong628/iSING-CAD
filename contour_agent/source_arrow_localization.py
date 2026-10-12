@@ -5,7 +5,9 @@ snapped hypothesis must pass the existing complete original-pixel verifier.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import math
+import time
 
 import cv2
 import numpy as np
@@ -66,7 +68,7 @@ def source_label_shaft_ownership(gray, record, tip, direction, *, inspect_parall
     if not through_label and not inspect_parallel_family:
         return result
     offsets = []
-    for segment in native_radius_leader_segments(gray, record):
+    for segment in native_radius_leader_segments(gray, record, parallel_context=True):
         delta = segment[1]-segment[0]
         length = float(np.linalg.norm(delta))
         if length < max(30., .45*size) or abs(float(np.dot(delta/length, away))) < math.cos(math.radians(5.)):
@@ -398,6 +400,65 @@ def same_original_ink_arrow_shaft(gray, first, second):
         return False
 
 
+def _partial_search_ownership_competitors(gray, records, observations, band):
+    """Audit a retained positive against labels whose claims were not searched.
+
+    A stopped seed search cannot invalidate observed ink. It also cannot prove
+    exclusivity merely because a neighboring label never generated a claim.
+    These extra claims are ownership challenges only: a challenger requires
+    a fresh target observation before it can create its own CAD constraint.
+    """
+    from .constraint_binding import _verify_source_arrow_ink
+    radii = [row for row in records if row.get("parsed", {}).get("kind") == "radius"]
+    expanded = [deepcopy(row) for row in observations]
+    audits = []
+    for item in expanded[:]:
+        if (item.get("source_candidate_search") or {}).get("search_complete") is not False:
+            continue
+        audit = {"record_id": item.get("record_id"), "method": "partial_search_all_radius_label_ownership_v1",
+                 "checked_record_ids": [], "glyph_adjacent_record_ids": [], "verified_competing_record_ids": [],
+                 "search_complete": False, "maximum_radius_records": 256, "ground_truth_used": False,
+                 "nominal_used_to_rank": False, "scope": "all recognized source R labels against this physical arrow"}
+        item["partial_source_ownership_recheck"] = audit
+        audits.append(audit)
+        if len(radii) > 256:
+            audit["reason"] = "source_label_ownership_recheck_budget_exceeded"
+            continue
+        try:
+            tip = np.asarray(item["arrowhead"]["tip_px"], float)
+            direction = np.asarray(item["arrowhead"]["direction_px"], float)
+            direction /= np.linalg.norm(direction)
+            for record in radii:
+                audit["checked_record_ids"].append(record["id"])
+                if record["id"] == item.get("record_id"):
+                    continue
+                attachment = source_arrow_label_attachment(gray, record, item)
+                if (not attachment.get("strong_text_adjacency") or not attachment.get("directed_ray_reaches_text")
+                        or attachment.get("arrow_tip_inside_text_box")):
+                    continue
+                audit["glyph_adjacent_record_ids"].append(record["id"])
+                distance = float(attachment["label_to_tip_gap_px"])
+                if not math.isfinite(distance) or distance < 8.:
+                    continue
+                # Place a shaft hypothesis just outside this label's facing
+                # edge. The unchanged verifier checks its entire original ink
+                # path back to the same taper, independent of any CAD target.
+                proposal = {"record_id": record["id"], "tip_px": tip.tolist(),
+                            "shaft_px": (tip-direction*(distance-min(3., .1*distance))).tolist()}
+                verified = _verify_source_arrow_ink(gray, record, proposal, band, target_points=None)
+                if verified is None or not (_same_source_arrow(item, verified, band) or
+                                              same_original_ink_arrow_shaft(gray, item, verified)):
+                    continue
+                audit["verified_competing_record_ids"].append(record["id"])
+                expanded.append({**verified, "record_id": record["id"], "target_candidates": [],
+                    "ownership_competitor_only": True, "challenged_record_id": item.get("record_id"),
+                    "method": "independent_partial_search_competing_label_shaft_verified"})
+            audit["search_complete"] = True
+        except (KeyError, TypeError, ValueError, FloatingPointError):
+            audit["reason"] = "source_label_ownership_recheck_unavailable"
+    return expanded, audits
+
+
 def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
     """Resolve complete physical-arrow claims globally using source ink only.
 
@@ -408,6 +469,7 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
     """
     import copy
     rows = {row["id"]: row for row in records}
+    observations, partial_rechecks = _partial_search_ownership_competitors(gray, records, observations, band)
     if len(observations) > 1024:
         rejected = [{"record_id": key, "reason": "source_arrow_ownership_budget_exceeded"}
                     for key in sorted({row.get("record_id") for row in observations if row.get("record_id")})]
@@ -426,7 +488,10 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
         attachment = source_arrow_label_attachment(gray, record, row, text_points=pixels[record["id"]])
         row["source_text_shaft_attachment"] = attachment
         reason = None
-        if not attachment.get("full_source_shaft_verified"):
+        if ((row.get("source_candidate_search") or {}).get("search_complete") is False and
+                not (row.get("partial_source_ownership_recheck") or {}).get("search_complete")):
+            reason = "partial_source_search_ownership_not_rechecked"
+        elif not attachment.get("full_source_shaft_verified"):
             reason = "complete_source_shaft_not_verified"
         elif not attachment.get("directed_ray_reaches_text"):
             reason = "source_arrow_direction_does_not_reach_label"
@@ -473,17 +538,24 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
         for row in group:
             key = row["record_id"]
             source_crossing = (row.get("contour_visibility") or {}).get("first_intersection_to_target_px")
-            cost = (source_crossing is None or source_crossing > 1.,
+            cost = (bool(row.get("ownership_competitor_only")), source_crossing is None or source_crossing > 1.,
                     row["source_text_shaft_attachment"].get("normalized_text_to_shaft", math.inf))
             old = by_record.get(key)
             old_crossing = (old.get("contour_visibility") or {}).get("first_intersection_to_target_px") if old else None
-            old_cost = (old_crossing is None or old_crossing > 1.,
+            old_cost = (bool(old.get("ownership_competitor_only")), old_crossing is None or old_crossing > 1.,
                         (old.get("source_text_shaft_attachment") or {}).get("normalized_text_to_shaft", math.inf)) if old else None
             if old is None or cost < old_cost:
                 by_record[key] = row
         choices = sorted(by_record.values(), key=lambda row: (
             row["source_text_shaft_attachment"].get("normalized_text_to_shaft", math.inf), row["record_id"]))
-        winner = choices[0] if len(choices) == 1 else None
+        # Absence of a competing OCR claim is not positive label ownership.
+        # A dimension extension can have a real taper and uninterrupted ink,
+        # yet only pass through the rectangular box of an unrelated R label.
+        # Apply the same actual-glyph proof to an unopposed claim that already
+        # resolves competing claims; provider provenance is not a substitute.
+        single_attachment = choices[0]["source_text_shaft_attachment"] if len(choices) == 1 else {}
+        winner = (choices[0] if len(choices) == 1 and single_attachment.get("checked") and
+                  single_attachment.get("strong_text_adjacency") else None)
         if len(choices) > 1:
             best, runner = choices[:2]
             first, second = best["source_text_shaft_attachment"], runner["source_text_shaft_attachment"]
@@ -502,6 +574,11 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
                 "attachments": [{"record_id": row["record_id"], **row["source_text_shaft_attachment"]} for row in choices]})
         for row in choices:
             if row is winner:
+                if row.get("ownership_competitor_only"):
+                    rejected.append({"record_id": row["record_id"], "physical_arrow_id": physical_id,
+                        "reason": "source_competing_label_requires_target_reobservation",
+                        "arrowhead": row["arrowhead"], "challenged_record_id": row.get("challenged_record_id")})
+                    continue
                 # Duplicate observations of one physical arrow may disagree
                 # about which contour object its tip reaches. Deduplicate the
                 # arrow, never erase that target ambiguity by picking the row
@@ -525,13 +602,16 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
                 accepted.append(row)
             else:
                 rejected.append({"record_id": row["record_id"], "physical_arrow_id": physical_id,
-                    "reason": "source_arrow_claim_owned_by_other_label" if winner else "shared_source_arrow_ownership_ambiguous",
+                    "reason": "source_arrow_claim_owned_by_other_label" if winner else
+                              "source_arrow_label_attachment_insufficient" if len(choices) == 1 else
+                              "shared_source_arrow_ownership_ambiguous",
                     "selected_record_id": winner["record_id"] if winner else None,
                     "arrowhead": row["arrowhead"], "source_text_shaft_attachment": row["source_text_shaft_attachment"],
                     "previous_evidence_method": row.get("method")})
     audit = {"method": "global_complete_source_arrow_ownership_v1", "input_observation_count": len(observations),
              "physical_arrow_count": len(groups), "accepted_observation_count": len(accepted),
              "rejected_claim_count": len(rejected), "shared_arrow_conflicts": conflicts,
+             "partial_search_label_ownership_rechecks": partial_rechecks,
              "record_observation_counts_before": {key: sum(row.get("record_id") == key for row in observations)
                                                   for key in sorted(claimed) if key is not None},
              "record_observation_counts_after": {key: sum(row.get("record_id") == key for row in accepted)
@@ -541,20 +621,25 @@ def resolve_source_arrow_ownership(gray, records, observations, *, band=4.):
     return accepted, rejected, audit
 
 
-def native_radius_leader_segments(gray, record, records=(), *, limit=96):
+def native_radius_leader_segments(gray, record, records=(), *, limit=96, audit=None, parallel_context=False):
     """Observe short label-adjacent strokes without shrinking the source image.
 
     These are detection hypotheses only. They must subsequently pass the full
     source arrow, label ray and shaft verifier, including unmasked text strokes.
     """
-    from .constraint_binding import _box
+    from .constraint_binding import _box, _label_ray_entry
+    receipt = audit if audit is not None else {}
+    receipt.update(status="invalid_source_input", search_complete=False,
+                   raw_segment_counts=[], maximum_detector_roi_pixels=2_000_000,
+                   maximum_native_segments=min(96, max(1, limit)))
     if gray is None or gray.ndim != 2 or record.get("parsed", {}).get("kind") != "radius":
         return []
     box = _box(record)
     if box is None:
         return []
     low, high = box.min(axis=0), box.max(axis=0)
-    padding = min(384., max(48., float(np.linalg.norm(high-low))))
+    label_size = max(12., float(np.linalg.norm(high-low)))
+    padding = min(384., max(48., label_size))
     left, top = np.maximum(0, np.floor(low-padding)).astype(int)
     right, bottom = np.minimum([gray.shape[1], gray.shape[0]], np.ceil(high+padding)).astype(int)
     if right <= left or bottom <= top or (right-left)*(bottom-top) > 2_000_000:
@@ -566,15 +651,41 @@ def native_radius_leader_segments(gray, record, records=(), *, limit=96):
         if other is not None:
             cv2.fillPoly(masked, [np.rint(other-[left, top]).astype(np.int32)], 255)
     segments = []
+    def could_belong_to_label(points):
+        for shaft, tip in (points, points[::-1]):
+            gap = float(np.linalg.norm(np.maximum(low-shaft, 0.)+np.minimum(high-shaft, 0.)))
+            direction = tip-shaft
+            length = float(np.linalg.norm(direction))
+            if gap <= max(18., label_size*.75) and length >= 6.:
+                if _label_ray_entry(shaft, -direction/length, low-2., high+2.,
+                                    max(18., label_size*.75)) is not None:
+                    return True
+        return False
     for observed in (masked, original):
         raw = cv2.HoughLinesP(cv2.Canny(observed, 70, 180), 1., np.pi/720,
                               threshold=22, minLineLength=22, maxLineGap=6)
-        for item in ([] if raw is None else raw[:500]):
+        receipt["raw_segment_counts"].append(0 if raw is None else len(raw))
+        for item in ([] if raw is None else raw):
             points = np.asarray(item[0], float).reshape(2, 2)+[left, top]
+            if not parallel_context and not could_belong_to_label(points):
+                continue
             if not any(np.max(np.linalg.norm(points-old, axis=1)) < 1.5 or
                        np.max(np.linalg.norm(points[::-1]-old, axis=1)) < 1.5 for old in segments):
                 segments.append(points)
-    return sorted(segments, key=lambda pair: -float(np.linalg.norm(pair[1]-pair[0])))[:min(96, max(1, limit))]
+    ordered = sorted(segments, key=lambda pair: -float(np.linalg.norm(pair[1]-pair[0])))
+    if parallel_context:
+        # This view supplies surrounding strokes solely to detect a rejecting
+        # repetitive pattern. It is never an inventory of arrow candidates or
+        # a claim that a surviving arrow has unique label/target ownership.
+        return ordered[:receipt["maximum_native_segments"]]
+    incomplete = len(ordered) > receipt["maximum_native_segments"]
+    receipt.update(status="native_segment_budget_exhausted" if incomplete else "completed",
+                   search_complete=not incomplete, observed_native_segment_count=len(ordered))
+    if incomplete:
+        receipt.update(acceptance_withheld_reason="uninspected_source_segment_competitors",
+                       diagnostic_only_segments=[p.tolist() for p in ordered[:receipt["maximum_native_segments"]]])
+        return []
+    return ordered
 
 
 def verify_source_hough_leader(gray, record, segment, boundary_points, band, contours=None, *, verifier=None):
@@ -599,9 +710,129 @@ def verify_source_hough_leader(gray, record, segment, boundary_points, band, con
             "crossing_admission": "detected_directed_source_arrow_with_full_shaft_and_label_ray"}
 
 
-def source_arrow_hypotheses(gray, record, proposal, *, limit=24):
+def localize_ocr_radius_arrows(gray, record, records, boundary_points, band, contours=None, *,
+                              verifier=None, seed_limit=24, time_limit_seconds=8.):
+    """Snap bounded OCR-local ink seeds independently of provider proposals.
+
+    An approximate Hough endpoint can lie on the arrow body or one shaft edge.
+    Reuse the same bounded pixel snap as a model seed, followed by unchanged
+    complete shaft/arrow and actual-glyph attachment checks. Distinct survivors
+    remain separate observations for the global ownership/target audit.
+    """
+    from .constraint_binding import _box, _label_ray_entry
+    started = time.monotonic()
+    maximum_seeds = min(24, max(0, int(seed_limit)))
+    maximum_seconds = min(8., max(0., float(time_limit_seconds)))
+    audit = {"method": "bounded_ocr_local_source_seeds_v1", "record_id": record.get("id"),
+             "status": "not_run", "maximum_seed_count": maximum_seeds,
+             "maximum_hypotheses_per_seed": 24, "maximum_native_segments": 96,
+             "maximum_roi_pixels": 2_000_000, "time_limit_seconds": maximum_seconds,
+             "attempted_seed_count": 0, "accepted_observation_count": 0,
+             "candidate_seed_count": 0, "seed_attempts": [],
+             "api_proposal_used": False, "nominal_used_to_rank": False, "ground_truth_used": False}
+    def finish(result, status):
+        exhausted = status in {"time_budget_exhausted", "seed_budget_exhausted", "inner_search_incomplete"}
+        audit.update(status=status, verified_observation_count=len(result),
+                     accepted_observation_count=len(result), search_complete=not exhausted,
+                     uninspected_seed_count=max(0, audit["candidate_seed_count"]-audit["attempted_seed_count"]),
+                     elapsed_seconds=round(time.monotonic()-started, 6))
+        if exhausted:
+            # Already verified ink remains positive evidence when a later
+            # seed is truncated. It is not a claim that alternatives were
+            # exhausted: ownership must inspect every neighboring R label on
+            # this shaft before any unique target can become a constraint.
+            audit.update(ownership_recheck_required=True, uniqueness_established=False,
+                         candidate_admission_is_binding=False)
+        search = {key: audit[key] for key in ("status", "search_complete", "candidate_seed_count",
+                  "attempted_seed_count", "uninspected_seed_count", "maximum_seed_count")}
+        for item in result:
+            item["source_candidate_search"] = {**search, "uniqueness_established": False,
+                                               "ownership_recheck_required": exhausted}
+        return result, audit
+    box = _box(record)
+    boundary = np.asarray(boundary_points, float)
+    if (gray is None or gray.ndim != 2 or box is None or
+            record.get("parsed", {}).get("kind") != "radius" or
+            boundary.ndim != 2 or boundary.shape[1] != 2 or not len(boundary) or
+            not np.isfinite(boundary).all()):
+        return finish([], "invalid_source_input")
+    text_points = _source_text_pixels(gray, record)
+    if text_points is None:
+        return finish([], "source_text_ink_unavailable")
+    low, high = box.min(axis=0), box.max(axis=0)
+    size = max(12., float(np.linalg.norm(high-low)))
+    padding = min(384., max(48., size))
+    left, top = np.maximum(0, np.floor(low-padding)).astype(int)
+    right, bottom = np.minimum([gray.shape[1], gray.shape[0]], np.ceil(high+padding)).astype(int)
+    audit["seed_roi_px"] = [int(left), int(top), int(right), int(bottom)]
+    prelocalization_band = max(10., band*1.7)+.65*max(7., min(90., size*.52))
+    # Boundary proximity only bounds hypotheses. A current fitted radius or an
+    # OCR numeric value never ranks seeds or establishes their acceptance.
+    from scipy.spatial import cKDTree
+    tree = cKDTree(boundary)
+    seeds = []
+    native_audit = {}
+    native_segments = native_radius_leader_segments(gray, record, records, audit=native_audit)
+    audit["native_segment_search"] = native_audit
+    if native_audit.get("search_complete") is False:
+        return finish([], "inner_search_incomplete")
+    for segment in native_segments:
+        for shaft, tip in (segment, segment[::-1]):
+            label_gap = float(np.linalg.norm(np.maximum(low-shaft, 0.)+np.minimum(high-shaft, 0.)))
+            direction = tip-shaft
+            length = float(np.linalg.norm(direction))
+            if label_gap > max(18., size*.75) or length < 6.:
+                continue
+            direction /= length
+            ray_gap = _label_ray_entry(shaft, -direction, low-2., high+2., max(18., size*.75))
+            target_gap = float(tree.query(tip)[0])
+            if ray_gap is None or target_gap > prelocalization_band:
+                continue
+            proposal = {"record_id": record.get("id"), "shaft_px": shaft.tolist(), "tip_px": tip.tolist()}
+            seeds.append((label_gap+.5*target_gap, proposal))
+    seeds.sort(key=lambda item: (item[0], item[1]["shaft_px"], item[1]["tip_px"]))
+    audit["candidate_seed_count"] = len(seeds)
+    accepted = []
+    for _, proposal in seeds[:maximum_seeds]:
+        if time.monotonic()-started >= maximum_seconds:
+            return finish(accepted, "time_budget_exhausted")
+        audit["attempted_seed_count"] += 1
+        receipt = {"seed_segment_px": [proposal["shaft_px"], proposal["tip_px"]]}
+        inner_audit = {}
+        evidence_candidates = localize_source_arrow_candidates(gray, record, proposal, boundary, band, contours,
+                                                               verifier=verifier, audit=inner_audit)
+        receipt["source_localization_search"] = inner_audit
+        if inner_audit.get("search_complete") is False:
+            receipt["status"] = "inner_search_incomplete"
+            audit["seed_attempts"].append(receipt)
+            return finish(accepted, "inner_search_incomplete")
+        if not evidence_candidates:
+            receipt["status"] = "full_source_verification_failed"
+        for evidence in evidence_candidates:
+            attachment = source_arrow_label_attachment(gray, record, evidence, text_points=text_points)
+            receipt["text_shaft_attachment"] = attachment
+            if not attachment.get("strong_text_adjacency"):
+                receipt["status"] = "source_text_shaft_attachment_insufficient"
+            else:
+                receipt.update(status="locally_verified_pending_global_ownership",
+                               tip_px=evidence["arrowhead"]["tip_px"])
+                accepted.append({**evidence, "method": "ocr_local_source_arrow_with_full_shaft_verified",
+                    "proposal_origin": "bounded_ocr_local_source_seeds", "model_proposal_used": False,
+                    "source_text_shaft_attachment": attachment,
+                    "source_seed": {"segment_px": receipt["seed_segment_px"],
+                                    "api_proposal_used": False, "nominal_used_to_rank": False}})
+        audit["seed_attempts"].append(receipt)
+    return finish(accepted, "seed_budget_exhausted" if len(seeds) > maximum_seeds else "completed")
+
+
+def source_arrow_hypotheses(gray, record, proposal, *, limit=24, audit=None):
     """Find nearby native-resolution shaft strokes, retaining tight pixel bounds."""
     from .constraint_binding import _box, _label_ray_entry
+    receipt = audit if audit is not None else {}
+    maximum = min(64, max(1, limit))
+    receipt.update(status="invalid_source_input", search_complete=False,
+                   maximum_hypotheses=maximum, maximum_detector_roi_pixels=2_000_000,
+                   raw_segment_counts=[], enumerated_hypothesis_count=0)
     if (record.get("parsed", {}).get("kind") != "radius" or not isinstance(proposal, dict) or
             proposal.get("record_id", record.get("id")) != record.get("id")):
         return []
@@ -641,9 +872,11 @@ def source_arrow_hypotheses(gray, record, proposal, *, limit=24):
     for observed in (crop, unmasked):
         raw_segments = cv2.HoughLinesP(cv2.Canny(observed, 70, 180), 1., np.pi/1440,
                                       threshold=12, minLineLength=12, maxLineGap=5)
+        receipt["raw_segment_counts"].append(0 if raw_segments is None else len(raw_segments))
         if raw_segments is not None:
-            segments.extend(raw_segments[:500])
+            segments.extend(raw_segments)
     if not segments:
+        receipt.update(status="completed", search_complete=True)
         return []
     choices = []
     for raw in segments:
@@ -694,38 +927,201 @@ def source_arrow_hypotheses(gray, record, proposal, *, limit=24):
                math.dist(candidate["shaft_px"], old["proposal"]["shaft_px"]) < 1.5 for old in result):
             continue
         result.append({"proposal": candidate, "localization": audit})
-        if len(result) >= min(24, max(1, limit)):
+        # Inspect one extra distinct hypothesis to distinguish an exactly full
+        # completed search from a truncated set with unchecked competitors.
+        if len(result) > maximum:
             break
+    incomplete = len(result) > maximum
+    receipt.update(status="hypothesis_budget_exhausted" if incomplete else "completed",
+                   search_complete=not incomplete, enumerated_hypothesis_count=len(result),
+                   observed_choice_count=len(choices))
+    if incomplete:
+        receipt.update(acceptance_withheld_reason="uninspected_source_hypothesis_competitors",
+                       diagnostic_only_hypotheses=result[:maximum])
+        return []
     return result
 
 
-def localize_source_arrow_proposal(gray, record, proposal, boundary_points, band, contours=None, *, verifier=None):
-    """Verify directly, then search bounded ink corrections without weaker gates."""
+def localize_source_arrow_candidates(gray, record, proposal, boundary_points, band, contours=None, *, verifier=None,
+                                    audit=None, hypothesis_cache=None):
+    """Retain distinct verified source hypotheses for global ownership review.
+
+    A local ambiguity cannot be settled using the current CAD target or its
+    fitted R. Nor should it erase a real arrow before other labels can claim
+    their shafts. Return the complete bounded set; callers must still resolve
+    source-label ownership and target ambiguity before making a constraint.
+    """
     if verifier is None:
         from .constraint_binding import verify_source_arrow_proposal
         verifier = verify_source_arrow_proposal
+    receipt = audit if audit is not None else {}
     direct = verifier(gray, record, proposal, boundary_points, band, contours)
     if direct is not None:
-        return direct
+        receipt.update(status="direct_proposal_verified", search_complete=True,
+                       local_search_performed=False)
+        receipt.update(verified_hypothesis_count=1, physical_arrow_candidate_count=1)
+        return [direct]
     accepted = []
-    for candidate in source_arrow_hypotheses(gray, record, proposal):
+    cache_key=None
+    if isinstance(hypothesis_cache,dict) and isinstance(proposal,dict):
+        try:
+            cache_key=(record.get("id"),tuple(np.asarray(record.get("box"),float).ravel()),
+                       tuple(np.asarray(proposal.get("tip_px"),float).ravel()),
+                       tuple(np.asarray(proposal.get("shaft_px"),float).ravel()))
+        except (TypeError,ValueError):pass
+    cached=hypothesis_cache.get(cache_key) if cache_key is not None else None
+    if cached is None:
+        hypotheses=source_arrow_hypotheses(gray,record,proposal,audit=receipt)
+        # Dense hatching can create more than 24 nearby pixel hypotheses for
+        # a slightly imprecise API tip. One bounded exhaustive expansion is
+        # permitted only when the observed inventory itself fits inside 64.
+        # This changes search capacity, never arrow, shaft, ownership or R
+        # admission. Partial searches still provide no positive certificate.
+        observed = receipt.get("observed_choice_count")
+        if (receipt.get("status") == "hypothesis_budget_exhausted" and
+                type(observed) is int and 24 < observed <= 64):
+            initial = {key: deepcopy(receipt.get(key)) for key in
+                ("status", "search_complete", "maximum_hypotheses", "observed_choice_count",
+                 "enumerated_hypothesis_count")}
+            expanded = {}
+            hypotheses=source_arrow_hypotheses(gray,record,proposal,limit=64,audit=expanded)
+            receipt.clear();receipt.update(expanded)
+            receipt["bounded_search_expansion"] = {
+                "initial": initial, "maximum_hypotheses": 64, "maximum_expansions": 1,
+                "performed": True, "source_verification_thresholds_changed": False,
+                "nominal_used_to_rank": False, "ground_truth_used": False}
+        if cache_key is not None:hypothesis_cache[cache_key]=(deepcopy(hypotheses),deepcopy(receipt))
+    else:
+        hypotheses,cached_receipt=deepcopy(cached)
+        receipt.update(cached_receipt)
+    receipt["local_search_performed"] = True
+    if receipt.get("search_complete") is False:
+        return []
+    for candidate in hypotheses:
         evidence = verifier(gray, record, candidate["proposal"], boundary_points, band, contours)
         if evidence is not None:
             accepted.append({**evidence, "source_pixel_localization": candidate["localization"]})
     if not accepted:
-        return None
-    # More than one distinct arrow endpoint is unresolved; do not select by R
-    # or by whichever proposed target makes the downstream geometry easier.
-    best = min(accepted, key=lambda row: (float(row["score"]),
-               row["source_pixel_localization"]["tip_shift_px"]))
-    def same_arrow(row):
-        # The taper detector samples several sections of one filled arrow;
-        # opposite Hough shaft edges can move its reported tip within that
-        # same observed arrowhead. This groups observations only, not gates.
-        target_band = max(10., float(band)*1.7, .5*max(
-            float(best["arrowhead"].get("length_px", 0)), float(row["arrowhead"].get("length_px", 0))))
-        return math.dist(best["arrowhead"]["tip_px"], row["arrowhead"]["tip_px"]) <= target_band
-    if any(not same_arrow(row) for row in accepted):
-        return None
-    best["source_pixel_localization"]["locally_verified_alternative_count"] = len(accepted)
-    return best
+        receipt.update(verified_hypothesis_count=0, physical_arrow_candidate_count=0)
+        return []
+    # Complete-link grouping uses direction and original shaft ink, never a
+    # broad tip-only radius that could collapse nearby parallel arrows.
+    groups = []
+    for row in accepted:
+        group = next((group for group in groups if all(
+            _same_source_arrow(row, old, band) or same_original_ink_arrow_shaft(gray, row, old)
+            for old in group)), None)
+        if group is None:
+            groups.append([row])
+        else:
+            group.append(row)
+    result = []
+    for group in groups:
+        best = min(group, key=lambda row: (
+            source_arrow_label_attachment(gray, record, row).get("normalized_text_to_shaft", math.inf),
+            float(row["score"]), row["source_pixel_localization"]["tip_shift_px"]))
+        best["source_pixel_localization"]["locally_verified_alternative_count"] = len(group)
+        result.append(best)
+    receipt.update(verified_hypothesis_count=len(accepted), physical_arrow_candidate_count=len(result),
+                   distinct_source_candidates_preserved=len(result) > 1)
+    return result
+
+
+def localize_source_arrow_proposal(gray, record, proposal, boundary_points, band, contours=None, *, verifier=None,
+                                   audit=None, hypothesis_cache=None):
+    """Compatibility path for consumers that require one unique source arrow."""
+    candidates = localize_source_arrow_candidates(gray, record, proposal, boundary_points, band, contours,
+        verifier=verifier, audit=audit, hypothesis_cache=hypothesis_cache)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def observe_source_arrow_scope(gray,record,source_boundary_points,band,*,hypothesis_cache=None):
+    """Observe up to two API locations BEFORE requiring a selected CAD target.
+
+    The immutable source-mask loop supplies only scope distance. A real arrow
+    far outside that selected loop is a scope conflict, not proof that the
+    annotation may be removed from coverage or that its R belongs elsewhere.
+    """
+    receipt={"record_id":record.get("id"),"method":"independent_source_arrow_vs_input_mask_scope_v1",
+        "status":"not_checked","immutable_source_mask_used":False,"maximum_proposals":2,
+        "observations":[],"recognized_annotation_retained":True,"ground_truth_used":False,
+        "nominal_used_to_rank":False,"out_of_scope_exemption_granted":False}
+    proposals=record.get("source_arrow_proposals")
+    if not isinstance(proposals,list) or not proposals:
+        receipt["status"]="not_checked_no_online_source_proposals";return receipt
+    receipt.update(input_proposal_count=len(proposals),inspected_proposal_limit=min(2,len(proposals)),
+                   proposal_count_beyond_scope_budget=max(0,len(proposals)-2))
+    try: boundary=np.asarray(source_boundary_points,float)
+    except (TypeError,ValueError):boundary=np.asarray([])
+    if (boundary.ndim!=2 or boundary.shape[1]!=2 or not 3<=len(boundary)<=200000 or
+            not np.isfinite(boundary).all() or abs(cv2.contourArea(boundary.astype(np.float32)))<4.):
+        receipt["status"]="not_checked_no_immutable_source_mask_boundary";return receipt
+    from .constraint_binding import _verify_source_arrow_ink
+    def independent_verifier(image,row,proposal,*unused):
+        return _verify_source_arrow_ink(image,row,proposal,band,target_points=None)
+    text_points=_source_text_pixels(gray,record)
+    contour=boundary.astype(np.float32)
+    for proposal in proposals[:2]:
+        search={}
+        verified_candidates=localize_source_arrow_candidates(gray,record,proposal,None,band,verifier=independent_verifier,
+            audit=search,hypothesis_cache=hypothesis_cache)
+        if not verified_candidates:
+            receipt["observations"].append({"status":"independent_source_arrow_not_verified",
+                "source_pixel_search":search,"conflicting_candidate_veto_allowed":False});continue
+        for verified in verified_candidates:
+            attachment=source_arrow_label_attachment(gray,record,verified,text_points=text_points)
+            tip=verified["arrowhead"]["tip_px"]
+            signed_distance=float(cv2.pointPolygonTest(contour,tuple(float(v) for v in tip),True))
+            margin=max(24.,3*float(band),.65*float(verified["arrowhead"].get("length_px",0.)))
+            source_verified=bool(attachment.get("checked") and attachment.get("strong_text_adjacency") and
+                attachment.get("directed_ray_reaches_text") and not attachment.get("arrow_tip_inside_text_box") and
+                attachment.get("full_source_shaft_verified"))
+            far_outside=bool(source_verified and signed_distance < -margin)
+            receipt["observations"].append({"status":"outside_selected_boundary_or_scope_conflict" if far_outside else
+                "source_glyph_attachment_not_verified" if not source_verified else
+                "near_boundary_without_scope_exclusion" if abs(signed_distance)<=margin else "inside_selected_boundary",
+                "source_arrow":verified,"source_text_shaft_attachment":attachment,"source_pixel_search":search,
+                "signed_distance_to_input_mask_px":signed_distance,"scope_margin_px":margin,
+                "independent_source_verified":source_verified,"conflicting_candidate_veto_allowed":far_outside})
+    receipt.update(immutable_source_mask_used=True,status="outside_selected_boundary_or_scope_conflict" if
+        any(row.get("conflicting_candidate_veto_allowed") for row in receipt["observations"]) else "checked_no_far_outside_source_proof")
+    return receipt
+
+
+def _same_directed_verified_shaft(first,second,band):
+    """Conservative same-shaft exemption, including two distant tip hypotheses."""
+    try:
+        a,b=first["arrowhead"],second["arrowhead"]
+        p,q=np.asarray(a["tip_px"],float),np.asarray(b["tip_px"],float)
+        u,v=np.asarray(a["direction_px"],float),np.asarray(b["direction_px"],float)
+        u/=np.linalg.norm(u);v/=np.linalg.norm(v)
+        delta=q-p
+        lateral=max(abs(float(u[0]*delta[1]-u[1]*delta[0])),abs(float(v[0]*delta[1]-v[1]*delta[0])))
+        if float(u@v)<math.cos(math.radians(8.)) or lateral>max(3.,min(4.,float(band))):return False
+        intervals=[sorted(float((np.asarray(point)-p)@u) for point in row["segment_px"])
+                   for row in (first,second)]
+        return bool(min(interval[1] for interval in intervals)-max(interval[0] for interval in intervals)>=6.)
+    except (KeyError,TypeError,ValueError,FloatingPointError):return False
+
+
+def guard_source_arrow_scope(gray,record,observations,scope,band):
+    """Withhold conflicting inside hypotheses; never waive source annotations."""
+    outside=[row for row in scope.get("observations",[]) if row.get("conflicting_candidate_veto_allowed") is True]
+    if not outside:return observations,[]
+    kept=[];rejected=[]
+    for item in observations:
+        conflicts=[row for row in outside if not (_same_source_arrow(item,row["source_arrow"],band) or
+            same_original_ink_arrow_shaft(gray,item,row["source_arrow"]) or
+            _same_directed_verified_shaft(item,row["source_arrow"],band))]
+        if not conflicts:
+            kept.append(item);continue
+        rejected.append({"record_id":record.get("id"),"reason":"outside_selected_boundary_or_scope_conflict",
+            "tip_px":(item.get("arrowhead") or {}).get("tip_px"),"target_candidates":item.get("target_candidates",[]),
+            "conflicting_independent_source_tips":[row["source_arrow"]["arrowhead"]["tip_px"] for row in conflicts],
+            "independent_source_verified":True,"immutable_source_mask_used":True,
+            "same_physical_shaft":False,"recognized_annotation_retained":True,"out_of_scope_exemption_granted":False})
+    if not observations:
+        rejected.append({"record_id":record.get("id"),"reason":"outside_selected_boundary_or_scope_conflict",
+            "independent_source_verified":True,"immutable_source_mask_used":True,
+            "recognized_annotation_retained":True,"out_of_scope_exemption_granted":False})
+    return kept,rejected

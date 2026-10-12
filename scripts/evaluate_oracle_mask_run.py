@@ -274,13 +274,21 @@ def _svg(comparison: dict, case_id: str) -> str:
 
 
 def evaluate_oracle_mask_run(run_dir: Path, *, dataset_root: Path = ROOT / "__dataset",
-                             case_id: str | None = None, target_tolerance_mm: float = STRICT_TOLERANCE_MM) -> dict:
+                             case_id: str | None = None, target_tolerance_mm: float = STRICT_TOLERANCE_MM,
+                             comparison_tolerances_mm: tuple[float, ...] = ()) -> dict:
     """Write immutable-after-export evaluation files; never invoke generation."""
     if type(target_tolerance_mm) not in (int, float) or not math.isfinite(target_tolerance_mm) or target_tolerance_mm <= 0:
         raise ValueError("target_tolerance_mm_must_be_finite_positive")
     target_tolerance_mm = float(target_tolerance_mm)
-    comparison_options = ({"additional_parameter_tolerances_mm": (target_tolerance_mm,)}
-                          if target_tolerance_mm != STRICT_TOLERANCE_MM else {})
+    if not isinstance(comparison_tolerances_mm, (tuple, list)) or any(
+        type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+        for value in comparison_tolerances_mm
+    ):
+        raise ValueError("comparison_tolerances_mm_must_be_finite_positive_sequence")
+    tolerances = sorted({STRICT_TOLERANCE_MM, target_tolerance_mm,
+                         *(float(value) for value in comparison_tolerances_mm)})
+    additional = tuple(value for value in tolerances if value != STRICT_TOLERANCE_MM)
+    comparison_options = {"additional_parameter_tolerances_mm": additional} if additional else {}
     run_dir = Path(run_dir).resolve(strict=True)
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     declared_id = manifest.get("case_id")
@@ -357,9 +365,15 @@ def evaluate_oracle_mask_run(run_dir: Path, *, dataset_root: Path = ROOT / "__da
         if not path.is_file(): return {}
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
-    summary["target_acceptance"] = _target_acceptance(
-        comparison, target_tolerance_mm, radius_contract=receipt("after/radius-contract.json"),
-        parameter_stage=receipt("after/parametric-stage.json"))
+    radius_receipt, parameter_receipt = receipt("after/radius-contract.json"), receipt("after/parametric-stage.json")
+    summary["tolerance_comparison"] = [
+        _target_acceptance(comparison, value, radius_contract=radius_receipt,
+                           parameter_stage=parameter_receipt) for value in tolerances]
+    summary["target_acceptance"] = next(row for row in summary["tolerance_comparison"]
+                                        if row["tolerance_mm"] == target_tolerance_mm)
+    summary["tolerance_comparison_scope"] = (
+        "Parallel diagnostics for the same frozen prediction; earlier thresholds remain visible. "
+        "No tolerance changes annotated radii, source constraints, or prediction selection.")
     _write(evaluation / "comparison.json", comparison)
     svg = _svg(comparison, case_id)
     if svg:
@@ -422,9 +436,12 @@ def main() -> None:
     parser.add_argument("--case-id", type=str)
     parser.add_argument("--target-tolerance-mm", type=float, default=STRICT_TOLERANCE_MM,
                         help="Explicit supplemental target; keeps the original 0.1 mm result and exact annotated radii.")
+    parser.add_argument("--comparison-tolerance-mm", type=float, action="append", default=[],
+                        help="Additional unchanged comparison checkpoint; repeat to retain earlier user targets.")
     args = parser.parse_args()
     report = evaluate_oracle_mask_run(args.run_dir, dataset_root=args.dataset, case_id=args.case_id,
-                                      target_tolerance_mm=args.target_tolerance_mm)
+                                      target_tolerance_mm=args.target_tolerance_mm,
+                                      comparison_tolerances_mm=tuple(args.comparison_tolerance_mm))
     print(json.dumps({key: report.get(key) for key in ("case_id", "status", "checks", "target_acceptance", "overlay")}, ensure_ascii=False))
 
 

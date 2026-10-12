@@ -106,7 +106,7 @@ def test_same_object_duplicate_detections_are_one_arrow_without_radius_ranking()
 
 def test_neighboring_parallel_arrowheads_are_not_merged_by_tip_proximity():
     gray = image()
-    original = [observation(), observation(tip=(101., 81.), target="g001")]
+    original = [observation(), observation(tip=(101., 69.), target="g001")]
     kept, _, audit = resolve_source_arrow_ownership(gray, [record()], original)
     assert len(kept) == audit["physical_arrow_count"] == 2
 
@@ -261,7 +261,7 @@ def test_observation_pipeline_does_not_erase_neighboring_arrows_before_global_au
     # reach the global resolver, including the detector/proposal entry path.
     import contour_agent.constraint_binding as binding
     import contour_agent.source_arrow_localization as localization
-    boundary = np.array([[100., 75.], [101., 81.]])
+    boundary = np.array([[100., 75.], [101., 69.]])
     monkeypatch.setattr(binding, "_samples", lambda entity, transform: boundary)
     monkeypatch.setattr(localization, "native_radius_leader_segments", lambda *args, **kwargs: [])
     def arrow(gray, target, direction, *args):
@@ -275,7 +275,7 @@ def test_observation_pipeline_does_not_erase_neighboring_arrows_before_global_au
                 "label_gap_px": 1., "label_ray_intersection_gap_px": 1.,
                 "crossing_source_contour": False, "crossing_admission": "source_only_fixture"}
     monkeypatch.setattr(binding, "verify_source_arrow_proposal", verified)
-    segments = [np.array([[229., 75.], [100., 75.]]), np.array([[229., 81.], [101., 81.]])]
+    segments = [np.array([[229., 75.], [100., 75.]]), np.array([[229., 69.], [101., 69.]])]
     audit = {}
     found = binding._radius_source_observations(image(), [record()],
         {"entities": [{"id": "g000", "type": "ARC"}]}, lambda points: points,
@@ -417,7 +417,7 @@ def test_joint_radius_runs_unchanged_interval_gate_only_after_source_preflight(m
     observations = [_joint_observation("r176", "g016", "g017"),
                     _joint_observation("r176", "g016")]
     seen = []
-    def fixed_radius(entity, nominal, leader, model, graph, transform, band):
+    def fixed_radius(entity, nominal, leader, model, graph, transform, band, **kwargs):
         seen.append((entity["id"], nominal, leader))
         return {"passed": True, "source_deviation_budget_px": 3.79}
     monkeypatch.setattr(binding, "_radius_primitive_feasibility", fixed_radius)
@@ -433,7 +433,7 @@ def test_joint_radius_runs_unchanged_interval_gate_only_after_source_preflight(m
     primary["evidence"].pop("source_joint_radius_conflict_resolution")
     primary["evidence"]["multiple_directed_source_targets_require_review"] = True
     monkeypatch.setattr(binding, "_radius_primitive_feasibility",
-                        lambda *args: {"passed": False, "status": "requires_topology_repartition"})
+                        lambda *args, **kwargs: {"passed": False, "status": "requires_topology_repartition"})
     _admit_joint_radius_conflicts([primary, rival], observations, {}, graph, None, 4.)
     assert not primary["local_reliable"]
     assert primary["evidence"]["multiple_directed_source_targets_require_review"]
@@ -441,7 +441,7 @@ def test_joint_radius_runs_unchanged_interval_gate_only_after_source_preflight(m
     # costly interval feasibility search.
     primary["evidence"].pop("whole_primitive_radius")
     monkeypatch.setattr(binding, "_radius_primitive_feasibility",
-                        lambda *args: (_ for _ in ()).throw(AssertionError("must abstain")))
+                        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must abstain")))
     two_real_arrows = [_joint_observation("r176", "g016"),
                        _joint_observation("r176", "g017")]
     _admit_joint_radius_conflicts([primary, rival], two_real_arrows, {}, graph, None, 4.)
@@ -472,7 +472,7 @@ def test_radius_arrow_at_line_arc_joint_keeps_verified_arc_despite_coarse_fit(mo
 
     calls = []
     monkeypatch.setattr(binding, "_radius_primitive_feasibility",
-        lambda entity, nominal, *args: calls.append((entity["id"], nominal)) or {"passed": True})
+        lambda entity, nominal, *args, **kwargs: calls.append((entity["id"], nominal)) or {"passed": True})
     _admit_joint_radius_conflicts([primary], observations, {}, graph, None, 4.)
     assert calls == [("arc", 3.)]
     assert primary["local_reliable"]
@@ -514,7 +514,7 @@ def test_single_arrow_two_adjacent_arcs_needs_other_radius_source_claim(monkeypa
 
     calls = []
     monkeypatch.setattr(binding, "_radius_primitive_feasibility",
-        lambda entity, nominal, *args: calls.append((entity["id"], nominal)) or {"passed": True})
+        lambda entity, nominal, *args, **kwargs: calls.append((entity["id"], nominal)) or {"passed": True})
     _admit_joint_radius_conflicts([primary, rival], [observation], {}, graph, None, 4.)
     assert calls == [("left", 176.)]
     assert primary["local_reliable"]
@@ -525,7 +525,7 @@ def test_single_arrow_two_adjacent_arcs_needs_other_radius_source_claim(monkeypa
     primary["evidence"].pop("whole_primitive_radius")
     primary["evidence"].pop("source_joint_radius_conflict_resolution")
     monkeypatch.setattr(binding, "_radius_primitive_feasibility",
-                        lambda *args: {"passed": False})
+                        lambda *args, **kwargs: {"passed": False})
     _admit_joint_radius_conflicts([primary, rival], [observation], {}, graph, None, 4.)
     assert not primary["local_reliable"]
 
@@ -566,7 +566,7 @@ def test_one_strong_glyph_attached_arrow_excludes_only_occupied_weak_target(monk
     graph = {"entities": [{"id": "near", "type": "ARC"}]}
     seen = []
     monkeypatch.setattr(binding, "_radius_primitive_feasibility",
-        lambda entity, nominal, leader, *args:
+        lambda entity, nominal, leader, *args, **kwargs:
             seen.append((entity["id"], nominal, leader)) or {"passed": True})
     _admit_joint_radius_conflicts([primary, rival], observations, {}, graph, None, 4.)
     assert seen == [("near", 65., strong)]
@@ -599,6 +599,31 @@ def test_one_strong_glyph_attached_arrow_excludes_only_occupied_weak_target(monk
     primary["evidence"].pop("whole_primitive_radius")
     primary["evidence"].pop("source_joint_radius_conflict_resolution")
     monkeypatch.setattr(binding, "_radius_primitive_feasibility",
-                        lambda *args: {"passed": False})
+                        lambda *args, **kwargs: {"passed": False})
     _admit_joint_radius_conflicts([primary, rival], observations, {}, graph, None, 4.)
     assert not primary["local_reliable"]
+
+
+def test_multiple_verified_joint_pixels_preserve_all_targets_before_radius_exclusion(monkeypatch):
+    import contour_agent.constraint_binding as binding
+    primary = _radius_claim("Rmain", "left", 176., reliable=False, unique=False)
+    primary["evidence"].pop("whole_primitive_radius")
+    rival = _radius_claim("Rother", "right", 40.)
+    graph={"entities":[
+        {"id":"left","type":"ARC","start_node":"a","end_node":"b"},
+        {"id":"right","type":"ARC","start_node":"b","end_node":"c"}]}
+    first=_joint_observation("Rmain","left","right")
+    second=deepcopy(first)
+    observations=[first,second]
+    proof=binding._radius_one_arrow_incompatible_claim_preflight(primary,observations,[primary,rival],graph)
+    assert proof and proof[0]["source_observation_count"]==2
+    assert proof[0]["all_source_target_sets_preserved"]
+    monkeypatch.setattr(binding,"_radius_primitive_feasibility",lambda *a,**kw:{"passed":True})
+    binding._admit_joint_radius_conflicts([primary,rival],observations,{},graph,None,4.)
+    assert primary["local_reliable"]
+    weak=deepcopy(second);weak["shaft_evidence"]["verified"]=False
+    assert binding._radius_one_arrow_incompatible_claim_preflight(primary,[first,weak],[primary,rival],graph) is None
+    different=deepcopy(second);different["target_candidates"][1]["entity_id"]="third"
+    assert binding._radius_one_arrow_incompatible_claim_preflight(primary,[first,different],[primary,rival],graph) is None
+    identical_radius=deepcopy(rival);identical_radius["value"]=primary["value"]
+    assert binding._radius_one_arrow_incompatible_claim_preflight(primary,observations,[primary,identical_radius],graph) is None

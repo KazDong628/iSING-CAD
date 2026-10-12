@@ -66,7 +66,7 @@ def test_competing_verified_arrowheads_remain_ambiguous(monkeypatch):
     original = {"tip_px": [101., 74.], "shaft_px": [245., 59.]}
     candidates = [{"proposal": {"tip_px": [x, 75.], "shaft_px": [229., 75.]},
                    "localization": {"tip_shift_px": 1.}} for x in [100., 170.]]
-    monkeypatch.setattr("contour_agent.source_arrow_localization.source_arrow_hypotheses", lambda *args: candidates)
+    monkeypatch.setattr("contour_agent.source_arrow_localization.source_arrow_hypotheses", lambda *args, **kwargs: candidates)
 
     def verifier(gray, record, proposal, *args):
         if proposal is original:
@@ -176,3 +176,71 @@ def test_two_parallel_strokes_do_not_establish_repetitive_hatch_family():
     gray, record, _ = repetitive_label_source(family=False)
     cv2.line(gray, (100,105), (309,105), 0, 2)
     assert not source_label_shaft_ownership(gray, record, [100.,75.], [-1.,0.])["repetitive_label_crossing"]
+
+
+def test_twenty_fifth_real_ink_competitor_cannot_be_discarded_as_unique_arrow():
+    gray = np.full((170, 310), 255, np.uint8)
+    for y in range(42, 117, 4):
+        if abs(y-75) > 8 and abs(y-105) > 8:
+            cv2.line(gray, (100, y), (229, y), 0, 1)
+    for y in (75, 105):
+        cv2.line(gray, (100, y), (229, y), 0, 2)
+        cv2.fillConvexPoly(gray, np.array([[100, y], [116, y-6], [116, y+6]], np.int32), 0)
+    row = {"id": "r000", "parsed": {"kind": "radius", "nominal": 40.},
+           "box": [[230., 30.], [285., 30.], [285., 115.], [230., 115.]]}
+    boundary = np.array([[100., y] for y in range(40, 120)])
+    proposal = {"record_id": "r000", "tip_px": [101., 74.], "shaft_px": [245., 59.]}
+    audit = {}
+    assert localize_source_arrow_proposal(gray, row, proposal, boundary, 5., audit=audit) is None
+    assert audit["status"] == "hypothesis_budget_exhausted" and audit["search_complete"] is False
+    assert audit["enumerated_hypothesis_count"] == 25
+    early = [verify_source_arrow_proposal(gray, row, item["proposal"], boundary, 5.)
+             for item in audit["diagnostic_only_hypotheses"]]
+    early = [item for item in early if item]
+    assert early and all(item["arrowhead"]["tip_px"][1] < 85 for item in early)
+    # The previously omitted second arrow is real source ink and independently
+    # passes the unchanged complete shaft/arrow verifier; no mocked validator.
+    late = verify_source_arrow_proposal(gray, row, {"tip_px": [100., 105.],
+                                        "shaft_px": [229., 105.]}, boundary, 5.)
+    assert late is not None and late["shaft_evidence"]["verified"]
+    assert late["arrowhead"]["tip_px"][1] > 95
+
+
+def test_exactly_full_unique_hypothesis_inventory_is_complete():
+    gray, row, _ = source()
+    proposal = {"tip_px": [101., 74.], "shaft_px": [245., 59.]}
+    full = source_arrow_hypotheses(gray, row, proposal)
+    assert 1 < len(full) < 24
+    audit = {}
+    assert source_arrow_hypotheses(gray, row, proposal, limit=len(full), audit=audit) == full
+    assert audit["search_complete"] is True and audit["status"] == "completed"
+    assert source_arrow_hypotheses(gray, row, proposal, limit=len(full)-1, audit=audit) == []
+    assert audit["search_complete"] is False
+
+
+def test_unrelated_raw_fragments_do_not_hide_a_late_label_adjacent_segment(monkeypatch):
+    gray = np.full((200, 300), 255, np.uint8)
+    row = {"id": "r", "parsed": {"kind": "radius"},
+           "box": [[200., 60.], [230., 60.], [230., 90.], [200., 90.]]}
+    # Crop origin is (152, 12). Six hundred vertical fragments cannot reach
+    # this text rectangle; the final horizontal stroke can. No raw[:500].
+    raw = np.array([[[10, 20, 10, 50]]] * 600 + [[[10, 63, 47, 63]]], np.int32)
+    monkeypatch.setattr(cv2, "HoughLinesP", lambda *args, **kwargs: raw)
+    audit = {}
+    result = native_radius_leader_segments(gray, row, audit=audit)
+    assert len(result) == 1 and audit["search_complete"] is True
+    assert audit["raw_segment_counts"] == [601, 601]
+    assert audit["observed_native_segment_count"] == 1
+
+
+def test_native_budget_counts_only_deduplicated_label_competitors(monkeypatch):
+    gray = np.full((200, 300), 255, np.uint8)
+    row = {"id": "r", "parsed": {"kind": "radius"},
+           "box": [[200., 60.], [230., 60.], [230., 90.], [200., 90.]]}
+    raw = np.array([[[10, y, 47, y]] for y in (52, 63, 74)], np.int32)
+    monkeypatch.setattr(cv2, "HoughLinesP", lambda *args, **kwargs: raw)
+    audit = {}
+    assert native_radius_leader_segments(gray, row, limit=2, audit=audit) == []
+    assert audit["status"] == "native_segment_budget_exhausted"
+    assert audit["observed_native_segment_count"] == 3
+    assert audit["search_complete"] is False and len(audit["diagnostic_only_segments"]) == 2

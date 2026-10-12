@@ -71,6 +71,29 @@ def test_tampered_dxf_invalidates_stale_evaluation(tmp_path):
     assert row["full_user_target_passed"] is False
 
 
+def test_one_point_five_mm_target_is_never_mislabeled_as_one_mm(tmp_path):
+    run = run_fixture(tmp_path)
+    path = run / "evaluation/summary.json"
+    evaluation = reporter.read(path)
+    new = {"tolerance_mm": 1.5, "primitive_matching": {"matched_count": 20},
+           "checks": {"registered_shape_within_target": True}}
+    old = {"tolerance_mm": 1., "primitive_matching": {"matched_count": 14},
+           "checks": {"registered_shape_within_target": False}}
+    evaluation.update(target_acceptance=new, tolerance_comparison=[old, new])
+    write(path, evaluation)
+    reference = reporter.collect_attempt(tmp_path, run)["reference"]
+    assert reference["matched_primitive_count_1mm"] == 14
+    assert reference["matched_primitive_count_requested_target"] == 20
+    assert reference["requested_target_tolerance_mm"] == 1.5
+    assert not reference["checks_1mm"]["registered_shape_within_target"]
+    assert reference["checks_requested_target"]["registered_shape_within_target"]
+    evaluation.pop("tolerance_comparison")
+    write(path, evaluation)
+    reference = reporter.collect_attempt(tmp_path, run)["reference"]
+    assert reference["checks_1mm"] is None
+    assert reference["matched_primitive_count_1mm"] is None
+
+
 def test_current_native_r_is_not_stale_solver_claim(tmp_path):
     run = run_fixture(tmp_path)
     doc = ezdxf.readfile(run / "after/drawing.dxf")

@@ -25,6 +25,22 @@ def _write_json(path, value):
 
 def build_automatic(image_path, document, output_dir, *, progress=None, segmentation_checkpoint=None,
                     segmentation_mask=None, segmentation_review=None):
+    context = {}
+    try:
+        return _build_automatic(image_path, document, output_dir, progress=progress,
+            segmentation_checkpoint=segmentation_checkpoint, segmentation_mask=segmentation_mask,
+            segmentation_review=segmentation_review, draft_context=context)
+    except InterruptedError:
+        raise
+    except Exception as error:
+        if not context.get("source_draft"):
+            raise
+        from .draft_artifacts import recover_source_draft
+        return recover_source_draft(output_dir, context["source_draft"], error, stage=context.get("stage"))
+
+
+def _build_automatic(image_path, document, output_dir, *, progress=None, segmentation_checkpoint=None,
+                     segmentation_mask=None, segmentation_review=None, draft_context=None):
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     emit = progress or (lambda stage,message: None)
     review = segmentation_review or {}
@@ -71,6 +87,12 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
         extraction["primary_diagnostic"] = primary_diagnostic
     if not extraction.get("polyline_px"):
         raise ValueError("所选轮廓提取器未找到有效主轮廓，请检查当前模型的分割结果。")
+    from .draft_artifacts import preserve_source_draft
+    draft = preserve_source_draft(image_path, extraction, out, oracle_mask=oracle_mask, gt_assisted=gt_assisted)
+    if draft_context is not None:
+        draft_context["source_draft"] = draft
+        draft_context["stage"] = "source_overlay"
+    emit("source_draft", "已保存可回读的闭合源轮廓 DXF 草稿；像素单位，标注和对象属性尚未验证。")
     # Preserve the pre-fit source contour before measurement/vectorization can
     # fail. This evidence is separate from the red fitted-CAD overlay below.
     source=cv2.imdecode(np.fromfile(str(image_path),np.uint8),cv2.IMREAD_COLOR)
@@ -83,6 +105,8 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
     cv2.polylines(contour_overlay,[contour_points],True,(210,90,0),max(2,round(max(source.shape[:2])/800)))
     cv2.imencode('.png',contour_overlay)[1].tofile(str(out/'contour-overlay.png'))
     emit("measure", "从标注文字和尺寸线端点自动估计比例，检查多个尺寸是否一致。")
+    if draft_context is not None:
+        draft_context["stage"] = "scale_measurement"
     scale = estimate_scale(image_path, document)
     scaled = scale["status"] == "resolved"
     pixel_scale = float(scale["pixels_per_mm"]) if scaled else 1.0
@@ -91,6 +115,8 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
     if scaled and scale["axis"] == "x" and scale.get("diameter_semantics") == "half_section_radius_station":
         base_x = scale["axis_origin_px"]
     emit("vectorize", "沿源轮廓拟合直线与圆弧，优化连接点并合并冗余片段；使用原像素保真门检查结果。")
+    if draft_context is not None:
+        draft_context["stage"] = "primitive_vectorization"
     fitting_tolerance = max(2., max(extraction["image_size"].values()) / 2200 * 1.7)
     try:
         fitting = fit_polyline_with_diagnostics(raw,source_polyline_px=extraction.get("raw_polyline_px") or raw,
@@ -112,6 +138,8 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
         entities.append(e)
     if not entities:
         raise ValueError("提取边界未能形成有效的CAD实体。")
+    if draft_context is not None:
+        draft_context["stage"] = "fitted_export"
     doc=ezdxf.new("R2010"); doc.units=4 if scaled else 0
     doc.layers.new("AUTO_MAIN_PROFILE", dxfattribs={"color":3})
     modelspace=doc.modelspace()
@@ -167,7 +195,7 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
     learned_algorithm = ("oracle-gt-mask-conditioned-v1" if oracle_mask else "gt-assisted-human-reviewed-mask-v1" if gt_assisted else
                          "human-reviewed-unet-mask-v1" if segmentation_mask else
                          ("unet-resnet18-dxf-supervised" if extraction.get("model",{}).get("label_status")=="registered_dxf_gt_experimental" else "unet-resnet18-weak-v1"))
-    result={"mode":"autonomous_image","algorithm_version":learned_algorithm if (segmentation_checkpoint or segmentation_mask) else "hatch-dimension-vector-v3","automatic_completion":geometry_valid and readback_ok and complete_material,
+    result={"mode":"autonomous_image","artifact_input_identity":draft["artifact_input_identity"],"algorithm_version":learned_algorithm if (segmentation_checkpoint or segmentation_mask) else "hatch-dimension-vector-v3","automatic_completion":geometry_valid and readback_ok and complete_material,
             "complete_material_exterior":complete_material,"completion_class":"automatic_source_draft" if complete_material else "incomplete_material_exterior_draft",
             "manual_intervention":bool(segmentation_review) and not oracle_mask,"template_used":False,
             "ground_truth_used":gt_assisted or oracle_mask,"oracle_mask_conditioned":oracle_mask,
@@ -181,6 +209,10 @@ def build_automatic(image_path, document, output_dir, *, progress=None, segmenta
             "fitted_polyline_px":[[p[0]*pixel_scale+base_x,base_y-p[1]*pixel_scale] for p in sample_points],
             "scope":"Automatically traced main material boundary with measured global scale and local radius bindings; not full dimension-constraint solving."}
     _write_json(out/"model.json",result);_write_json(out/"validation.json",validation);_write_json(out/"dimension-evidence.json",scale)
+    _write_json(out/"draft-availability.json", {"schema_version":"automatic-dxf-availability-v1",
+        "available":readback_ok,"source_checkpoint":"source-draft-drawing.dxf","current_artifact":"drawing.dxf",
+        "current_units":"mm" if scaled else "pixel","engineering_accepted":False,
+        "input_identity":draft["artifact_input_identity"]})
     emit("export", f"自动导出{len(entities)}个CAD实体；"+("毫米比例已从尺寸线求得。" if scaled else "比例尚未唯一确定，产物明确采用像素单位。"))
     return result
 

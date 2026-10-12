@@ -24,6 +24,8 @@ def fixture_model(tmp_path, units="mm"):
               {"id":"g001","type":"LINE","start":[-4.,5.],"end":[0.,5.]},
               {"id":"g002","type":"ARC","start":[0.,5.],"end":[0.,-5.],"center":[0.,0.],"radius":5.,"clockwise":True},
               {"id":"g003","type":"LINE","start":[0.,-5.],"end":[-4.,-5.]}]
+    for index,entity in enumerate(entities):
+        entity.update(start_node=f"v{index:03d}",end_node=f"v{(index+1)%len(entities):03d}")
     scale=5. if units=="mm" else 1.
     raw,_,_=_sample_entities(entities)
     pixels=np.c_[raw[:,0]*scale+100,100-raw[:,1]*scale].tolist()
@@ -172,8 +174,10 @@ def test_restart_uses_already_persisted_binding_receipt_without_retry(tmp_path,m
     service=recover(tmp_path,monkeypatch)
     try:
         job=service.store.get("persisted")
-        assert job["parameterization"]["provider"]["http_success"] is True
-        assert job["parameterization"]["provider"]["network_requests"]==1
+        attempt=job["parameterization"]["attempt_diagnostics"]
+        assert not attempt["applies_to_current_core"]
+        assert attempt["parameterization"]["provider"]["http_success"] is True
+        assert attempt["parameterization"]["provider"]["network_requests"]==1
         assert not job["parameterization"]["accepted"]
     finally:service.close()
 
@@ -390,9 +394,13 @@ def test_restart_partial_second_publication_restores_last_valid_topology(tmp_pat
     monkeypatch.setattr("contour_agent.topology.build_topology",lambda *a,**k:graph)
     monkeypatch.setattr("contour_agent.constraint_binding.analyze_constraint_bindings",lambda *a,**k:{"constraints":[],"provider":{"status":"disabled"}})
     monkeypatch.setattr("contour_agent.parametric_solver.solve_parametric",lambda *a,**k:{"accepted":False,"status":"no_constraints"})
-    topology,_=refine_parametric(image,{},baseline,output)
+    from contour_agent.dataset import read_ocr
+    raw_ocr=tmp_path/"source-ocr.json"
+    raw_ocr.write_text(json.dumps({"meta":{},"records":[]}),encoding="utf8")
+    topology,_=refine_parametric(image,read_ocr(raw_ocr),baseline,output)
     for name in CORE:shutil.copyfile(output/name,output/("last-valid-"+name))
     job=seed_pending_job(tmp_path,topology,output)
+    job.update(source_image=str(image),source_ocr=str(raw_ocr))
     stage=job["parameterization"]
     stage.update(topology_exported=True,publication={"status":"pending","rollback_prefix":"last-valid-",
         "candidate_sha256":dict.fromkeys(CORE,"not-the-current-set"),
@@ -484,3 +492,38 @@ def test_api_geometry_and_dimension_update_flags_require_accepted_published_choi
     saved=json.loads((output/"model.json").read_text(encoding="utf8"))
     assert saved["parameterization"]["geometry_updated_by_api"] is expected_geometry
     assert saved["parameterization"]["dimensions_updated_by_api"] is expected_dimensions
+
+
+def test_fresh_radius_evidence_reaches_topology_search_before_numerical_binding(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    import contour_agent.parametric_pipeline as pipeline
+    image,baseline,output=prepared(tmp_path)
+    graph=supported_graph(image,baseline)
+    events=[]
+    document={"records":[]}
+    monkeypatch.setattr("contour_agent.topology.build_topology",lambda *a,**k:graph)
+    def inventory(*args,**kwargs):
+        return {"all_candidates":[],"radius_binding_coverage":{"unresolved":[{"record_id":"radius-new"}]}}
+    monkeypatch.setattr("contour_agent.constraint_binding.build_binding_candidates",inventory)
+    monkeypatch.setattr("contour_agent.radius_target_provider.RadiusTargetProvider",lambda s:object())
+    def localize(image,doc,*args,record_ids=None,**kwargs):
+        events.append("focused-retry" if record_ids else "initial-localization")
+        result=deepcopy(doc)
+        if record_ids:result["new_source_evidence"]=True
+        return result,{"proposals":[],"network_requests":1}
+    monkeypatch.setattr("contour_agent.radius_target_provider.locate_radius_targets",localize)
+    def plan(image,doc,*args,**kwargs):
+        assert doc.get("new_source_evidence") is True
+        events.append("topology-search")
+        return graph,{"selected_candidate_id":"source","selection_source":"source",
+            "local_evaluation":{},"selected_preflight_artifact":None}
+    monkeypatch.setattr(pipeline,"_plan_topology",plan)
+    def bind(*args,**kwargs):
+        events.append("numerical-binding")
+        return {"constraints":[],"provider":{"status":"disabled"},"counts":{},"issues":[]}
+    monkeypatch.setattr("contour_agent.constraint_binding.analyze_constraint_bindings",bind)
+    monkeypatch.setattr("contour_agent.parametric_solver.solve_parametric",lambda *a,**k:{"accepted":False,"status":"no_constraints"})
+    _,stage=pipeline.refine_parametric(image,document,baseline,output,use_api=True,
+        editor_provider=SimpleNamespace(settings=object()))
+    assert events==["initial-localization","focused-retry","topology-search","numerical-binding"]
+    assert stage["topology_exported"]

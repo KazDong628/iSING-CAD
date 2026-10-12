@@ -13,11 +13,11 @@ import numpy as np
 from .ocr import canonical_records
 
 
-def _axis_lines(gray: np.ndarray, axis: str) -> list[dict]:
+def _axis_lines(gray: np.ndarray, axis: str, *, minimum_span: int | None = None) -> list[dict]:
     h, w = gray.shape
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     extent = w if axis == "x" else h
-    length = max(25, int(extent * .025))
+    length = max(25, int(extent * .025)) if minimum_span is None else max(5, int(minimum_span))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (length, 1) if axis == "x" else (1, length))
     opened = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
     n, _, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
@@ -120,6 +120,240 @@ def _linear_witnesses(gray, records, *, split_chains=False):
             }
             witnesses.append(item)
     return witnesses
+
+
+def _dimension_station_arrow(gray, axis, cross, station, sign, label_size):
+    """Observe a filled dimension arrow at an independently detected station.
+
+    Unlike a radius leader, a dimension shaft can continue beyond its arrow
+    tip (in particular when arrows are outside a short measured interval).
+    Its narrowing tip, widening body and thinner shaft are still required.
+    A plain crossing or an undifferentiated thick line cannot establish this.
+    No nominal length or candidate scale participates in the observation.
+    """
+    oriented = gray if axis == "y" else gray.T
+    h, w = oriented.shape
+
+    def width_at(y, extent):
+        iy, ix = int(round(y)), int(round(cross))
+        if not 0 <= iy < h:
+            return 0.
+        left, right = max(0, ix-extent), min(w, ix+extent+1)
+        ink = oriented[iy, left:right] < 170
+        central = [i for i in range(max(0, ix-left-2), min(len(ink), ix-left+3)) if ink[i]]
+        if not central:
+            return 0.
+        index = min(central, key=lambda i: abs(i-(ix-left)))
+        lo = hi = index
+        while lo > 0 and ink[lo-1]:
+            lo -= 1
+        while hi+1 < len(ink) and ink[hi+1]:
+            hi += 1
+        return float(hi-lo+1)
+
+    best = None
+    for length in sorted({max(7., min(48., label_size*f)) for f in (.08, .12, .18, .24, .32, .42)}):
+        extent = max(7, int(length*.65))
+        for shift in (-2., 0., 2.):
+            tip = station+shift
+            widths = [width_at(tip-sign*length*f, extent) for f in (.13, .40, .70, 1.25, 1.60)]
+            narrow, middle, body, shaft, tail = widths
+            shaft = max(shaft, tail, 1.)
+            if not (narrow >= shaft+1 and middle >= 2 and body >= max(4., 1.8*shaft)
+                    and .45*body <= middle <= 1.35*body and narrow <= .72*body
+                    and body <= .85*length):
+                continue
+            score = body/shaft + body/max(narrow, 1.) - abs(shift)/length
+            item = {"verified": True, "method": "dimension_station_directed_filled_taper",
+                    "tip_px": [cross, station] if axis == "y" else [station, cross],
+                    "direction_px": [0., float(sign)] if axis == "y" else [float(sign), 0.],
+                    "sample_tip_shift_px": shift, "length_px": length,
+                    "cross_section_widths_px": widths, "score": float(score)}
+            if best is None or score > best["score"]:
+                best = item
+    return best
+
+
+def _local_binding_witnesses(gray, row):
+    """Return source-arrow-confirmed intervals, including external-arrow spans.
+
+    Window and morphology lengths depend on the OCR box, never the nominal
+    value. Both stations must be observed perpendicular strokes with opposing
+    arrows on one common shaft. Ambiguous intervals are retained for review.
+    """
+    box = np.asarray(row["box"], float)
+    low, high = box.min(axis=0), box.max(axis=0)
+    size = np.maximum(high-low, 8.)
+    padding = np.minimum(np.maximum(size*2.2, 80.), 320.)
+    roi_low = np.maximum(np.floor(low-padding).astype(int), 0)
+    roi_high = np.minimum(np.ceil(high+padding).astype(int), np.asarray(gray.shape[::-1]))
+    roi = gray[roi_low[1]:roi_high[1], roi_low[0]:roi_high[0]]
+    if not roi.size:
+        return []
+    lines_by_axis = {}
+    for axis, k in (("x", 0), ("y", 1)):
+        local = _axis_lines(roi, axis, minimum_span=max(10, int(min(size)*.22)))
+        lines_by_axis[axis] = [{**line, "lo": line["lo"]+float(roi_low[k]),
+                               "hi": line["hi"]+float(roi_low[k]),
+                               "cross": line["cross"]+float(roi_low[1-k])} for line in local]
+    candidates = []
+    search_complete = True
+    for axis, k in (("x", 0), ("y", 1)):
+        cross_size, along_size = size[1-k], size[k]
+        lines = [line for line in lines_by_axis[axis]
+                 if -.3*cross_size <= line["cross"]-high[1-k] <= 1.3*cross_size
+                 and line["lo"]-along_size <= box[:, k].mean() <= line["hi"]+along_size]
+        # Bounded local hypotheses. If a busy text/line neighbourhood exceeds
+        # the bound, do not silently claim that the remaining pair is unique.
+        if len(lines) > 12:
+            search_complete = False
+            continue
+        for line in lines:
+            # Local opening can connect the arrow body to its shaft. Its full
+            # component width must not let an adjacent OCR glyph masquerade
+            # as an extension which actually reaches the shaft.
+            margin = min(4., max(2., line["thickness"]*.5))
+            stations = [other for other in lines_by_axis["y" if axis == "x" else "x"]
+                        if other["lo"]-margin <= line["cross"] <= other["hi"]+margin
+                        and line["lo"]-margin <= other["cross"] <= line["hi"]+margin
+                        and other["span"] >= max(16., cross_size*.4)
+                        and low[k]-along_size*2 <= other["cross"] <= high[k]+along_size*2]
+            stations.sort(key=lambda item: item["cross"])
+            if len(stations) > 12:
+                search_complete = False
+                continue
+            arrows = {}
+            for station in stations:
+                for sign in (-1., 1.):
+                    arrows[(station["cross"], sign)] = _dimension_station_arrow(
+                        gray, axis, line["cross"], station["cross"], sign,
+                        float(np.linalg.norm(size)))
+            # Adjacent observed stations only: an intervening extension may
+            # delimit a chained dimension and must not be skipped by ranking.
+            for first, second in zip(stations[:-1], stations[1:]):
+                lo, hi = first["cross"], second["cross"]
+                if hi-lo < max(12., line["thickness"]*4):
+                    continue
+                label_gap = max(lo-high[k], low[k]-hi, 0.)
+                if label_gap > along_size*1.25:
+                    continue
+                pairs = [(arrows[(lo, sign)], arrows[(hi, -sign)]) for sign in (-1., 1.)]
+                pairs = [(a, b) for a, b in pairs if a is not None and b is not None]
+                if not pairs:
+                    continue
+                a, b = max(pairs, key=lambda pair: pair[0]["score"]+pair[1]["score"])
+                interval = {**line, "lo": lo, "hi": hi, "span": hi-lo+1,
+                            "unsegmented_stroke": dict(line),
+                            "extension_stations": {"lo": first, "hi": second},
+                            "segmentation_method": "opposing_source_arrows_at_observed_extensions"}
+                distance = abs(line["cross"]-high[1-k])/cross_size
+                candidates.append({"record_id": row["id"], "text": row["text"], "axis": axis,
+                                   "nominal": row["parsed"]["nominal"], "span_px": hi-lo,
+                                   "pixels_per_mm": (hi-lo)/row["parsed"]["nominal"],
+                                   "line": interval, "box": row["box"],
+                                   "association_distance_label_heights": float(distance),
+                                   "binding_evidence": {"method": "ocr_local_opposing_dimension_arrows_v1",
+                                       "verified": True, "nominal_used_to_rank": False,
+                                       "endpoint_arrows": [a, b], "label_interval_gap_px": label_gap,
+                                       "roi_px": [roi_low.tolist(), roi_high.tolist()],
+                                       "scale_estimation_eligible": False}})
+    # Do not use the expected nominal span to choose between competing strokes.
+    # Deduplicate only the same observed station pair on the same shaft.
+    unique = {}
+    for item in candidates:
+        line = item["line"]
+        key = (item["axis"], line["lo"], line["hi"], line["cross"])
+        unique.setdefault(key, item)
+    result = list(unique.values())
+    for item in result:
+        item["binding_evidence"]["verified"] = search_complete
+        item["binding_evidence"]["search_complete"] = search_complete
+        item["binding_evidence"]["ambiguous"] = len(result) > 1 or not search_complete
+        item["binding_evidence"]["alternative_intervals"] = len(result)
+        item["axis_association"] = {"method": "opposing_source_arrows_and_extension_stations",
+                                    "ambiguous": len(result) > 1 or not search_complete}
+    return result
+
+
+def _long_binding_witnesses(gray, legacy, crossing_by_axis):
+    """Recover distant arrow stations on an already label-owned long shaft.
+
+    A legitimate short extension at a remote center may be shorter than the
+    OCR label. Legacy span splitting excluded it and selected a different
+    crossing farther away. Observe both arrows on the full shaft instead;
+    neither the nominal nor the predicted CAD supplies an endpoint.
+    """
+    result = []
+    by_record = {}
+    for witness in legacy:
+        if witness.get("axis_association", {}).get("ambiguous"):
+            continue
+        axis = witness["axis"]; k = 0 if axis == "x" else 1
+        box = np.asarray(witness["box"], float)
+        size = np.maximum(np.ptp(box, axis=0), 8.)
+        line = witness["line"].get("unsegmented_stroke", witness["line"])
+        margin = min(4., max(2., line["thickness"]*.5))
+        stations = [other for other in crossing_by_axis[axis]
+            if other["lo"]-margin <= line["cross"] <= other["hi"]+margin
+            and line["lo"]-margin <= other["cross"] <= line["hi"]+margin
+            and other["span"] >= max(16., float(size[1-k])*.4)]
+        stations.sort(key=lambda row: row["cross"])
+        if len(stations) > 64:
+            continue
+        for first, second in zip(stations[:-1], stations[1:]):
+            low, high = first["cross"], second["cross"]
+            if high-low < max(12., 4*line["thickness"]):
+                continue
+            gap = max(low-float(box[:, k].max()), float(box[:, k].min())-high, 0.)
+            if gap > size[k]*1.25:
+                continue
+            for sign in (-1., 1.):
+                a = _dimension_station_arrow(gray, axis, line["cross"], low, sign, float(np.linalg.norm(size)))
+                b = _dimension_station_arrow(gray, axis, line["cross"], high, -sign, float(np.linalg.norm(size)))
+                if a is None or b is None:
+                    continue
+                item = {**witness, "line": {**line, "lo": low, "hi": high, "span": high-low+1,
+                    "unsegmented_stroke": dict(line), "extension_stations": {"lo": first, "hi": second},
+                    "segmentation_method": "full_shaft_opposing_source_arrows_at_finite_extensions"},
+                    "span_px": high-low, "pixels_per_mm": (high-low)/witness["nominal"],
+                    "binding_evidence": {"method": "full_shaft_opposing_dimension_arrows_v1",
+                        "verified": True, "nominal_used_to_rank": False, "endpoint_arrows": [a, b],
+                        "label_interval_gap_px": gap, "search_complete": True,
+                        "scale_estimation_eligible": False}}
+                by_record.setdefault(witness["record_id"], {})[(axis, low, high, line["cross"])] = item
+    for options in by_record.values():
+        for item in options.values():
+            item["binding_evidence"].update(ambiguous=len(options) > 1, alternative_intervals=len(options))
+            item["axis_association"] = {"method": "full_shaft_opposing_arrows_and_finite_extensions",
+                                        "ambiguous": len(options) > 1}
+            result.append(item)
+    return result
+
+
+def binding_linear_witnesses(gray, records):
+    """Binding evidence with short dimensions kept separate from scale evidence.
+
+    Original long-span witnesses remain available. A locally observed pair of
+    opposing arrows supersedes that record's unsplit stroke; competing pairs
+    stay explicitly ambiguous and must not become hard constraints. Endpoint
+    attachment to actual CAD objects remains the caller's independent duty.
+    """
+    legacy = _linear_witnesses(gray, records, split_chains=True)
+    observed = []
+    for row in records:
+        parsed = row.get("parsed") or {}
+        if (parsed.get("kind") != "length" or not row.get("box")
+                or not isinstance(parsed.get("nominal"), (int, float))
+                or not np.isfinite(parsed["nominal"]) or parsed["nominal"] <= 0):
+            continue
+        observed.extend(_local_binding_witnesses(gray, row))
+    recovered = {item["record_id"] for item in observed}
+    remaining = [item for item in legacy if item["record_id"] not in recovered]
+    if remaining:
+        observed.extend(_long_binding_witnesses(gray, remaining, {
+            "x": _axis_lines(gray, "y"), "y": _axis_lines(gray, "x")}))
+        recovered = {item["record_id"] for item in observed}
+    return [item for item in legacy if item["record_id"] not in recovered] + observed
 
 
 def _estimate_diameter_scale(gray, records, witnesses):

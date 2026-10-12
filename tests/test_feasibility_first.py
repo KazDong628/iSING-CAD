@@ -49,7 +49,7 @@ def test_infeasible_seed_spends_budget_on_feasibility_before_rms(monkeypatch):
     search = result['diagnostics']['source_budget_search']
     assert search['warm_RMS_skipped'] and search['feasible_checkpoint_found']
     assert not search['acceptance_thresholds_changed']
-    assert search['maximum_rounds'] == 5 and search['maximum_wall_seconds'] == 120.
+    assert search['maximum_rounds'] == 24 and search['maximum_wall_seconds'] == 120.
     assert graph == original
 
 def test_feasible_seed_keeps_existing_warm_path(monkeypatch):
@@ -125,3 +125,21 @@ def test_iteration_limited_point_failing_independent_checks_retains_baseline(mon
     assert result['entities'] == original['entities']
     assert result['nodes'] == original['nodes']
     assert not result['diagnostics']['source_budget_search']['feasible_checkpoint_found']
+
+
+def test_outside_mask_warm_seed_is_not_a_feasible_fallback_when_optimizer_exhausts(monkeypatch):
+    # This seed already satisfies its dimensional equation, but not the mask.
+    # Enabling a warm start must not let the old seed become best_feasible.
+    graph, constraints, observation = inputs(source_width=10.5, tolerance=.03)
+    constraints[0]['value']=10.
+    original=copy.deepcopy(graph)
+    calls=recording_optimizer(monkeypatch,exhaust_rms=True)
+    result=solver.solve_parametric(graph,constraints,source_observation=observation,
+                                  source_warm_start=True)
+    assert calls == ['scalar_objective']
+    assert result['accepted'] is False
+    assert result['entities'] == original['entities']
+    search=result['diagnostics']['source_budget_search']
+    assert search['initial_exact_radius_seed_audit']['passed'] is False
+    assert search['feasible_checkpoint_found'] is False
+    assert search['maximum_warm_RMS_iterations'] == 160

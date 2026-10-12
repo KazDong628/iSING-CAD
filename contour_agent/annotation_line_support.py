@@ -1,7 +1,8 @@
 """Restore straight source intervals located by independently checked angle ink.
 
-This module proposes topology only.  It never takes a fitted slope as a
-dimension, and leaves the exact annotated angle to binding and solving.
+This module proposes topology and source-nominal construction hypotheses.
+It never takes a fitted slope as a dimension. Fresh binding and solving must
+certify each constructed angle before the result can be published.
 """
 from __future__ import annotations
 
@@ -12,6 +13,48 @@ import numpy as np
 
 from .topology import _primitive_distance
 from .vectorize import _arc, _line
+
+
+def _source_nominal_line(points, observation, tolerance, *, fixed_start=False, fixed_end=False):
+    """Construct a proposal from the witnessed nominal, within the same pixel budget.
+
+    Pixel slope selects the branch only. The annotation supplies the angle;
+    fresh binding and optimization still certify the resulting attribute.
+    """
+    evidence = observation.get("evidence") or {}
+    nominal = observation.get("nominal")
+    axis = observation.get("reference_axis")
+    if (evidence.get("method") != "source_angular_arrows_axis_and_straight_support_v1" or
+            any((evidence.get(role) or {}).get("verified") is not True
+                for role in ("reference_arrow", "target_arrow")) or
+            type(nominal) not in (int, float) or not math.isfinite(nominal) or
+            not 0 < nominal < 90 or axis not in {"vertical", "horizontal"}):
+        return None
+    points = np.asarray(points, float)
+    delta = points[-1]-points[0]
+    observed = math.degrees(math.atan2(abs(delta[0]), abs(delta[1])) if axis == "vertical"
+                            else math.atan2(abs(delta[1]), abs(delta[0])))
+    if abs(observed-nominal) > 8.:
+        return None
+    theta = math.radians(nominal)
+    direction = np.array([math.sin(theta), math.cos(theta)] if axis == "vertical"
+                         else [math.cos(theta), math.sin(theta)]) * np.where(delta < 0, -1., 1.)
+    anchor = points[0] if fixed_start else points[-1] if fixed_end else points.mean(axis=0)
+    projected = anchor + ((points-anchor) @ direction)[:, None]*direction
+    a, b = projected[0], projected[-1]
+    if fixed_start: a = points[0]
+    if fixed_end: b = points[-1]
+    line = {"type": "LINE", "start": a.tolist(), "end": b.tolist()}
+    length = float(np.linalg.norm(b-a))
+    if length <= 1e-8:
+        return None
+    actual = math.degrees(math.atan2(abs((b-a)[0]), abs((b-a)[1])) if axis == "vertical"
+                          else math.atan2(abs((b-a)[1]), abs((b-a)[0])))
+    error = float(_primitive_distance(points, line).max())
+    if abs(actual-nominal) > 1e-7 or error > tolerance:
+        return None
+    line.update(fit_error_px=error, source_nominal_angle_constructed=True)
+    return line
 
 
 def _segment(observation):
@@ -97,7 +140,7 @@ def angle_edit_evidence(graph, inventory, operation):
     raise ValueError("angle_line_source_evidence_not_verified_for_entity")
 
 
-def propose_annotation_line_edits(graph, inventory, *, limit=1):
+def propose_annotation_line_edits(graph, inventory, *, limit=1, required_record_ids=None):
     """Offer angle-supported ARC->LINE interval repairs before radius refits."""
     if limit <= 0:
         return []
@@ -105,6 +148,8 @@ def propose_annotation_line_edits(graph, inventory, *, limit=1):
     proposed = []
     seen = set()
     for observation in graph.get("angle_source_observations", []):
+        if required_record_ids is not None and observation.get("record_id") not in required_record_ids:
+            continue
         if any(entities.get(row.get("entity_id"), {}).get("type") == "LINE"
                and row.get("whole_line_supported") is True
                for row in observation.get("target_candidates", [])):
@@ -156,7 +201,7 @@ def _dense_path(points, tolerance):
 
 
 def restore_annotated_joint_line_support(points, observation, tolerance, *, radius_targets,
-                                         fixed_radius_fitter):
+                                         fixed_radius_fitter, source_line_validator=None):
     """Test a finite LINE across an ARC/ARC joint using source data alone.
 
     Both radius arrows must belong to opposite curved tails. A tangent-like
@@ -249,8 +294,27 @@ def restore_annotated_joint_line_support(points, observation, tolerance, *, radi
                        max(np.abs(ends @ normal)), -span)
             candidates.append((ranking, first, line, last))
     if not candidates:
-        raise ValueError("angle_line_joint_has_no_two_radius_source_fit")
-    _, first, line, last = min(candidates, key=lambda row: row[0])
+        # Independent tail fits can preclude any shared straight interval.
+        # Try the joint geometric equations before declaring the topology
+        # impossible. This is still an initial source-owned proposal.
+        from .source_contact_construction import tangent_arc_line_arc
+        orientations=[{arc["clockwise"] for arc in group.values()}
+                      for group in (left_arcs,right_arcs)]
+        constructed=(tangent_arc_line_arc(points,observation,
+            [left[1]["radius_px"],right[1]["radius_px"]],
+            [next(iter(group)) for group in orientations],tolerance,
+            source_line_validator=source_line_validator)
+            if all(len(group)==1 for group in orientations) else None)
+        if constructed is None:
+            raise ValueError("angle_line_joint_has_no_two_radius_source_fit")
+        first,line,last=constructed
+        if any(float(_primitive_distance(tip[None,:],line)[0])<=2.25*tolerance
+               for _,_,tip in located):
+            raise ValueError("angle_line_joint_radius_target_on_straight_interval")
+        line["source_contact_construction"]["radius_record_ids"]=[left[1]["record_id"],right[1]["record_id"]]
+        line["source_contact_construction"]["angle_record_id"]=observation["record_id"]
+    else:
+        _, first, line, last = min(candidates, key=lambda row: row[0])
     for arc, (_, target, _) in ((first, left), (last, right)):
         arc["radius_binding"] = copy.deepcopy(target["binding"])
         # The fixed-radius fitter just matched this original source interval
@@ -321,11 +385,15 @@ def restore_annotated_line_support(points, observation, tolerance, *, radius_tar
                 line = _line(dense[lo:hi+1], tolerance)
                 if line is None:
                     continue
+                nominal_line = _source_nominal_line(dense[lo:hi+1], observation, tolerance,
+                    fixed_start=lo == 0, fixed_end=hi == len(dense)-1)
+                if nominal_line is not None:
+                    line = nominal_line
                 vector = np.asarray(line["end"])-line["start"]
                 cosine = abs(float(vector @ direction / np.linalg.norm(vector)))
                 # This checks association to the observed ink, not agreement
                 # with the nominal angle, which is a later solver constraint.
-                if cosine < math.cos(math.radians(3.)):
+                if nominal_line is None and cosine < math.cos(math.radians(3.)):
                     continue
                 if hi < first or lo > last or min(hi, last)-max(lo, first) < .5*(last-first):
                     continue
@@ -335,7 +403,11 @@ def restore_annotated_line_support(points, observation, tolerance, *, radius_tar
                     if a == b:
                         pieces.append(None)
                         continue
-                    support = dense[a:b+1]
+                    support = dense[a:b+1].copy()
+                    if a == 0:
+                        support[-1] = line["start"]
+                    else:
+                        support[0] = line["end"]
                     tail = _arc(support, tolerance) or _line(support, tolerance)
                     if tail is None:
                         failed = True
@@ -372,10 +444,12 @@ def restore_annotated_line_support(points, observation, tolerance, *, radius_tar
                     "source_line": copy.deepcopy(observation["source_line"]),
                     "source_interval_endpoints_px": [line["start"], line["end"]],
                     "numeric_angle_bound": False, "requires_angle_binding_and_solve": True,
+                    "nominal_direction_constructed": nominal_line is not None,
                     "ground_truth_used": False}
                 # Prefer the largest supported physical straight extent, then
                 # fewer tails. The reference DXF never enters this ordering.
-                rank = (-float(np.linalg.norm(vector)), len(replacements),
+                rank = (-int(nominal_line is not None), len(replacements) if nominal_line is not None else 0,
+                        -float(np.linalg.norm(vector)), len(replacements),
                         max(float(row.get("fit_error_px", 0.)) for row in replacements))
                 candidates.append((rank, replacements))
     if not candidates:

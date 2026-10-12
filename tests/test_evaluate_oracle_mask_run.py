@@ -159,6 +159,32 @@ def test_one_mm_target_does_not_hide_object_fragmentation(tmp_path):
     assert not report["target_acceptance"]["all_requested_checks_passed"]
 
 
+def test_parallel_one_point_five_mm_target_preserves_one_mm_failure_and_prediction(tmp_path):
+    run, dataset = _fixture(tmp_path)
+    path = run / "after" / "drawing.dxf"
+    _rectangle(path, origin=(1.2, 0))
+    frozen = path.read_bytes()
+    report = evaluate_oracle_mask_run(run, dataset_root=dataset, target_tolerance_mm=1.5,
+                                     comparison_tolerances_mm=(1., 1.))
+    checks = {row["tolerance_mm"]: row for row in report["tolerance_comparison"]}
+    assert sorted(checks) == [.1, 1., 1.5]
+    assert not checks[1.]["checks"]["native_coordinate_shape_within_target"]
+    assert checks[1.5]["checks"]["native_coordinate_shape_within_target"]
+    assert not checks[.1]["checks"]["native_coordinate_shape_within_target"]
+    assert report["target_acceptance"] == checks[1.5]
+    assert all(row["annotated_radius_tolerance_mm"] == 0 for row in checks.values())
+    assert all(not row["all_requested_checks_passed"] for row in checks.values())
+    assert path.read_bytes() == frozen
+
+
+@pytest.mark.parametrize("values", [(True,), (0,), (float("nan"),), "1.5"])
+def test_invalid_parallel_tolerance_rejected_before_reference_access(tmp_path, monkeypatch, values):
+    monkeypatch.setattr("scripts.evaluate_oracle_mask_run.build_catalog",
+                        lambda _: pytest.fail("invalid comparison target must not read GT"))
+    with pytest.raises(ValueError, match="finite_positive_sequence"):
+        evaluate_oracle_mask_run(tmp_path / "absent", comparison_tolerances_mm=values)
+
+
 @pytest.mark.parametrize("value", [True, 0, -1, float("nan"), float("inf")])
 def test_invalid_target_rejected_before_any_reference_read(tmp_path, monkeypatch, value):
     monkeypatch.setattr("scripts.evaluate_oracle_mask_run.build_catalog",

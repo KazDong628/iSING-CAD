@@ -129,11 +129,6 @@ def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
                      reference_components=receipt["reference_components"],
                      reference_holes=receipt["reference_holes"])
         checkpoint("oracle_inputs_validated", "GT 栅格掩膜已冻结；参考 DXF 坐标不进入预测。")
-        providers, selected = (_providers(online, provider_profile) if anthropic_thinking is None
-                               else _providers(online, provider_profile, anthropic_thinking=anthropic_thinking))
-        state["provider"] = selected
-        checkpoint("provider_ready")
-
         from contour_agent.automatic import build_automatic
         from contour_agent.dataset import read_ocr
         from contour_agent.dimension_analysis import analyze_dimensions
@@ -149,6 +144,14 @@ def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
                                                      "source": "registered_dxf_gt",
                                                      "reviewed": False},
                                 progress=checkpoint)
+        from contour_agent.draft_artifacts import dxf_availability
+        state["dxf_availability"] = dxf_availability(after)
+        state["prediction_artifact"] = "after/drawing.dxf" if state["dxf_availability"]["available"] else None
+        checkpoint("initial_cad_available")
+        providers, selected = (_providers(online, provider_profile) if anthropic_thinking is None
+                               else _providers(online, provider_profile, anthropic_thinking=anthropic_thinking))
+        state["provider"] = selected
+        checkpoint("provider_ready")
         # Keep this text-only interpretation step separate from topology and
         # geometry. Its proposals are recorded for audit, never substituted
         # into source OCR. analyze_dimensions retains the local inventory on
@@ -174,8 +177,12 @@ def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
         # into geometry fitting. Record the exceptional oracle condition in the
         # run receipt without modifying the source-only pipeline's contracts.
         checkpoint("topology_and_constraints", "依据原图与标注编辑拓扑、绑定约束并求解。")
-        model, stage = refine_parametric(image, document, model, after,
-                                         use_api=online, progress=checkpoint, **providers)
+        if model.get("initialization_recovery"):
+            stage = {"status": "not_run_initialization_recovery", "accepted": False,
+                     "reason": "source_contour_checkpoint_only"}
+        else:
+            model, stage = refine_parametric(image, document, model, after,
+                                             use_api=online, progress=checkpoint, **providers)
         state["parameterization_status"] = stage.get("status")
         state["parameterization_accepted"] = bool(stage.get("accepted"))
         state["prediction_artifact"] = "after/drawing.dxf" if (after / "drawing.dxf").is_file() else None
@@ -208,6 +215,9 @@ def run_oracle_mask_case(case_id: str, run_dir: str | Path, *,
         _write(run_manifest, state)
         raise
     except Exception as error:
+        from contour_agent.draft_artifacts import dxf_availability
+        state["dxf_availability"] = dxf_availability(run / "after")
+        state["prediction_artifact"] = "after/drawing.dxf" if state["dxf_availability"]["available"] else None
         state["status"] = "failed"
         state["failure_stage"] = state["last_stage"]
         state["failure_type"] = type(error).__name__

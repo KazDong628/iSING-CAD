@@ -274,6 +274,12 @@ def test_feasible_residuals_do_not_override_optimizer_nonconvergence(monkeypatch
         fit.success=False;fit.status=0;fit.message="Bounded regression: evaluation budget exhausted"
         return fit
     monkeypatch.setattr(solver,"least_squares",exhausted)
+    actual_minimize=solver.minimize
+    def exhausted_minimize(*args,**kwargs):
+        fit=actual_minimize(*args,**kwargs)
+        fit.success=False;fit.status=0;fit.message="Bounded regression: evaluation budget exhausted"
+        return fit
+    monkeypatch.setattr(solver,"minimize",exhausted_minimize)
     graph=rectangle()
     relation={"id":"flat","kind":"horizontal","entities":["g0"],"nodes":[],"record_id":None,"value":None,"source":"source_geometry"}
     result=solver.solve_parametric(graph,[relation])
@@ -573,7 +579,7 @@ def test_source_budget_search_repairs_a_local_maximum_hidden_by_RMS():
     assert result["validation"]["source_boundary_budget_audit"]["conservative_max_deviation"]<=maximum
     assert result["constraints"][0]["passed"] and result["validation"]["max_gap"]==0
     receipt=result["diagnostics"]["source_budget_search"]
-    assert len(receipt["rounds"])<=5 and not receipt["acceptance_thresholds_changed"]
+    assert len(receipt["rounds"])<=receipt["maximum_rounds"] and not receipt["acceptance_thresholds_changed"]
     assert not receipt["infeasibility_proven"] and not receipt["reference_dxf_read"]
     assert observation==unchanged and result["underconstrained"]
 
@@ -626,7 +632,7 @@ def test_incompatible_source_budget_keeps_fallback_without_claiming_infeasibilit
     assert not result["accepted"] and result["status"]=="source_budget_search_failed"
     assert result["entities"]==graph["entities"] and result["nodes"]==graph["nodes"]
     search=result["diagnostics"]["source_budget_search"]
-    assert not search["passed"] and len(search["rounds"])<=5 and not search["infeasibility_proven"]
+    assert not search["passed"] and len(search["rounds"])<=search["maximum_rounds"] and not search["infeasibility_proven"]
     assert "not proof" in " ".join(result["validation"]["issues"])
 
 

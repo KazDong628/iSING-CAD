@@ -253,7 +253,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if name not in {"drawing.dxf", "preview.svg", "validation.json", "model.json", "overlay.png", "dimension-evidence.json",
                         "segmentation-mask.png","segmentation-overlay.png","segmentation.json","contour-overlay.png",
                         "raw-segmentation-mask.png","raw-segmentation-overlay.png","segmentation-refinement.json",
-                        "curve-fit.json","dimension-analysis.json","topology.json","topology-overlay.png",
+                        "curve-fit.json","dimension-analysis.json","source-ocr-review.json","effective-source-ocr.json","topology.json","topology-overlay.png",
                         "topology-candidates.json","topology-plan.json","topology-edit-proposals.json",
                         "topology-iterations.json","reconstruction-feedback.json",
                         "correction-evidence.json","constraint-bindings.json","binding-candidates.json","binding-topology.png",
@@ -261,7 +261,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "baseline-overlay.png","baseline-model.json","feedback-plan.json","feedback-screenshot.png",
                         "model-segmentation-mask.png","model-segmentation-overlay.png",
                         "reviewed-segmentation-mask.png","reviewed-segmentation-overlay.png","segmentation-review.json",
-                        "oracle-generated-mask.png","oracle-mask-import.json"}:
+                        "oracle-generated-mask.png","oracle-mask-import.json",
+                        "source-draft-drawing.dxf","source-draft-preview.svg","source-draft-model.json",
+                        "source-draft-validation.json","draft-availability.json"}:
             raise HTTPException(404, "产物不存在。")
         job = service.store.get(job_id)
         directory = job.get("artifact_directory")

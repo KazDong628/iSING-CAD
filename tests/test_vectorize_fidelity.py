@@ -88,10 +88,12 @@ def test_contour_evidence_survives_downstream_measurement_failure(tmp_path,monke
     path=source_extraction(tmp_path,monkeypatch)
     def fail(*args,**kwargs):raise ValueError("synthetic measurement failure")
     monkeypatch.setattr("contour_agent.automatic.estimate_scale",fail)
-    with pytest.raises(ValueError,match="measurement failure"):
-        build_automatic(path,{},tmp_path/"output")
+    result=build_automatic(path,{},tmp_path/"output")
     assert (tmp_path/"output/contour-overlay.png").is_file()
-    assert not (tmp_path/"output/drawing.dxf").exists()
+    assert (tmp_path/"output/drawing.dxf").is_file()
+    assert not result["validation"]["passed"]
+    assert not result["validation"]["dimensions_verified"]
+    assert result["initialization_recovery"]["failure_stage"]=="scale_measurement"
 
 
 def test_curve_evidence_is_persisted_and_identical_in_model_validation(tmp_path,monkeypatch):
@@ -110,11 +112,13 @@ def test_vectorization_error_has_failed_receipt_and_preserved_contour(tmp_path,m
     monkeypatch.setattr("contour_agent.automatic.estimate_scale",lambda *a,**kw:{"status":"unresolved","axis":None,"pixels_per_mm":None,"issues":[]})
     def fail(*args,**kwargs):raise ValueError("synthetic fit failure")
     monkeypatch.setattr("contour_agent.automatic.fit_polyline_with_diagnostics",fail)
-    with pytest.raises(ValueError,match="fit failure"):
-        build_automatic(path,{"records":[]},tmp_path/"output")
+    result=build_automatic(path,{"records":[]},tmp_path/"output")
     evidence=json.loads((tmp_path/"output/curve-fit.json").read_text(encoding="utf8"))
     assert not evidence["passed"] and not evidence["engineering_certified"]
     assert (tmp_path/"output/contour-overlay.png").is_file()
+    assert (tmp_path/"output/drawing.dxf").is_file()
+    assert not result["validation"]["passed"]
+    assert result["initialization_recovery"]["failure_stage"]=="primitive_vectorization"
 
 
 @pytest.mark.parametrize("samples",[101,701])

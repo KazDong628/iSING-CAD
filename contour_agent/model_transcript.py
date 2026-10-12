@@ -223,11 +223,108 @@ def _public_radius_contract(contract, bindings, validation):
     return public
 
 
+def _audit_number(value, *, integer=False):
+    if (isinstance(value, (int, float)) and not isinstance(value, bool) and
+            math.isfinite(value) and value >= 0 and (not integer or isinstance(value, int))):
+        return value
+    return None
+
+
+def _public_strict_relations(validation):
+    """Published validation is authoritative; a newer candidate is not a receipt."""
+    raw = (validation or {}).get("strict_relation_validation")
+    if not isinstance(raw, dict):
+        return None
+    result = {"certificate_source": "published_validation", "checks": [],
+              "required_count": _audit_number(raw.get("required_count"), integer=True),
+              "angle_tolerance_deg": _audit_number(raw.get("angle_tolerance_deg")),
+              "endpoint_tolerance": _audit_number(raw.get("endpoint_tolerance")),
+              "dxf_readback_performed": raw.get("dxf_readback_performed") is True,
+              "native_mapping_verified": raw.get("native_mapping_verified") is True,
+              "complete_relation_coverage_verified": False, "reference_accuracy_verified": False}
+    checks = raw.get("checks")
+    for item in checks[:256] if isinstance(checks, list) else []:
+        if not isinstance(item, dict):
+            continue
+        row = {"constraint_id": _identifier(item.get("constraint_id")),
+               "entity_ids": _identifiers(item.get("entity_ids"), 2),
+               "node_id": _identifier(item.get("node_id")), "passed": item.get("passed") is True}
+        for source in ("model", "dxf"):
+            measurement = item.get(source)
+            if isinstance(measurement, dict):
+                row[source] = {key: _audit_number(measurement.get(key))
+                               for key in ("angle_residual_deg", "endpoint_gap")}
+                row[source]["passed"] = measurement.get("passed") is True
+        row["passed"] = bool(row["passed"] and all(
+            row.get(source, {}).get("passed") is True and
+            row[source].get("angle_residual_deg") is not None and row[source].get("endpoint_gap") is not None
+            for source in ("model", "dxf")))
+        result["checks"].append(row)
+    result["satisfied_count"] = sum(row["passed"] for row in result["checks"])
+    result["current_dxf_verified"] = bool(result["dxf_readback_performed"] and result["native_mapping_verified"])
+    result["passed"] = bool(raw.get("passed") is True and result["current_dxf_verified"] and
+                            result["required_count"] == len(result["checks"]) == result["satisfied_count"])
+    return result
+
+
+def _public_reconstruction_contract(validation, strict):
+    raw = (validation or {}).get("reconstruction_contract")
+    if not isinstance(raw, dict):
+        return None
+    result = {"certificate_source": "published_validation", "joints": [],
+              "reference_accuracy_verified": False, "reference_object_count_verified": False,
+              "complete_source_annotation_detection_verified": False}
+    for key in ("recognized_dimensions", "bound_source_records", "unbound_dimensions", "entity_count"):
+        result[key] = _audit_number(raw.get(key), integer=True)
+    result["remaining_shape_dof"] = _audit_number(raw.get("remaining_shape_dof"))
+    counts = raw.get("entity_count_by_type")
+    result["entity_count_by_type"] = {kind: _audit_number((counts if isinstance(counts, dict) else {}).get(kind), integer=True)
+                                      for kind in ("LINE", "ARC")}
+    joints = raw.get("joints")
+    for item in joints[:256] if isinstance(joints, list) else []:
+        if not isinstance(item, dict):
+            continue
+        relation = item.get("relationship")
+        if not isinstance(relation, str) or relation not in {"source_admitted_tangent", "sourced_line_directions"}:
+            relation = "unresolved"
+        types = item.get("types")
+        result["joints"].append({"node_id": _identifier(item.get("node_id")),
+                                 "entities": _identifiers(item.get("entities"), 2),
+                                 "types": [kind if isinstance(kind, str) and kind in {"LINE", "ARC"} else None for kind in types[:2]]
+                                          if isinstance(types, list) else [],
+                                 "relationship": relation, "passed": item.get("passed") is True,
+                                 "constraint_id": _identifier(item.get("constraint_id"))})
+    observed_unknown = sum(row["relationship"] == "unresolved" for row in result["joints"])
+    declared_unknown = _audit_number(raw.get("unresolved_joint_count"), integer=True)
+    result["unresolved_joint_count"] = max(declared_unknown, observed_unknown) if declared_unknown is not None else None
+    result["unresolved_arc_arc_joint_count"] = sum(row["relationship"] == "unresolved" and row["types"] == ["ARC", "ARC"]
+                                                  for row in result["joints"])
+    result["joint_inventory_complete"] = bool(isinstance(joints, list) and len(joints) <= 256 and
+                                               result["entity_count"] == len(joints) == len(result["joints"]))
+    result["all_join_relationships_certified"] = bool(raw.get("all_join_relationships_certified") is True and
+        result["joint_inventory_complete"] and result["unresolved_joint_count"] == 0 and
+        all(row["passed"] for row in result["joints"]) and (strict or {}).get("passed") is True)
+    result["all_recognized_attributes_covered"] = bool(raw.get("all_recognized_attributes_covered") is True and
+        result["recognized_dimensions"] is not None and result["recognized_dimensions"] > 0 and
+        result["bound_source_records"] == result["recognized_dimensions"] and result["unbound_dimensions"] == 0)
+    result["shape_fully_determined"] = bool(raw.get("shape_fully_determined") is True and result["remaining_shape_dof"] == 0)
+    result["satisfied"] = bool(raw.get("satisfied") is True and (validation or {}).get("passed") is True and result["all_join_relationships_certified"] and
+                               result["all_recognized_attributes_covered"] and result["shape_fully_determined"])
+    result["status"] = "source_obligations_satisfied" if result["satisfied"] else "unresolved_source_obligations"
+    return result
+
+
 def _public_feedback(feedback):
     if not isinstance(feedback, dict):
         return {}
     result = _scalars(feedback, ("candidate_id", "issue_count", "constraint_count", "structural_constraint_count",
-                                  "solver_status", "solver_accepted", "remaining_shape_dof", "unbound_dimensions"))
+                                  "solver_status", "solver_accepted", "remaining_shape_dof", "unbound_dimensions",
+                                  "binding_status", "preflight_status", "preflight_skip_reason"))
+    failure = feedback.get("preflight_failure")
+    if isinstance(failure, dict):
+        result["preflight_failure"] = _scalars(failure, (
+            "category", "stage", "error_type", "binding_completed", "solver_started",
+            "solver_completed", "infeasibility_proven", "exception_message_recorded"))
     result["issues"] = []
     issues = feedback.get("issues")
     for issue in issues[:64] if isinstance(issues, list) else []:
@@ -280,12 +377,14 @@ def _public_iterations(document):
 
 
 def _public_parameterization(directory):
+    from .binding_attempts import published_binding_sources
     solution = _read_object(directory, "parametric-solution.json")
     bindings = _read_object(directory, "constraint-bindings.json")
     stage = _read_object(directory, "parametric-stage.json")
     contract = _read_object(directory, "radius-contract.json")
     validation = _read_object(directory, "validation.json")
-    if not solution and not bindings and not contract and not stage:
+    model = _read_object(directory, "model.json")
+    if not solution and not bindings and not contract and not stage and not validation:
         return None
     result = _scalars(solution, ("status", "accepted", "underconstrained"))
     result["constraint_subset_accepted"] = (solution or {}).get("accepted") is True
@@ -293,6 +392,8 @@ def _public_parameterization(directory):
     result["pipeline_status"] = _scalars(stage, ("status",)).get("status")
     result["all_dimensions_verified"] = (stage or {}).get("all_dimensions_verified") is True
     result["radius_contract"] = _public_radius_contract(contract, bindings, validation)
+    result["strict_relation_validation"] = _public_strict_relations(validation)
+    result["reconstruction_contract"] = _public_reconstruction_contract(validation, result["strict_relation_validation"])
     result["counts"] = _scalars((bindings or {}).get("counts"),
                                 ("recognized_dimensions", "bound_source_records", "unbound_dimensions", "constraints",
                                  "structural_local_accepted", "structural_api_accepted"))
@@ -305,6 +406,54 @@ def _public_parameterization(directory):
                                                                "value", "actual", "absolute_residual", "tolerance")))
     result["feedback"] = _public_feedback(_read_object(directory, "reconstruction-feedback.json"))
     result["reference_verified"] = False
+    # A rejected solution can contain the exported baseline geometry and valid
+    # constraints of its attempted update. Those obligations do not belong to
+    # the published DXF. The model stores the committed stage separately.
+    published = (model or {}).get("parameterization")
+    if isinstance(published, dict):
+        result["binding_provenance"]=published_binding_sources(published)
+        result["attempted"] = {
+            key: result[key] for key in ("status", "accepted", "underconstrained",
+                "constraint_subset_accepted", "pipeline_accepted", "pipeline_status",
+                "counts", "diagnostics", "constraints", "feedback") if key in result}
+        result["attempted"]["scope"] = "latest_parameterization_attempt"
+        solver = published.get("solver")
+        solver = solver if isinstance(solver, dict) else {}
+        published_status = _scalars(published, ("status",)).get("status")
+        subset = bool(solver.get("accepted") is True and
+                      (published.get("constraint_subset_accepted") is True or
+                       published.get("accepted") is True))
+        result.update(scope="published_dxf", status=published_status,
+            accepted=subset, constraint_subset_accepted=subset,
+            pipeline_accepted=published.get("accepted") is True,
+            pipeline_status=published_status,
+            all_dimensions_verified=published.get("all_dimensions_verified") is True,
+            underconstrained=solver.get("underconstrained") if subset else None)
+        if subset:
+            result["counts"] = _scalars(published.get("binding_counts"), (
+                "recognized_dimensions", "bound_source_records", "unbound_dimensions",
+                "constraints", "structural_local_accepted", "structural_api_accepted"))
+            result["diagnostics"] = _scalars(solver.get("diagnostics"), (
+                "constraint_rank", "remaining_shape_dof", "independent_dimension_record_count"))
+            checks = published.get("solver_constraint_checks")
+            checks = checks if isinstance(checks, list) else []
+            result["constraints"] = [_scalars(row, (
+                "id", "kind", "record_id", "passed", "value", "actual",
+                "absolute_residual", "tolerance")) for row in checks[:128] if isinstance(row, dict)]
+        else:
+            recognized = _audit_number(result["attempted"].get("counts", {}).get(
+                "recognized_dimensions"), integer=True)
+            result["counts"] = {"recognized_dimensions": recognized,
+                "bound_source_records": 0, "unbound_dimensions": recognized, "constraints": 0,
+                "structural_local_accepted": 0, "structural_api_accepted": 0}
+            result["diagnostics"] = {}
+            result["constraints"] = []
+        formal_bindings = {"counts": result["counts"]}
+        result["radius_contract"] = _public_radius_contract(
+            published.get("annotation_radius_contract") or {}, formal_bindings, validation)
+        result["feedback"] = _public_feedback(published.get("reconstruction_feedback"))
+    else:
+        result["scope"] = "latest_attempt_without_publication_identity"
     return result
 
 
@@ -323,6 +472,23 @@ def build_model_transcript(job: dict, runtime_root: Path):
     stages = []
     iterations = _read_object(directory, "topology-iterations.json")
     for stage_id, label, filename in _STAGES:
+        if stage_id=="binding":
+            from .binding_attempts import collect_binding_attempts
+            attempts=collect_binding_attempts(directory)
+            if attempts:
+                labels={"initial":"初始约束绑定","radius_rebinding":"半径候选重新绑定","fallback":"回退候选重新绑定",
+                        "post_solve_radius_rebinding":"有效解半径候选重新绑定",
+                        "source_completion_1":"有效解源约束补全第一轮",
+                        "source_completion_2":"有效解源约束补全第二轮"}
+                for attempt in attempts:
+                    provider=attempt["provider"]
+                    if not provider.get("network_requests") and provider.get("status") in {"disabled","skipped","not_configured"}:
+                        continue
+                    item=_stage("binding",labels.get(attempt["phase"],label),{"provider":provider},provider)
+                    item.update(attempt_id=attempt["attempt_id"],receipt_scope=attempt["receipt_scope"],
+                                recovered_from_artifacts=attempt["recovered_from_artifacts"])
+                    stages.append(item)
+                continue
         document = _read_object(directory, filename)
         provider = document.get("provider") if isinstance(document, dict) else None
         if stage_id == "radius_targets" and isinstance(document, dict):

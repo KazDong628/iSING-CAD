@@ -45,7 +45,7 @@ def test_five_provider_edits_leave_one_trial_for_unmet_verified_line():
         provider, [line], _angle_graph(), [{"record_id": "r032", "kind": "angle",
                                              "nominal": 24.}],
         {"satisfied_record_ids": []})
-    assert operations == [*provider[:4], line]
+    assert operations == [line, *provider[:4]]
     assert skipped == []
 
 
@@ -64,7 +64,30 @@ def test_unwitnessed_or_satisfied_line_does_not_displace_provider_edit():
     single = {**_line_operation(), "entity_ids": ["g010"]}
     operations, _ = _ordered_topology_operations(
         provider, [single], _angle_graph(), inventory, {"satisfied_record_ids": []})
-    assert operations == provider
+    assert operations == [single, *provider[:4]]
+
+
+def test_single_arc_swallowing_angle_line_has_first_branch_without_certification():
+    from contour_agent.topology_search import (source_repair_branch_priority,
+                                               unmet_source_line_operations,
+                                               unmet_source_angle_joint_operations)
+    graph = _angle_graph()
+    graph["entities"] = [{"id": "g010", "type": "ARC"}]
+    graph["annotation_support"] = []
+    inventory = [{"record_id": "r032", "kind": "angle", "nominal": 24.}]
+    candidate = {"id": "swallowed", "graph": graph,
+                 "constraint_feedback": {"satisfied_record_ids": []}}
+    original = deepcopy(candidate)
+    operations = unmet_source_line_operations(candidate, candidate["constraint_feedback"], inventory)
+    assert len(operations) == 1 and operations[0]["entity_ids"] == ["g010"]
+    assert unmet_source_angle_joint_operations(candidate, candidate["constraint_feedback"], inventory) == []
+    generic = {"id": "generic", "graph": {"entities": []},
+               "constraint_feedback": {"satisfied_record_ids": []}}
+    assert sorted([generic, candidate], key=lambda row: source_repair_branch_priority(
+        row, annotation_inventory=inventory))[0] is candidate
+    assert candidate == original
+    candidate["constraint_feedback"]["satisfied_record_ids"] = ["r032"]
+    assert unmet_source_line_operations(candidate, candidate["constraint_feedback"], inventory) == []
 
 
 def test_reserved_line_enters_preflight_and_online_base_verdict_cannot_erase_it(
@@ -144,7 +167,7 @@ def test_reserved_line_enters_preflight_and_online_base_verdict_cannot_erase_it(
         source, {}, {}, base, bundle, tmp_path,
         editor_provider=Editor(), evaluator_provider=Evaluator(), use_api=True,
         feedback=feedback, verifier=verify)
-    assert attempted == [*provider[:4], line]
+    assert attempted == [line, *provider[:4]]
     assert preflighted == ["cand-edit-05-annotated-line"]
     assert receipt["preflight_queue"][0]["status"] == "passed"
     assert receipt["evaluator"]["selected_candidate_id"] == "base"

@@ -110,6 +110,21 @@ def test_two_supported_lines_or_axes_cannot_silently_choose_one():
         assert len(candidates) == 2 and not any(c["local_reliable"] for c in candidates)
 
 
+def test_certified_adjacent_radius_does_not_compete_for_a_restored_straight_angle():
+    obs = observation(span=33.)
+    curved = observation("arc", kind="ARC", span=43., whole=False)["target_candidates"][0]
+    curved["source_interval"] = [.28, 1.]
+    obs["target_candidates"].append(curved)
+    graph = {"entities": [{"id": "side", "type": "LINE", "start_node": "joint", "end_node": "outside",
+        "angle_support_evidence": {"record_id": "angle_label", "nominal_direction_constructed": True,
+            "ground_truth_used": False, "requires_angle_binding_and_solve": True}},
+        {"id": "arc", "type": "ARC", "start_node": "inside", "end_node": "joint"}]}
+    assert not binding._angle_candidates([obs], graph)[0]["local_reliable"]
+    assert binding._angle_candidates([obs], graph, source_radius_entities={"arc"})[0]["local_reliable"]
+    curved["source_interval"] = [.28, .65]
+    assert not binding._angle_candidates([obs], graph, source_radius_entities={"arc"})[0]["local_reliable"]
+
+
 def test_conflicting_angles_keep_only_finite_line_arrow_owner():
     graph = {"units": "mm", "source_grid_pitch_px": 1.,
              "coordinate_system": {"origin_source_px": [0., 0.]},

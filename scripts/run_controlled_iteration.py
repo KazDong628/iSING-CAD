@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -134,6 +135,7 @@ def providers(config_root, online, profile_id, timeout):
         return {}, {"online_requested": False, "network_requests": 0}
     from contour_agent.config import Settings, load_local_env, provider_registry
     from contour_agent.provider import DimensionProvider
+    from contour_agent.source_ocr_review import SourceOCRReviewProvider
     from contour_agent.binding_provider import BindingProvider
     from contour_agent.planning_provider import PlanningProvider
     from contour_agent.topology_edit_provider import TopologyEditProvider, TopologyEvaluationProvider
@@ -150,6 +152,7 @@ def providers(config_root, online, profile_id, timeout):
         raise ValueError("provider_not_configured")
     return {
         "dimension_provider": DimensionProvider(settings, max_attempts=1),
+        "source_ocr_review_provider": SourceOCRReviewProvider(settings),
         "provider": BindingProvider(settings), "planner_provider": PlanningProvider(settings),
         "editor_provider": TopologyEditProvider(settings), "evaluator_provider": TopologyEvaluationProvider(settings),
     }, {"online_requested": True, "profile_id": chosen, "model": settings.model,
@@ -196,9 +199,13 @@ def main(argv=None):
     parser.add_argument("--provider-profile", default="9ecode-gpt-5.6-sol")
     parser.add_argument("--api-timeout", type=float, default=180.)
     parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--target-tolerance-mm", type=float, default=1.,
+                        help="Supplemental reference target, never a solver or source-boundary threshold.")
     args = parser.parse_args(argv)
     if not 5 <= args.api_timeout <= 600:
         parser.error("api-timeout must be between 5 and 600 seconds")
+    if not math.isfinite(args.target_tolerance_mm) or args.target_tolerance_mm <= 0:
+        parser.error("target-tolerance-mm must be finite and positive")
     run = args.output.resolve()
     main_root = args.config_root.resolve(strict=True)
     if args.evaluate:
@@ -216,7 +223,9 @@ def main(argv=None):
              "oracle_mask_conditioned": True, "held_out": False, "calibration_or_development": True,
              "ground_truth_coordinates_sent_to_provider": False, "ground_truth_dxf_used_as_prediction_geometry": False,
              "status": "initializing", "stage_history": [], "evaluation_requested": args.evaluate,
-             "frozen_strict_evaluation_tolerance_mm": .1, "additional_evaluation_tolerance_mm": 1.0}
+             "frozen_strict_evaluation_tolerance_mm": .1,
+             "additional_evaluation_tolerance_mm": args.target_tolerance_mm,
+             "preserved_comparison_tolerances_mm": [.1, 1.]}
     def checkpoint(stage, message=""):
         state["last_stage"] = str(stage)
         state["stage_history"].append({"stage": str(stage), "at": stamp()})
@@ -233,9 +242,6 @@ def main(argv=None):
                      source_image_sha256=receipt["source_image_sha256"], source_ocr_sha256=receipt["source_ocr_sha256"],
                      oracle_mask_sha256=receipt["mask_sha256"])
         checkpoint("inputs_frozen")
-        bundle, settings_receipt = providers(main_root, args.online, args.provider_profile, args.api_timeout)
-        state["provider"] = settings_receipt
-        dimension_provider = bundle.pop("dimension_provider", None)
         from contour_agent.automatic import build_automatic
         from contour_agent.dataset import read_ocr
         from contour_agent.dimension_analysis import analyze_dimensions
@@ -247,12 +253,33 @@ def main(argv=None):
         model = build_automatic(inputs["source_image"], document, after, segmentation_mask=inputs["mask"],
                                 segmentation_review={"status": "oracle_mask", "source": "frozen_gt_raster_only", "reviewed": False},
                                 progress=checkpoint)
+        from contour_agent.draft_artifacts import dxf_availability
+        state["dxf_availability"] = dxf_availability(after)
+        checkpoint("initial_cad_available")
+        bundle, settings_receipt = providers(main_root, args.online, args.provider_profile, args.api_timeout)
+        state["provider"] = settings_receipt
+        dimension_provider = bundle.pop("dimension_provider", None)
+        ocr_review_provider = bundle.pop("source_ocr_review_provider", None)
+        from contour_agent.source_ocr_review import review_source_ocr
+        checkpoint("source_ocr_review")
+        document,review = review_source_ocr(inputs["source_image"],document,model,after,
+            provider=ocr_review_provider,use_api=args.online,raw_ocr_path=inputs["source_ocr"],progress=checkpoint)
+        state["source_ocr_review"]={"status":review["status"],"changed_record_ids":review["changed_record_ids"],
+            "effective_document_sha256":review["effective_document_sha256"],
+            "http_successful_requests":sum(p["provider"].get("http_success") is True for p in review["pages"]),
+            "schema_successful_requests":sum(p["provider"].get("schema_success") is True for p in review["pages"]),
+            "network_requests":sum(p["provider"].get("network_requests") or 0 for p in review["pages"]),
+            "unknown_request_counts":sum(p["provider"].get("network_requests") is None for p in review["pages"])}
         checkpoint("dimension_analysis")
         dimensions = analyze_dimensions(document, model, provider=dimension_provider, use_api=args.online)
         write(after / "dimension-analysis.json", dimensions)
         checkpoint("topology_and_constraints")
-        model, stage = refine_parametric(inputs["source_image"], document, model, after,
-                                         use_api=args.online, progress=checkpoint, **bundle)
+        if model.get("initialization_recovery"):
+            stage = {"status": "not_run_initialization_recovery", "accepted": False,
+                     "reason": "source_contour_checkpoint_only"}
+        else:
+            model, stage = refine_parametric(inputs["source_image"], document, model, after,
+                                             use_api=args.online, progress=checkpoint, source_first=True, **bundle)
         state["parameterization_status"] = stage.get("status")
         state["parameterization_accepted"] = stage.get("accepted") is True
         checkpoint("current_export_audit")
@@ -275,7 +302,8 @@ def main(argv=None):
             checkpoint("post_export_evaluation")
             completed = subprocess.run([sys.executable, "-X", "utf8", str(comparator), "--run-dir", str(run),
                                         "--dataset", str(evaluation_root / "__dataset"), "--case-id", state["case_id"],
-                                        "--target-tolerance-mm", "1"], cwd=evaluation_root,
+                                        "--target-tolerance-mm", str(args.target_tolerance_mm),
+                                        "--comparison-tolerance-mm", "1"], cwd=evaluation_root,
                                        capture_output=True, timeout=600, check=False)
             state["evaluation_exit_code"] = completed.returncode
             state["evaluation_code"]["unchanged"] = code_snapshot(evaluation_root) == state["evaluation_code"]["sha256_before"]
@@ -291,6 +319,8 @@ def main(argv=None):
         checkpoint("finished")
         return 0
     except BaseException as error:
+        from contour_agent.draft_artifacts import dxf_availability
+        state["dxf_availability"] = dxf_availability(run / "after")
         state.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
                      failure_stage=state.get("last_stage"), failure_type=type(error).__name__, failed_at=stamp())
         write(run / "run-manifest.json", state)

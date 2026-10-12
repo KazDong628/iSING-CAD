@@ -1,5 +1,6 @@
 """Small agent state machine: extract -> review -> solve -> independently validate."""
 from __future__ import annotations
+from copy import deepcopy
 import hashlib
 import io
 import json
@@ -21,7 +22,8 @@ from .store import JobStore
 from .automatic import build_automatic
 from .vision_provider import VisionProvider
 from .dimension_analysis import analyze_dimensions
-from .parametric_pipeline import refine_parametric
+from .source_ocr_review import SourceOCRReviewProvider, review_source_ocr, load_effective_ocr
+from .parametric_pipeline import refine_parametric, source_input_identity
 from .feedback_provider import FeedbackProvider
 from .feedback_geometry import create_feedback_candidate
 
@@ -36,13 +38,212 @@ def digest(path: Path):
     return h.hexdigest()
 
 
+def _load_published_source_ocr(image_path, raw_ocr_path, directory, model):
+    """A valid review sidecar must also belong to this published CAD model."""
+    document=load_effective_ocr(image_path,raw_ocr_path,directory)
+    reviewed=any((Path(directory)/name).exists() for name in
+                 ("source-ocr-review.json","effective-source-ocr.json"))
+    if reviewed or "source_input_identity" in model:
+        if model.get("source_input_identity")!=source_input_identity(image_path,document):
+            raise ValueError("当前CAD产物与有效OCR输入身份不一致；不能认证或继续截图修正。")
+    return document
+
+
 def _parameterization_needs_review(job):
     stage=job.get("parameterization") or {}
     if not stage:return False
     contract=stage.get("annotation_radius_contract")
+    validation=job.get("validation") or {}
+    coverage=validation.get("reconstruction_contract") or {}
+    strict=validation.get("strict_relation_validation") or {}
     return bool(stage.get("accepted") is not True or
+                coverage.get("satisfied") is not True or
+                coverage.get("unresolved_joint_count") != 0 or
+                coverage.get("remaining_shape_dof") != 0 or
+                strict.get("passed") is not True or
+                strict.get("dxf_readback_performed") is not True or
+                strict.get("native_mapping_verified") is not True or
                 (contract is not None and (not contract.get("satisfied") or
                                           contract.get("publication_status")=="candidate_only")))
+
+
+def _recover_numerical_constraints(model, document, strict):
+    """Re-evaluate every published equation on model and native geometry.
+
+    Use the solver's input protocol and fixed tolerances, without solving or
+    trusting its stored residuals. Shared nodes come from the current native
+    endpoints, not a possibly stale graph or a later candidate's sidecar.
+    """
+    from .parametric_solver import (ANGLE_TOLERANCE_DEG, LINEAR_TOLERANCE_MM,
+        STRICT_OCR_ANGLE_CERT_TOLERANCE_DEG, STRICT_MEASUREMENT_CERT_TOLERANCE_MM,
+        _strict_measurement_contract, _DIMENSIONAL, _constraint_residual,
+        _constraint_value, _strict_ocr_angle_contract, _strict_ocr_angle_specs,
+        _strict_general_angle_contract, _validate_inputs)
+    from .relation_contract import (STRICT_RELATION_ENDPOINT_TOLERANCE,
+        STRICT_TANGENT_CERT_TOLERANCE_DEG, _geometry, _native_geometry)
+
+    constraints=(model.get("parameterization") or {}).get("constraints",[])
+    audit={"schema_version":"current-core-numerical-readback-v1", "passed":False,
+           "required_count":len(constraints) if isinstance(constraints,list) else None,
+           "satisfied_count":0,"checks":[],"issues":[],"dxf_readback_performed":False,
+           "native_mapping_verified":False,"solver_called":False,"reference_geometry_used":False}
+    try:
+        if strict.get("native_mapping_verified") is not True:
+            raise ValueError("native_entity_mapping_not_verified")
+        entities=[_geometry(entity) for entity in model["entities"]]
+        primitives=list(document.modelspace())
+        audit["dxf_readback_performed"]=True
+        if len(primitives)!=len(entities):raise ValueError("native_entity_count_mismatch")
+        native=[_native_geometry(primitive,entity) for primitive,entity in zip(primitives,entities)]
+        audit["native_mapping_verified"]=True
+
+        def graph(values):
+            nodes={}
+            for entity in values:
+                for endpoint in ("start","end"):
+                    node_id=entity[endpoint+"_node"];point=entity[endpoint]
+                    if node_id in nodes and math.dist(point,nodes[node_id])>STRICT_RELATION_ENDPOINT_TOLERANCE:
+                        raise ValueError("shared_native_node_endpoints_disagree")
+                    nodes.setdefault(node_id,point)
+            return {"units":(model.get("coordinate_system") or {}).get("units"),"entities":values,
+                    "nodes":[{"id":key,"x":point[0],"y":point[1]} for key,point in nodes.items()]}
+
+        model_nodes,entities,prepared=_validate_inputs(graph(entities),constraints)
+        native_nodes,native,native_prepared=_validate_inputs(graph(native),constraints)
+        if prepared!=native_prepared:raise ValueError("native_constraint_inventory_mismatch")
+        specs=_strict_ocr_angle_specs(entities,prepared)
+        model_angles={r["constraint_id"]:r for r in _strict_ocr_angle_contract(entities,specs)["checks"]}
+        native_angles={r["constraint_id"]:r for r in _strict_ocr_angle_contract(native,specs)["checks"]}
+        tangent_checks={r["constraint_id"]:r for r in strict.get("checks",[])}
+        contexts=[({n["id"]:np.array([n["x"],n["y"]]) for n in nodes},
+                   {entity["id"]:entity for entity in values})
+                  for nodes,values in ((model_nodes,entities),(native_nodes,native))]
+        measurements=[{row["constraint_id"]:row for row in _strict_measurement_contract(
+            nodes,list(indexed.values()),prepared,entities)["checks"]} for nodes,indexed in contexts]
+        general_angles=[{row["constraint_id"]:row for row in _strict_general_angle_contract(
+            nodes,list(indexed.values()),prepared)["checks"]} for nodes,indexed in contexts]
+        for row in prepared:
+            tolerance=(0. if row["kind"]=="radius" else
+                       STRICT_TANGENT_CERT_TOLERANCE_DEG if row["kind"]=="tangent" else
+                       STRICT_OCR_ANGLE_CERT_TOLERANCE_DEG if row["id"] in model_angles or row["id"] in general_angles[0] else
+                       STRICT_MEASUREMENT_CERT_TOLERANCE_MM if row["id"] in measurements[0] else
+                       LINEAR_TOLERANCE_MM if row["kind"] in _DIMENSIONAL else ANGLE_TOLERANCE_DEG)
+            samples=[]
+            for nodes,indexed in contexts:
+                nids=row["nodes"]
+                # atan2(0, 0) must not certify a collapsed direction/angle.
+                pairs=([(nids[0],nids[1])] if row["kind"] in {"horizontal","vertical"} else
+                       [(nids[0],nids[1]),(nids[2],nids[1])] if row["kind"]=="angle" and len(nids)==3 else [])
+                if any(float(np.linalg.norm(nodes[a]-nodes[b]))<=1e-12 for a,b in pairs):
+                    raise ValueError("degenerate_constraint_direction")
+                actual=float(_constraint_value(row,nodes,indexed))
+                residual=float(_constraint_residual(row,actual))
+                if not math.isfinite(actual) or not math.isfinite(residual):
+                    raise ValueError("nonfinite_constraint_measurement")
+                samples.append({"actual":actual,"signed_residual":residual,"absolute_residual":abs(residual),
+                                "passed":abs(residual)<=tolerance})
+            if row["kind"]=="tangent":
+                current=tangent_checks.get(row["id"],{})
+                for sample,key in zip(samples,("model","dxf")):
+                    sample["passed"] &= current.get("passed") is True and (current.get(key) or {}).get("passed") is True
+            if row["id"] in model_angles:
+                for sample,angles in zip(samples,(model_angles,native_angles)):
+                    sample["passed"] &= angles[row["id"]]["passed"] is True
+            if row["id"] in general_angles[0]:
+                for sample,angles in zip(samples,general_angles):
+                    sample["passed"] &= angles[row["id"]]["passed"] is True
+            if row["id"] in measurements[0]:
+                for sample,contracts in zip(samples,measurements):
+                    check=contracts[row["id"]]
+                    sample["passed"] &= check["passed"] is True
+                    sample["derived_anchor_points"]=check.get("derived_anchor_points",[])
+                    sample["intersection_conditions"]=check.get("intersection_conditions",[])
+            audit["checks"].append({**row,**samples[1],"model":samples[0],"dxf":samples[1],
+                "passed":all(sample["passed"] for sample in samples),"tolerance":tolerance,
+                "residual_unit":"mm" if row["kind"] in _DIMENSIONAL else "degree",
+                "binding_verified_by_solver":False,"recomputed_from_current_native_dxf":True})
+        audit["satisfied_count"]=sum(row["passed"] for row in audit["checks"])
+        audit["passed"]=audit["satisfied_count"]==audit["required_count"]
+    except (ValueError,KeyError,TypeError,AttributeError,IndexError,OverflowError) as error:
+        audit["issues"].append(str(error))
+    return audit
+
+
+def _recover_parametric_certificate(model, document):
+    """Recheck current CORE obligations; an old accepted flag is not a certificate.
+
+    This never discovers new obligations or upgrades legacy exports. The saved
+    export-time stage supplies the obligation inventory, not a newer attempt's
+    sidecar. Native geometry is independently read back again before restoring
+    acceptance; downloadable, coherent geometry may still remain uncertified.
+    """
+    from .radius_contract import annotation_radius_contract, exact_radius_checks
+    from .reconstruction_contract import reconstruction_contract
+    from .relation_contract import relation_checks
+
+    stage=deepcopy(model.get("parameterization") or {})
+    validation=model.get("validation") or {}
+    constraints=stage.get("constraints") or []
+    entities=model.get("entities") or []
+    stored_strict=validation.get("strict_relation_validation") or {}
+    stored_exact=validation.get("exact_radius_validation") or {}
+    stored_coverage=validation.get("reconstruction_contract") or {}
+    stored_radii=validation.get("annotation_radius_contract") or {}
+    strict=relation_checks(entities,constraints,dxf_document=document)
+    exact=exact_radius_checks(entities,constraints,dxf_document=document)
+    numerical=_recover_numerical_constraints(model,document,strict)
+    stage["solver_constraint_checks"]=numerical["checks"]
+    solver=stage.setdefault("solver",{})
+    solver["accepted"]=bool(solver.get("accepted") is True and numerical["passed"])
+    solver.setdefault("validation",{})["constraint_subset_satisfied"]=numerical["passed"]
+    current_subset=bool(
+        model.get("algorithm_version")=="source-topology-bound-parametric-v1" and
+        stored_strict.get("schema_version")=="strict-relation-contract-v1" and
+        stored_strict.get("passed") is True and
+        stored_strict.get("dxf_readback_performed") is True and
+        stored_strict.get("native_mapping_verified") is True and
+        stored_strict.get("required_count")==strict.get("required_count") and
+        stored_exact.get("passed") is True and stored_exact.get("dxf_readback_performed") is True and
+        stored_exact.get("required_count")==exact.get("required_count") and
+        strict.get("passed") is True and strict.get("native_mapping_verified") is True and
+        exact.get("passed") is True and numerical["passed"])
+    # A failed angle, distance or G1 equation must not relabel exact, covered
+    # radii as missing. Radius certification has its own native readback and
+    # published source-coverage prerequisites; overall acceptance still needs
+    # every numerical and relationship certificate above.
+    current_radius_subset=bool(
+        model.get("algorithm_version")=="source-topology-bound-parametric-v1" and
+        strict.get("native_mapping_verified") is True and strict.get("dxf_readback_performed") is True and
+        stored_exact.get("passed") is True and stored_exact.get("dxf_readback_performed") is True and
+        stored_exact.get("required_count")==exact.get("required_count") and
+        exact.get("passed") is True and exact.get("dxf_readback_performed") is True)
+    radii=annotation_radius_contract(stage,{"entities":entities,"accepted":current_radius_subset})
+    radius_complete=bool(current_radius_subset and stored_radii.get("satisfied") is True and
+        stored_radii.get("current_dxf_verified") is True and radii.get("satisfied") is True)
+    checked_validation={**deepcopy(validation),"strict_relation_validation":strict,
+                        "exact_radius_validation":exact,
+                        "numerical_constraint_validation":numerical,
+                        "annotation_radius_contract":{**radii,"satisfied":radius_complete,
+                            "all_annotated_radii_verified":radius_complete,"current_dxf_verified":radius_complete}}
+    coverage=reconstruction_contract(entities,stage,checked_validation)
+    complete=bool(current_subset and stored_coverage.get("schema_version")=="source-reconstruction-contract-v1" and
+        stored_coverage.get("satisfied") is True and coverage.get("satisfied") is True)
+    reasons=list(coverage.get("reasons") or [])
+    if not numerical["passed"]:reasons.append("current_native_numerical_constraints_failed")
+    if not current_subset:reasons.append("current_native_subset_certificate_missing_or_failed")
+    if stored_coverage.get("schema_version")!="source-reconstruction-contract-v1":
+        reasons.append("current_reconstruction_certificate_missing")
+    elif stored_coverage.get("satisfied") is not True:
+        reasons.append("published_reconstruction_was_not_complete")
+    return {"source":"current_published_core","constraint_subset_verified":current_subset,
+            "radius_subset_verified":current_radius_subset,
+            "annotated_radii_verified":radius_complete,"complete":complete,
+            "strict_relation_validation":strict,"exact_radius_validation":exact,
+            "numerical_constraint_validation":numerical,
+            "annotation_radius_contract":checked_validation["annotation_radius_contract"],
+            "solver_constraint_checks":stage["solver_constraint_checks"],"solver":solver,
+            "reconstruction_contract":coverage,"reasons":list(dict.fromkeys(reasons)),
+            "legacy_export_automatically_certified":False}
 
 class AgentService:
     def __init__(self, settings: Settings, *, recover_running=False):
@@ -58,6 +259,7 @@ class AgentService:
         active_settings = self.provider_profiles[self.default_provider_id].settings(settings)
         self.provider = DimensionProvider(active_settings)
         self.automatic_dimension_provider = DimensionProvider(active_settings, max_attempts=1)
+        self.source_ocr_review_provider = SourceOCRReviewProvider(active_settings)
         self.vision_provider = VisionProvider(active_settings)
         from .binding_provider import BindingProvider
         from .planning_provider import PlanningProvider
@@ -69,13 +271,14 @@ class AgentService:
         self.feedback_provider = FeedbackProvider(active_settings)
         self._provider_clients = {self.default_provider_id: {
             "dimension": self.provider, "automatic_dimension": self.automatic_dimension_provider,
+            "source_ocr_review": self.source_ocr_review_provider,
             "vision": self.vision_provider, "binding": self.binding_provider,
             "planning": self.planning_provider, "topology_edit": self.topology_edit_provider,
             "topology_evaluate": self.topology_evaluation_provider, "feedback": self.feedback_provider,
         }}
         for job in self.store.list(1000) if recover_running else []:
             if job["status"] in {"queued", "extracting", "solving", "auditing"}:
-                if job.get("mode") == "autonomous_image":
+                if job.get("mode") in {"autonomous_image", "autonomous_revision"}:
                     previous_status = job["status"]
                     directory = Path(job["artifact_directory"]) if job.get("artifact_directory") else None
                     def saved_object(name):
@@ -116,6 +319,14 @@ class AgentService:
                     published=False
                     if directory and directory.is_dir():
                         published=self._recover_automatic_geometry(job,directory)
+                        if not published and job.get("parameterization"):
+                            unverified=job["parameterization"]
+                            unverified.update(status="recovery_unverified",accepted=False,
+                                constraint_subset_accepted=False,geometry_updated_by_api=False,
+                                dimensions_updated_by_api=False,
+                                recovery_certificate={"source":"unverified_published_core","complete":False,
+                                    "constraint_subset_verified":False,"annotated_radii_verified":False,
+                                    "reasons":["source_input_or_core_integrity_not_verified"]})
                         self._publish_automatic_artifacts(job,directory)
                         if job.get("parameterization"):
                             from .parametric_pipeline import _write
@@ -207,6 +418,7 @@ class AgentService:
         configured = profile.settings(self.settings)
         bundle = {"dimension": DimensionProvider(configured),
                   "automatic_dimension": DimensionProvider(configured, max_attempts=1),
+                  "source_ocr_review": SourceOCRReviewProvider(configured),
                   "vision": VisionProvider(configured), "binding": BindingProvider(configured),
                   "planning": PlanningProvider(configured),
                   "topology_edit": TopologyEditProvider(configured),
@@ -378,6 +590,9 @@ class AgentService:
         output.mkdir(parents=True, exist_ok=True)
         parent_output = Path(job["parent_artifact_directory"])
         try:
+            parent_model=json.loads((parent_output/"model.json").read_text(encoding="utf8"))
+            feedback_document=_load_published_source_ocr(
+                Path(job["source_image"]),Path(job["source_ocr"]),parent_output,parent_model)
             from .planning_provider import evaluate_candidates
             from .topology_candidates import materialize_selected_candidate
             from .parametric_pipeline import _export_chain, _topology_source_validation
@@ -432,7 +647,7 @@ class AgentService:
             if geometry_operations:
                 try:
                     selected, geometry_audit = create_feedback_candidate(
-                        Path(job["source_image"]), read_ocr(Path(job["source_ocr"])), baseline, selected, bundle,
+                        Path(job["source_image"]), feedback_document, baseline, selected, bundle,
                         Path(job["feedback_screenshot"]), parent_output / "overlay.png", receipt["operations"], output,
                     )
                     revised_local = evaluate_candidates([selected], max_candidates=1)
@@ -475,6 +690,7 @@ class AgentService:
                                    topology=True, source_validation=source_validation)
             parameterization = {
                 "status": "feedback_topology_exported", "accepted": False, "topology_exported": True,
+                "constraint_subset_accepted": False, "constraints": [],
                 "ground_truth_used": False, "geometry_updated_by_api": False,
                 "topology_selected_by_api": True,
                 "geometry_updated_by_user_instruction": bool(
@@ -490,6 +706,15 @@ class AgentService:
                 "provider": receipt, "source_validation": source_validation,
             }
             result["parameterization"] = parameterization
+            artifact_available = bool(result["validation"].get("passed") and
+                                      result["validation"].get("dxf_readback", {}).get("passed"))
+            constraints_complete = bool(artifact_available and not _parameterization_needs_review(result))
+            # A successful topology edit supplies a downloadable draft.  It
+            # has not re-bound or solved the parent's dimensional obligations.
+            result.update(artifact_available=artifact_available, constraints_complete=constraints_complete,
+                          automatic_completion=constraints_complete,
+                          completion_class="source_topology_draft")
+            result["source_input_identity"] = source_input_identity(Path(job["source_image"]),feedback_document)
             result["revision"] = {"parent_job_id": job["parent_job_id"],
                                   "evidence_parent_job_id": job.get("evidence_parent_job_id", job["parent_job_id"]),
                                   "instruction": job["feedback_instruction"],
@@ -498,20 +723,23 @@ class AgentService:
             (output / "parametric-stage.json").write_text(json.dumps(parameterization, ensure_ascii=False, indent=2), encoding="utf-8")
             for name in ("segmentation-mask.png", "segmentation-overlay.png", "raw-segmentation-mask.png",
                          "raw-segmentation-overlay.png", "segmentation-refinement.json", "segmentation.json",
-                         "dimension-evidence.json", "dimension-analysis.json", "baseline-model.json",
+                         "dimension-evidence.json", "dimension-analysis.json", "source-ocr-review.json", "effective-source-ocr.json", "baseline-model.json",
                          "baseline-drawing.dxf", "baseline-preview.svg", "baseline-overlay.png"):
                 source = parent_output / name
                 if source.is_file() and not (output / name).exists():
                     shutil.copyfile(source, output / name)
-            job.update(status="completed", validation=result["validation"], automatic_completion=True,
+            job.update(status=("completed" if constraints_complete else "needs_review") if artifact_available else "failed",
+                       validation=result["validation"], automatic_completion=constraints_complete,
+                       artifact_available=artifact_available, constraints_complete=constraints_complete,
                        artifact_directory=str(output), parameterization=parameterization,
                        geometry={"entities": result["entities"], "bounds": result["bounds"],
                                  "coordinate_system": result["coordinate_system"]},
-                       completion_class="screenshot_guided_source_topology_revision",
-                       issues=[] if selected_id != parent_plan.get("selected_candidate_id") else
-                              ["在线检查保留了当前候选；已重新导出并验证，但轮廓对象没有变化。"])
+                       completion_class=result["completion_class"],
+                       issues=["已保留截图修正后的拓扑草稿；尚未重新完成标注绑定与严格约束求解，不能视为完成重建。"])
+            if selected_id == parent_plan.get("selected_candidate_id"):
+                job["issues"].append("在线检查保留了当前候选；已重新导出并验证，但轮廓对象没有变化。")
             self._publish_automatic_artifacts(job, output)
-            self._event(job, "feedback_export", f"截图修正已导出 {len(result['entities'])} 个 LINE/ARC 图元并完成 DXF 回读。")
+            self._event(job, "feedback_export", f"截图修正拓扑草稿已导出 {len(result['entities'])} 个 LINE/ARC 图元并完成 DXF 回读；标注约束尚未完成认证。")
             self._persist_if_active(job)
         except InterruptedError:
             return
@@ -689,7 +917,6 @@ class AgentService:
         job=self.store.get(job_id)
         if job.get("status") == "cancelled":
             return
-        providers=self._provider_bundle(job)
         image_path,ocr_path=Path(job["source_image"]),Path(job["source_ocr"])
         output=self.settings.runtime_root/"jobs"/job_id/"automatic-001"
         def progress(stage,message):
@@ -719,6 +946,11 @@ class AgentService:
             else:
                 kwargs = {"segmentation_checkpoint": self.settings.segmentation_checkpoint} if job.get("use_segmentation") else {}
             result=build_automatic(image_path,document,output,progress=progress,**kwargs)
+            # The initial draft used original OCR. A later reread must never
+            # silently relabel this geometry as having consumed new attributes.
+            result["source_input_identity"]=source_input_identity(image_path,document)
+            from .parametric_pipeline import _write
+            _write(output/"model.json",result)
             if review.get("status") == "approved" and (output / "reviewed-evidence/segmentation.json").is_file():
                 shutil.copyfile(output / "reviewed-evidence/segmentation.json", output / "segmentation.json")
             job["scale"]=result["scale"]
@@ -739,6 +971,13 @@ class AgentService:
             self._save_dimension_analysis(job,output)
             self._publish_automatic_artifacts(job, output)
             if not self._persist_if_active(job):return
+            # Provider setup must not precede generation of the source draft.
+            providers=self._provider_bundle(job)
+            document,ocr_review=review_source_ocr(image_path,document,result,output,
+                provider=providers.get("source_ocr_review"),use_api=job["use_api"],raw_ocr_path=ocr_path,progress=progress)
+            job["source_ocr_review"]=ocr_review
+            self._publish_automatic_artifacts(job,output)
+            if not self._persist_if_active(job):return
             if job["use_api"]:
                 job["status"]="auditing"
                 job["dimension_analysis"]["provider"]["status"]="pending"
@@ -750,11 +989,11 @@ class AgentService:
                 dimension_receipt=job["dimension_analysis"]["provider"]
                 self._event(job,"dimension_result","在线尺寸解析已完成。" if dimension_receipt.get("status")=="succeeded" else "在线尺寸解析不可用；本地尺寸证据与CAD产物保留。")
                 if not self._persist_if_active(job):return
-            if job.get("use_segmentation"):
+            if job.get("use_segmentation") and not result.get("initialization_recovery"):
                 result,parameterization=refine_parametric(image_path,document,result,output,
                     provider=providers["binding"],planner_provider=providers["planning"],
                     editor_provider=providers["topology_edit"],evaluator_provider=providers["topology_evaluate"],
-                    use_api=job["use_api"],progress=progress)
+                    use_api=job["use_api"],progress=progress,source_first=True)
                 job["parameterization"]=parameterization
                 job["validation"]=result["validation"]
                 job["geometry"]={"entities":result["entities"],"bounds":result["bounds"],"coordinate_system":result["coordinate_system"]}
@@ -763,11 +1002,17 @@ class AgentService:
                 if parameterization.get("accepted"):
                     job["completion_class"]="partial_parametric_draft"
                 elif parameterization.get("constraint_subset_accepted"):
-                    job["completion_class"]="partial_parametric_draft_unresolved_radii"
+                    job["completion_class"]=("partial_parametric_draft_unresolved_attributes" if
+                        parameterization.get("status")=="completed_with_unresolved_attributes" else
+                        "partial_parametric_draft_unresolved_radii")
                 elif parameterization.get("topology_exported"):
                     job["completion_class"]="source_topology_draft"
                 self._publish_automatic_artifacts(job,output)
                 if not self._persist_if_active(job):return
+            elif result.get("initialization_recovery"):
+                job["completion_class"]="source_contour_pixel_draft"
+                job["parameterization"]={"status":"not_run_initialization_recovery","accepted":False,
+                    "reason":"source_contour_checkpoint_only","initialization_recovery":result["initialization_recovery"]}
             if job["use_api"]:
                 job["status"]="auditing"
                 self._event(job,"vision","本地自动轮廓已可下载；在线模型正在检查候选边界与原图是否一致。")
@@ -799,6 +1044,8 @@ class AgentService:
             if (job.get("provider") or {}).get("status") == "pending":
                 job["provider"] = {"status":"skipped", "network_requests":0, "reason":"local_generation_failed"}
             message=str(error)[:300] if isinstance(error,(ValueError,ArithmeticError)) else "自动识别失败，未生成通过检查的轮廓。"
+            if (job.get("dxf_availability") or {}).get("available"):
+                message="后续处理失败；已保留可下载的自动构建 DXF，标注和精度未认定通过。"
             job["issues"]=[message]
             self._event(job,"failed",message)
             self._persist_if_active(job)
@@ -830,7 +1077,8 @@ class AgentService:
                "reviewed_segmentation_overlay":"reviewed-segmentation-overlay.png",
                "segmentation_review":"segmentation-review.json",
                "cad_overlay":"overlay.png","curve_fit":"curve-fit.json","dimension_analysis":"dimension-analysis.json"}
-        names.update(topology="topology.json",topology_overlay="topology-overlay.png",
+        names.update(source_ocr_review="source-ocr-review.json",effective_source_ocr="effective-source-ocr.json",
+                     topology="topology.json",topology_overlay="topology-overlay.png",
                      topology_candidates="topology-candidates.json",topology_plan="topology-plan.json",
                      topology_edit_proposals="topology-edit-proposals.json",
                      topology_iterations="topology-iterations.json",
@@ -839,14 +1087,24 @@ class AgentService:
                      binding_candidates="binding-candidates.json",binding_overlay="binding-topology.png",
                      parametric_solution="parametric-solution.json",parameterization="parametric-stage.json",
                      radius_targets="radius-targets.json",radius_contract="radius-contract.json",
+                     reconstruction_contract="reconstruction-contract.json",
                      workflow_provenance="workflow-provenance.json",
                      baseline_dxf="baseline-drawing.dxf",baseline_svg="baseline-preview.svg",
                      baseline_overlay="baseline-overlay.png",baseline_model="baseline-model.json")
         names.update(feedback_plan="feedback-plan.json", feedback_screenshot="feedback-screenshot.png")
+        names.update(source_draft_dxf="source-draft-drawing.dxf",source_draft_svg="source-draft-preview.svg",
+                     source_draft_model="source-draft-model.json",source_draft_validation="source-draft-validation.json",
+                     draft_availability="draft-availability.json")
         for key,name in names.items():
             if (output/name).is_file():
                 job["artifact_directory"]=str(output)
                 job.setdefault("artifacts",{})[key]=f"/api/jobs/{job['id']}/artifacts/{name}"
+        from .draft_artifacts import dxf_availability
+        path=output/"drawing.dxf"
+        stamp=(path.stat().st_mtime_ns,path.stat().st_size) if path.is_file() else None
+        if job.get("_dxf_availability_stamp")!=stamp or "dxf_availability" not in job:
+            job["dxf_availability"]=dxf_availability(output)
+            job["_dxf_availability_stamp"]=stamp
 
     @staticmethod
     def _save_dimension_analysis(job,output):
@@ -866,6 +1124,16 @@ class AgentService:
         from .automatic import _verify_dxf_readback
         from .parametric_pipeline import CORE
         publication=(job.get("parameterization") or {}).get("publication") or {}
+        reviewed=(directory/"source-ocr-review.json").exists() or (directory/"effective-source-ocr.json").exists()
+        expected_source_identity=None
+        if reviewed:
+            try:
+                source_document=load_effective_ocr(Path(job["source_image"]),Path(job["source_ocr"]),directory)
+                expected_source_identity=source_input_identity(Path(job["source_image"]),source_document)
+                job["source_ocr_review"]=json.loads((directory/"source-ocr-review.json").read_text("utf8"))
+            except (ValueError,OSError,KeyError):
+                job.setdefault("issues",[]).append("重启后原图文字重读证据不一致；已保留产物，不能重新认证。")
+                return False
         def verified(prefix="", expected_hashes=None):
             try:
                 if not all((directory/(prefix+name)).is_file() for name in CORE):return None
@@ -876,8 +1144,20 @@ class AgentService:
                 validation=json.loads((directory/(prefix+"validation.json")).read_text(encoding="utf8"))
                 curve_fit=json.loads((directory/(prefix+"curve-fit.json")).read_text(encoding="utf8"))
                 if not isinstance(model,dict) or not isinstance(validation,dict):return None
+                if reviewed:
+                    if model.get("source_input_identity")!=expected_source_identity:
+                        return None
+                elif "source_input_identity" in model:
+                    _load_published_source_ocr(Path(job["source_image"]),Path(job["source_ocr"]),directory,model)
                 incomplete_material = model.get("complete_material_exterior") is False and validation.get("complete_material_exterior") is False
-                if model.get("validation")!=validation or not validation.get("passed") or (not model.get("automatic_completion") and not incomplete_material):
+                topology_stage = model.get("parameterization") or {}
+                topology_draft = bool(
+                    model.get("algorithm_version") == "source-topology-draft-v1" and
+                    model.get("artifact_available") is True and model.get("constraints_complete") is False and
+                    topology_stage.get("topology_exported") is True and topology_stage.get("accepted") is False and
+                    topology_stage.get("constraint_subset_accepted") is False and
+                    (validation.get("source_topology_validation") or {}).get("passed") is True)
+                if model.get("validation")!=validation or not validation.get("passed") or (not model.get("automatic_completion") and not incomplete_material and not topology_draft):
                     return None
                 if model.get("curve_fit")!=curve_fit:return None
                 units=(model.get("coordinate_system") or {}).get("units")
@@ -916,29 +1196,80 @@ class AgentService:
             model,validation=saved
             job.update(validation=validation,automatic_completion=bool(model.get("automatic_completion")),scale=model["scale"],curve_fit=model.get("curve_fit"),
                        geometry={"entities":model["entities"],"bounds":model["bounds"],"coordinate_system":model["coordinate_system"]})
-            if model.get("parameterization",{}).get("accepted"):
-                # model.json snapshots the export. A later durable stage or
-                # binding receipt must not be replaced by older model metadata.
-                verified_stage={**model["parameterization"],**(job.get("parameterization") or {}),
-                                "accepted":True,"status":"completed",
-                                "geometry_updated_by_api":model["parameterization"].get("geometry_updated_by_api",False),
-                                "dimensions_updated_by_api":model["parameterization"].get("dimensions_updated_by_api",False)}
+            saved_stage=model.get("parameterization") or {}
+            # The latest attempt may describe an entirely different rejected
+            # candidate. Retain its receipts as diagnostics, never overlay its
+            # constraints, solver state or coverage onto the published CORE.
+            attempted_stage=deepcopy(job.get("parameterization") or {})
+            attempt_diagnostics=attempted_stage.pop("attempt_diagnostics",None)
+            attempted_stage.pop("recovery_certificate",None)
+            if attempt_diagnostics is None and attempted_stage and attempted_stage!=saved_stage:
+                attempt_diagnostics={"source":"latest_attempt_sidecar","applies_to_current_core":False,
+                                     "parameterization":attempted_stage}
+            if saved_stage.get("accepted") or saved_stage.get("constraint_subset_accepted"):
+                # Keep durable transport receipts, but certify only the CURRENT
+                # CORE's obligations against its actual native DXF. Neither old
+                # accepted=True nor a newer failed candidate's sidecar can pass.
+                try:
+                    certificate=_recover_parametric_certificate(model,ezdxf.readfile(directory/"drawing.dxf"))
+                except (ValueError,KeyError,TypeError,AttributeError,OverflowError,ezdxf.DXFError):
+                    certificate={"source":"current_published_core","complete":False,
+                                 "constraint_subset_verified":False,"annotated_radii_verified":False,
+                                 "reasons":["invalid_current_publication_certificate"],
+                                 "legacy_export_automatically_certified":False}
+                accepted=bool(saved_stage.get("accepted") is True and certificate["complete"])
+                subset=certificate["constraint_subset_verified"]
+                unresolved_status=("completed_with_unresolved_attributes" if
+                    certificate["annotated_radii_verified"] else "completed_with_unresolved_radii")
+                verified_stage={**deepcopy(saved_stage),
+                    "accepted":accepted,"constraint_subset_accepted":subset,
+                    "status":"completed" if accepted else unresolved_status,
+                    "annotation_radius_contract":certificate.get("annotation_radius_contract",{}),
+                    "reconstruction_contract":certificate.get("reconstruction_contract",{}),
+                    "solver_constraint_checks":certificate.get("solver_constraint_checks",[]),
+                    "solver":certificate.get("solver",{**deepcopy(saved_stage.get("solver") or {}),"accepted":False}),
+                    "recovery_certificate":certificate,
+                    "geometry_updated_by_api":bool(subset and saved_stage.get("geometry_updated_by_api")),
+                    "dimensions_updated_by_api":bool(subset and saved_stage.get("dimensions_updated_by_api"))}
                 if publication:
-                    verified_stage["publication"]={**publication,"status":"committed","recovered":True}
+                    recovered_publication=deepcopy((job.get("parameterization") or {}).get("publication") or publication)
+                    recovered_publication.update(recovered=True)
+                    if recovered_publication.get("status")!="rolled_back":
+                        recovered_publication["status"]="committed"
+                    verified_stage["publication"]=recovered_publication
+                if attempt_diagnostics:verified_stage["attempt_diagnostics"]=attempt_diagnostics
                 job["parameterization"]=verified_stage
-                job["completion_class"]="partial_parametric_draft"
-            elif model.get("parameterization",{}).get("constraint_subset_accepted"):
-                job["parameterization"]={**model["parameterization"],**(job.get("parameterization") or {}),
-                                         "accepted":False,"constraint_subset_accepted":True,
-                                         "status":"completed_with_unresolved_radii"}
-                job["completion_class"]="partial_parametric_draft_unresolved_radii"
-                job["status"]="needs_review"
+                # Keep the persisted CORE read-only; the recovered job exposes
+                # current measurements instead of its old validation flags.
+                for field in ("strict_relation_validation","exact_radius_validation",
+                              "numerical_constraint_validation","annotation_radius_contract","reconstruction_contract"):
+                    job["validation"][field]=certificate.get(field,{"passed":False,"satisfied":False})
+                job["validation"]["all_annotated_radii_verified"]=certificate["annotated_radii_verified"]
+                job["completion_class"]=("partial_parametric_draft" if accepted else
+                    "partial_parametric_draft_unresolved_attributes" if
+                    unresolved_status=="completed_with_unresolved_attributes" else "partial_parametric_draft_unresolved_radii")
+                if not accepted:
+                    job["status"]="needs_review"
+                    job.setdefault("issues",[]).append("已保留当前CAD产物；当前原生DXF、严格关系或完整约束证书尚未全部通过，旧完成标志不作为重新认证依据。")
             elif model.get("parameterization",{}).get("topology_exported"):
-                recovered_stage=job.get("parameterization") or model["parameterization"]
+                recovered_stage=deepcopy(saved_stage)
                 recovered_stage.update(accepted=False,topology_exported=True,
                                        geometry_updated_by_api=False,dimensions_updated_by_api=False)
+                if attempt_diagnostics:recovered_stage["attempt_diagnostics"]=attempt_diagnostics
+                if publication:
+                    recovered_stage["publication"]=deepcopy((job.get("parameterization") or {}).get("publication") or publication)
                 job["parameterization"]=recovered_stage
                 job["completion_class"]="source_topology_draft"
+                if "artifact_available" in model:
+                    job.update(artifact_available=True, constraints_complete=False, automatic_completion=False)
+            elif attempted_stage:
+                recovered_stage={**deepcopy(saved_stage),"accepted":False,"constraint_subset_accepted":False,
+                                 "status":"current_core_not_parameterized","geometry_updated_by_api":False,
+                                 "dimensions_updated_by_api":False}
+                if attempt_diagnostics:recovered_stage["attempt_diagnostics"]=attempt_diagnostics
+                if publication:
+                    recovered_stage["publication"]=deepcopy((job.get("parameterization") or {}).get("publication") or publication)
+                job["parameterization"]=recovered_stage
             job["extraction"]={k:v for k,v in model.get("extraction",{}).items() if k not in {"polyline_px","raw_polyline_px","candidates"}}
             if model.get("complete_material_exterior") is False:
                 job["completion_class"]="incomplete_material_exterior_draft"

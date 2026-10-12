@@ -208,7 +208,8 @@ def _complete_fillet_support_scope(graph, inventory, operation):
     return [entities[index]["id"] for index in expanded]
 
 
-def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius_record_ids=None):
+def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius_record_ids=None,
+                                 unresolved_angle_record_ids=None):
     """Create bounded source hypotheses; the executor/evaluator still validate.
 
     Reserve room for a directed small fillet and a shallow unlabelled ARC->LINE
@@ -217,7 +218,8 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
     if not isinstance(graph, dict) or not isinstance(inventory, list) or limit <= 0:
         return []
     from .annotation_line_support import propose_annotation_line_edits
-    angle_lines = propose_annotation_line_edits(graph, inventory, limit=1)
+    angle_lines = propose_annotation_line_edits(graph, inventory, limit=1,
+        required_record_ids=unresolved_angle_record_ids)
     entities = {row.get("id"): row for row in graph.get("entities", []) if isinstance(row, dict)}
     records = {row.get("record_id"): row for row in inventory if isinstance(row, dict)
                and row.get("record_id") and row.get("kind") == "radius"}
@@ -299,7 +301,17 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
                       float(_fillet_tangent(arc, "end") @ _fillet_tangent(after, "start"))]
         radius_matches = math.isclose(float(arc.get("radius", 0.)), float(record["nominal"]),
                                       rel_tol=1e-8, abs_tol=1e-8)
-        if radius_matches and min(deviations) >= math.cos(math.radians(1.)):
+        refinement = arc.get("source_refinement") or {}
+        constructed_witness = arc.get("fillet_construction") in {
+            "existing_finite_line_supports", "existing_lines_short_connector_redistribution",
+            "existing_line_arc_line_tangent_reinsertion"} and all(
+                refinement.get(key) is True for key in (
+                    "outer_endpoints_fixed", "support_directions_fixed", "support_types_fixed",
+                    "radius_exact", "source_path_and_arrow_verified"))
+        # A small fitted tangent error is not a design certificate. Reconstruct
+        # the exact local fillet when the source-bound ARC lacks its witness.
+        if (radius_matches and constructed_witness and
+                min(deviations) >= math.cos(math.radians(1e-5))):
             return
         operation = {"action": "insert_annotated_fillet",
                      "entity_ids": [before["id"], entity_id, after["id"]],
@@ -377,7 +389,7 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
         straight.append((source_chord / max(sagitta_px, .1), {
             "action": "refit_entity_as_line", "entity_ids": [entity["id"]], "record_id": None,
             "evidence_tags": ["source_boundary", "collinear_support"]}))
-    reserved = [row[1] for row in sorted(fillets, key=lambda row: row[0], reverse=True)[:1]]
+    reserved = [row[1] for row in sorted(fillets, key=lambda row: row[0], reverse=True)[:2]]
     reserved.extend(row[1] for row in sorted(straight, key=lambda row: row[0], reverse=True)[:1])
     # A verified radius can land on a primitive containing two true source
     # arcs. Reserve a partition hypothesis before repeatedly forcing either
@@ -387,16 +399,26 @@ def propose_annotation_arc_edits(graph, inventory, *, limit=4, unresolved_radius
     verified=sorted([row for row in supports if row.get("arrowhead_verified") is True],
                     key=lambda row:positions[row["candidate_entity_id"]])
     partitions=[]
-    for first,second in zip(verified,verified[1:]):
+    # The contour is a cycle. Its arbitrary serialization seam must not hide
+    # a two-radius transition between the last and first primitive.
+    pairs = list(zip(verified, verified[1:]))
+    if len(verified) > 1:
+        pairs.append((verified[-1], verified[0]))
+    seen_partitions = set()
+    for first,second in pairs:
         lo,hi=positions[first["candidate_entity_id"]],positions[second["candidate_entity_id"]]
-        if (hi-lo>2 or first["record_id"]==second["record_id"] or
+        distance = (hi-lo) % len(ordered_entities)
+        if (distance>2 or first["record_id"]==second["record_id"] or
                 records[first["record_id"]].get("nominal")==records[second["record_id"]].get("nominal")):
             continue
         # Start with the smallest named span containing both observed targets;
         # adding unlabelled neighbors can introduce a straight tail or another
         # fillet outside this exact-radius partition's declared scope.
-        indices=range(lo,hi+1)
+        indices=[(lo+offset) % len(ordered_entities) for offset in range(distance+1)]
         ids=[ordered_entities[index]["id"] for index in indices]
+        if tuple(ids) in seen_partitions:
+            continue
+        seen_partitions.add(tuple(ids))
         included={row["record_id"] for row in verified if row["candidate_entity_id"] in ids}
         if 2<=len(included)<=3 and 1<=len(ids)<=8:
             # A target on an *outer* endpoint needs the neighbor on its other
@@ -644,6 +666,14 @@ def _radius_edit_evidence(graph, operation, inventory, entity_ids, design_to_sou
         target = (record.get("leader") or {}).get("target_source_px")
     if target is not None:
         binding["target_source_px"] = copy.deepcopy(target)
+    leader=matched.get('source_evidence') or record.get('leader') or {}
+    arrow=leader.get('arrowhead') or {}
+    if arrow.get('verified') is True and leader.get('arrowhead_verified') is True:
+        # A missing fillet can project a real arrow onto the old sharp mask
+        # corner. Keep the observed tip separate from that boundary footpoint.
+        tip=np.asarray(arrow.get('tip_px'),float)
+        if tip.shape==(2,) and np.isfinite(tip).all():
+            binding['verified_arrow_tip_source_px']=tip.tolist()
     return True, radius_px, binding
 
 
@@ -1183,13 +1213,13 @@ def _annotated_line_fillet(points, radius, tolerance, binding):
 
 def _replacement_chain(support, action, tolerance, selected_entities, *, force_arc=False,
                        annotated_radius_px=None, radius_binding=None, radius_targets=None, candidate_scorer=None,
-                       angle_evidence=None):
+                       angle_evidence=None, source_line_validator=None, source_fillet_validator=None):
     if action == "restore_annotated_line_support":
         from .annotation_line_support import restore_annotated_joint_line_support, restore_annotated_line_support
         if len(selected_entities) == 2:
             replacements = restore_annotated_joint_line_support(
                 support, angle_evidence, tolerance, radius_targets=radius_targets,
-                fixed_radius_fitter=_fixed_radius_arc)
+                fixed_radius_fitter=_fixed_radius_arc,source_line_validator=source_line_validator)
         else:
             replacements = restore_annotated_line_support(
                 support, angle_evidence, tolerance, radius_targets=radius_targets,
@@ -1204,11 +1234,32 @@ def _replacement_chain(support, action, tolerance, selected_entities, *, force_a
                 entity["source_partition_evidence"]={key:value for key,value in partition.items() if key!="entities"}
         else:
             replacements = _split_source_chain(support, tolerance)
+        if ([row.get("type") for row in replacements] ==
+                [row.get("type") for row in selected_entities] and
+                not any(row.get("source_partition_evidence") for row in replacements)):
+            # Re-fitting the same ordered primitive types is not a split. It
+            # cannot repair an absent object or an annotation/type conflict,
+            # even if raster snapping moves a joint slightly. Sending this
+            # trial through binding/solving can consume the entire bounded
+            # search before a real fillet or LINE restoration is considered.
+            # An explicitly verified multi-radius partition remains eligible:
+            # it changes ownership/attributes even when its ARC count agrees.
+            raise ValueError("source_split_did_not_change_topology")
     elif action == "insert_annotated_fillet":
         if len(selected_entities) in (2, 3) and (all(e.get("type") == "LINE" for e in selected_entities)
                 or [e.get("type") for e in selected_entities] == ["LINE", "ARC", "LINE"]):
-            replacements = _annotated_existing_line_fillet(
-                support, annotated_radius_px, tolerance, radius_binding, selected_entities)
+            try:
+                replacements = _annotated_existing_line_fillet(
+                    support, annotated_radius_px, tolerance, radius_binding, selected_entities)
+            except ValueError as error:
+                if (str(error) != 'source_does_not_support_exact_annotated_fillet'
+                        or (len(selected_entities) != 2 and
+                            [e.get('type') for e in selected_entities]!=['LINE','ARC','LINE'])
+                        or source_fillet_validator is None):
+                    raise
+                from .source_fillet_seed import two_line_fillet_seed
+                replacements=two_line_fillet_seed(selected_entities,annotated_radius_px,tolerance,
+                    radius_binding,source_fillet_validator)
         else:
             replacements = _annotated_line_fillet(support, annotated_radius_px, tolerance, radius_binding)
     else:
@@ -1271,7 +1322,8 @@ def _verified_partition_targets(graph, inventory, entity_ids, design_to_source, 
     return targets
 
 
-def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
+def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None, source_line_validator=None,
+               source_fillet_validator=None):
     action = operation.get("action")
     if action not in EDIT_ACTIONS:
         raise ValueError("unsupported_topology_edit_action")
@@ -1315,7 +1367,8 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
     replacements = _replacement_chain(support, action, tolerance, selected_entities, force_arc=force_arc,
                                       annotated_radius_px=annotated_radius_px, radius_binding=radius_binding,
                                       radius_targets=radius_targets,candidate_scorer=candidate_scorer,
-                                      angle_evidence=angle_evidence)
+                                      angle_evidence=angle_evidence,source_line_validator=source_line_validator,
+                                      source_fillet_validator=source_fillet_validator)
     from .annotation_line_support import protect_annotated_straight_supports
     protect_annotated_straight_supports(graph, entity_ids, selected_entities, replacements, tolerance)
 
@@ -1334,7 +1387,9 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
     base_upper = base_quality["source_boundary_deviation_px"]["conservative_upper_bound_px"]
     if not quality["sampled_topology_valid"]:
         raise ValueError("edited_topology_invalid")
-    if candidate_upper > max(tolerance, base_upper + grid):
+    from .reconstruction_priority import mask_is_hard
+    mask_budget_passed=candidate_upper <= max(tolerance, base_upper + grid)
+    if not mask_budget_passed and mask_is_hard(baseline):
         raise ValueError("edited_boundary_deviation_exceeds_budget")
     return updated, quality, {
         "action": action, "entity_ids": list(entity_ids),
@@ -1364,11 +1419,14 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None):
         "source_path_localization_mismatch": float(localization_mismatch),
         "base_source_deviation_upper_px": float(base_upper),
         "edited_source_deviation_upper_px": float(candidate_upper),
+        "mask_budget_passed":bool(mask_budget_passed),
+        "mask_budget_used_as_acceptance_gate":mask_is_hard(baseline),
         "ground_truth_used": False,
     }
 
 
-def _apply_combined(graph, baseline, operations, inventory, *, candidate_scorer=None):
+def _apply_combined(graph, baseline, operations, inventory, *, candidate_scorer=None, source_line_validator=None,
+                    source_fillet_validator=None):
     """Apply non-overlapping, non-wrapping edits against the same source cycle."""
     if len(operations) < 2:
         raise ValueError("combined_edit_requires_multiple_operations")
@@ -1396,7 +1454,9 @@ def _apply_combined(graph, baseline, operations, inventory, *, candidate_scorer=
         if occupied.intersection(indices):
             raise ValueError("combined_edit_chains_overlap")
         occupied.update(indices)
-        individual, _, detail = _apply_one(graph, baseline, operation, inventory,candidate_scorer=candidate_scorer)
+        individual, _, detail = _apply_one(graph, baseline, operation, inventory,candidate_scorer=candidate_scorer,
+                                          source_line_validator=source_line_validator,
+                                          source_fillet_validator=source_fillet_validator)
         # _apply_one rotates the named replacement to the beginning of its
         # standalone cycle, and explicitly reports how many pieces it emitted.
         replacements[indices[0]] = (len(indices), individual[:detail["replacement_count"]])
@@ -1423,7 +1483,9 @@ def _apply_combined(graph, baseline, operations, inventory, *, candidate_scorer=
     base_upper = base_quality["source_boundary_deviation_px"]["conservative_upper_bound_px"]
     if not quality["sampled_topology_valid"]:
         raise ValueError("edited_topology_invalid")
-    if candidate_upper > max(tolerance, base_upper + grid):
+    from .reconstruction_priority import mask_is_hard
+    mask_budget_passed=candidate_upper <= max(tolerance, base_upper + grid)
+    if not mask_budget_passed and mask_is_hard(baseline):
         raise ValueError("edited_boundary_deviation_exceeds_budget")
     return updated, quality, {
         "action": "apply_nonoverlapping_edits",
@@ -1438,8 +1500,44 @@ def _apply_combined(graph, baseline, operations, inventory, *, candidate_scorer=
         "feature_restoration_validated": any(row["feature_restoration_validated"] for row in details),
         "base_source_deviation_upper_px": float(base_upper),
         "edited_source_deviation_upper_px": float(candidate_upper),
+        "mask_budget_passed":bool(mask_budget_passed),
+        "mask_budget_used_as_acceptance_gate":mask_is_hard(baseline),
         "ground_truth_used": False,
     }
+
+
+def _fresh_edit_source_graph(graph, source_entities, inventory, grid):
+    """Reattach freshly checked source leaders to an immutable edit-parent copy.
+
+    The resulting ownership is a local construction hypothesis. It does not
+    replace the parent's certified graph or the independent binding/solve
+    receipts that a constructed child must obtain before publication.
+    """
+    support, summary = _entity_annotation_support(source_entities, inventory, grid)
+    entities = graph.get("entities") or []
+    # Source support uses positional display IDs; edit callers may have their
+    # own IDs. Reattach by the unchanged ordered source geometry, not by a
+    # nominal-radius guess or a provider-supplied target.
+    ids = {f"g{index:03d}": row["id"] for index, row in enumerate(entities)}
+    for row in support:
+        if row.get("candidate_entity_id") in ids:
+            row["candidate_entity_id"] = ids[row["candidate_entity_id"]]
+        for adjacent in row.get("adjacent_target_hypotheses") or []:
+            if adjacent.get("entity_id") in ids:
+                adjacent["entity_id"] = ids[adjacent["entity_id"]]
+    refreshed = {row.get("record_id") for row in inventory}
+    working = copy.deepcopy(graph)
+    # A fresh negative result must replace a stale positive for the same
+    # source record. Records outside a bounded refresh remain visible rather
+    # than being silently removed from the annotation denominator.
+    retained = [copy.deepcopy(row) for row in graph.get("annotation_support") or []
+                if row.get("record_id") not in refreshed]
+    working["annotation_support"] = [*retained, *support]
+    audit = {"status": "rechecked_before_construction", "source_record_count": len(refreshed),
+        "verified_arrow_proposal_count": sum(row.get("arrowhead_verified") is True for row in support),
+        "source_support": summary, "certified_parent_mutated": False,
+        "numeric_binding_certified": False, "ground_truth_used": False}
+    return working, audit
 
 
 def execute_topology_edits(image_path, document, baseline, base_candidate, bundle, operations, output_dir):
@@ -1470,6 +1568,13 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
         gray, records, ring, grid,
         [*(graph.get("annotation_support") or []),
          *(graph.get("radius_source_segment_hypotheses") or [])])
+    working_graph, source_refresh = _fresh_edit_source_graph(
+        graph, _base_source_entities(graph, design_to_source, orientation_det), inventory, grid)
+    refreshed_record_ids = {row.get("record_id") for row in inventory}
+    retained_inventory = [copy.deepcopy(row) for row in bundle.get("annotation_inventory", [])
+                          if row.get("record_id") not in refreshed_record_ids]
+    construction_inventory = [*inventory, *retained_inventory]
+    source_refresh["unrefreshed_source_record_ids"] = [row.get("record_id") for row in retained_inventory]
     stroke = _StrokeEvidence(gray, records, grid)
     candidates, audit, accepted_operations = [], [], []
 
@@ -1477,6 +1582,29 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
         sampled, _, _ = _sample_entities(entities,max_step_px=max(.5,min(2.,grid/2)))
         measured=stroke.summarize(sampled)
         return stroke_support_fraction(measured)
+
+    def source_line_validator(line):
+        measured=stroke.summarize(np.asarray([line["start"],line["end"]],float))
+        tolerance=float(graph.get("proposal_tolerance_px") or grid)
+        # Same local source gate used by the fresh contact certificate. Search
+        # for a feasible offset instead of minimizing mask error and rejecting
+        # that single result after construction.
+        return (stroke_support_fraction(measured)>=.60 and
+                measured["p90_edge_distance_px"]<=max(2*grid,tolerance+grid))
+
+    def source_fillet_validator(arc):
+        sampled,_,_=_sample_entities([arc],max_step_px=max(.25,min(1.,grid/2)))
+        measured=stroke.summarize(sampled)
+        tolerance=float(graph.get('proposal_tolerance_px') or grid)
+        # Same local original-ink admission as source-contact LINE seeds.
+        # The unchanged complete-profile support gate runs in materialize().
+        return {**measured,'passed':bool(stroke_support_fraction(measured)>=.60 and
+                measured['p90_edge_distance_px']<=max(2*grid,tolerance+grid)),
+                'method':'original_image_local_contact_seed_support','ground_truth_used':False,
+                'numeric_binding_certified':False}
+
+    from .reconstruction_priority import mask_is_hard
+    fillet_validator=None if mask_is_hard(baseline) else source_fillet_validator
 
     def materialize(source_entities, quality, execution, candidate_id, strategy_description):
         sampled, _, _ = _sample_entities(source_entities, max_step_px=max(.5, min(2., grid / 2)))
@@ -1525,7 +1653,8 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
                "ground_truth_used": False}
         try:
             source_entities, quality, execution = _apply_one(
-                graph, baseline, operation, bundle.get("annotation_inventory", []),candidate_scorer=candidate_scorer)
+                working_graph, baseline, operation, construction_inventory, candidate_scorer=candidate_scorer,
+                source_line_validator=source_line_validator,source_fillet_validator=fillet_validator)
             suffix = {"merge_chain_as_line": "line", "merge_chain_as_arc": "arc",
                       "merge_chain_best_fit": "best",
                       "refit_chain_as_annotated_arc": "annotated-arc",
@@ -1543,6 +1672,32 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
         except (ValueError, ArithmeticError, KeyError, TypeError) as error:
             row["reason"] = str(error)[:160]
         audit.append(row)
+        # Keep a second initialization only when the source-contact proposal
+        # exceeds the immutable oracle-mask budget. A stronger local hypothesis
+        # must not erase a still-valid simpler initialization. Both alternatives
+        # retain separate evidence and need ordinary binding/solve/publication.
+        contact_search=(row.get("status")=="accepted_as_candidate" and
+            operation.get("action")=="restore_annotated_line_support" and
+            any((e.get("source_contact_construction") or {}).get(
+                "source_line_support_checked_during_search") is True for e in source_entities))
+        original_budget=(baseline.get("curve_fit") or {}).get("total_deviation_budget_px")
+        if (contact_search and baseline.get("oracle_mask_conditioned") is True and
+                type(original_budget) in (int,float) and original_budget>0 and
+                quality["source_boundary_deviation_px"]["conservative_upper_bound_px"]>original_budget):
+            alternate={"operation_index":index,"operation":copy.deepcopy(operation),
+                "variant":"mask_supported_initialization","alternative_to":candidate_id,
+                "status":"rejected","ground_truth_used":False}
+            try:
+                alternative,alternative_quality,detail=_apply_one(working_graph,baseline,
+                    operation,construction_inventory,candidate_scorer=candidate_scorer)
+                alternative_id=f"cand-edit-{index:02d}-annotated-line-mask-seed"
+                counts=materialize(alternative,alternative_quality,detail,alternative_id,
+                    "Separate mask-supported initialization; fresh annotation binding and joint solving remain required.")
+                alternate.update(status="accepted_as_candidate",candidate_id=alternative_id,
+                    execution=detail,entity_counts=counts,publication_approved=False)
+            except (ValueError,ArithmeticError,KeyError,TypeError) as error:
+                alternate["reason"]=str(error)[:160]
+            audit.append(alternate)
     # A failed proposal cannot poison successful independent edits. Preserve
     # the full per-operation audit, then combine a deterministic disjoint subset.
     subset, occupied, excluded = [], set(), []
@@ -1559,8 +1714,9 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
                "excluded_accepted_operation_indices": excluded}, "status": "rejected", "ground_truth_used": False}
         try:
             source_entities, quality, execution = _apply_combined(
-                graph, baseline, [operation for _, operation in subset], bundle.get("annotation_inventory", []),
-                candidate_scorer=candidate_scorer)
+                working_graph, baseline, [operation for _, operation in subset], construction_inventory,
+                candidate_scorer=candidate_scorer,source_line_validator=source_line_validator,
+                source_fillet_validator=fillet_validator)
             candidate_id = "cand-edit-all"
             counts = materialize(
                 source_entities, quality, execution, candidate_id,
@@ -1573,4 +1729,5 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
     return candidates, {"schema_version": "local-topology-edit-execution-v1",
                         "base_candidate_id": base_candidate.get("id"),
                         "proposed": len(operations), "accepted_candidates": len(candidates),
-                        "operations": audit, "ground_truth_used": False}
+                        "operations": audit, "source_inventory_refresh": source_refresh,
+                        "ground_truth_used": False}

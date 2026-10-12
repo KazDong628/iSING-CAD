@@ -25,6 +25,31 @@ def proposal(record_id="r000"):
     return {"record_id": record_id, "tip_px": [130, 110], "shaft_px": [70, 75]}
 
 
+def test_focused_obligation_retry_preserves_full_source_inventory(monkeypatch,tmp_path):
+    source=document(3)
+    calls=[]
+    class Provider:
+        def locate(self,image,doc,*,record_ids=None):
+            calls.append(record_ids)
+            assert len(doc["records"])==3
+            return {"status":"succeeded","schema_success":True,"http_success":True,
+                    "network_requests":1,"proposals":[proposal("r002")],"unknown_record_ids":[]}
+    monkeypatch.setattr("contour_agent.radius_target_provider._local_radius_inventory",lambda *args:
+        {"status":"completed","verified_record_ids":["r002"]})
+    enriched,receipt=locate_radius_targets("source.png",source,{},tmp_path,Provider(),record_ids=["r002"])
+    assert calls==[["r002"]]
+    assert receipt["recognized_radius_record_ids"]==["r000","r001","r002"]
+    assert receipt["focused_retry_record_ids"]==["r002"]
+    assert receipt["unknown_record_ids"]==["r000","r001"]
+    assert len(enriched["records"])==3
+
+
+def test_focused_retry_rejects_unknown_or_duplicate_record_ids(tmp_path):
+    for ids in (["r999"],["r000","r000"]):
+        with pytest.raises(ValueError):
+            locate_radius_targets("source.png",document(),{},tmp_path,object(),record_ids=ids)
+
+
 def test_schema_accepts_source_pixels_and_accounts_for_unknown():
     payload = {"proposals": [proposal()], "unknown_record_ids": ["r001"]}
     result = validate_radius_target_response(json.dumps(payload), {"r000", "r001"}, (300, 200))
