@@ -137,11 +137,13 @@ def test_vertical_second_view_sends_both_pixel_rotations_under_one_record(tmp_pa
     provider=SourceOCRReviewProvider(Settings(api_key="PRIVATE",base_url="https://example.com/v1",api_timeout=5))
     _,audit=review_source_ocr(image,doc,{},tmp_path/"out",provider=provider,use_api=True,raw_ocr_path=raw)
     assert len(captured)==2
-    assert [c["rotation_degrees"] for c in audit["pages"][0]["provider"]["crops"]]==[0]
-    assert [c["rotation_degrees"] for c in audit["pages"][1]["provider"]["crops"]]==[90,-90]
+    for kind in ('tight_target_glyphs','context'):
+        assert [c["rotation_degrees"] for c in audit["pages"][0]["provider"]["crops"] if c['source_view']==kind]==[0]
+        assert [c["rotation_degrees"] for c in audit["pages"][1]["provider"]["crops"] if c['source_view']==kind]==[90,-90]
     urls=[row["image_url"]["url"] for row in captured[1]["messages"][1]["content"] if row["type"]=="image_url"]
     crops=[Image.open(BytesIO(base64.b64decode(url.split(",",1)[1]))) for url in urls]
-    assert len(crops)==2 and all(max(crop.size)<=1024 for crop in crops)
-    assert ImageChops.difference(crops[0].rotate(180),crops[1]).getbbox() is None
-    assert ImageChops.difference(crops[0],crops[1]).getbbox() is not None
+    assert len(crops)==4 and all(max(crop.size)<=1024 for crop in crops)
+    for first,second in ((crops[0],crops[2]),(crops[1],crops[3])):
+        assert ImageChops.difference(first.rotate(180),second).getbbox() is None
+        assert ImageChops.difference(first,second).getbbox() is not None
     assert "66.85" not in str(captured)

@@ -96,3 +96,45 @@ The new theoretical-corner measurement anchors and short dimension evidence do
 not solve interior inspection stations, symbolic widths, curve extrema or
 rotation-axis diameter constraints. Full reconstruction coverage is evaluated
 separately; unresolved source scope and geometric relations remain explicit.
+
+## 186 source-input and retry repair (2026-10-13)
+
+A fresh 186 oracle-mask experiment exposed a runtime failure before topology
+planning: radius coverage intentionally retained malformed radius-like text,
+but the retry caller passed those IDs into a numeric-radius-only interface.
+The caller now selects only current positive parsed radii, deduplicates IDs,
+and records every text-review obligation separately. The coverage denominator
+and the strict provider input validator remain unchanged. Malformed labels
+cannot abort unrelated topology search and solving or become arrow exemptions.
+
+Source OCR reread now prioritizes geometric semantic risks before ordinary
+lengths and miscellaneous digit-bearing unknowns, within the existing request
+and record budgets. Each orientation supplies target glyphs plus wider source
+context; neither original OCR values nor CAD attributes enter those requests.
+Thin OCR strips expand only along their short axis using source-box geometry,
+and target crops are enlarged without drawn markers. The prompt contains no
+concrete inclination value. Opposite rotations and context views remain
+separate audited pixel observations; agreement does not prove correctness.
+
+`annotation_semantics.py` records inclination ratios, mixed radius/surface
+glyphs, malformed dimensions, hole patterns and manufacturing-state notes.
+Ratios preserve their literal numerator and denominator without guessing an
+axis, taper convention, direction, or CAD angle. Unresolved profile semantics
+block a complete reconstruction claim; hole/process notes remain visible as
+separate feature families. This classification does not waive a source radius,
+declare that a feature is outside a user-requested design, or solve its geometry.
+
+The independent 186 GT metadata specifies a simplified main-profile target
+that omits the right tread detail and hole pattern. Prediction does not read
+that metadata as coordinates or as permission to discard original annotations.
+Oracle-GT agreement and full source-feature coverage must be reported separately.
+
+The source-first solver observation now requests feasibility-first initialization
+for fresh topology as well as carried seeds. This reuses the bounded projection
+of all current equalities/inequalities, original bounds, native certificates
+and final source gate before expensive ink optimization. It never certifies an
+unchanged infeasible iterate or changes a known radius/angle. The 186 local
+solver-stage regression reached a native-verified source-feasible subset in
+30 seconds on the same 16 geometric equations whose old fresh preflight had
+exhausted 120 seconds. This is an offline numerical regression, not an extra
+online/end-to-end run, complete annotation coverage, or a global-optimum proof.

@@ -137,3 +137,22 @@ def test_rejected_solve_cannot_certify_returned_baseline_from_candidate_receipts
         assert result["satisfied_source_verified_joints"] == 0
         assert result["satisfied_design_constructed_joints"] == 0
         assert result["cohort"] == "bound_arrow_verified_radius_arcs"
+
+
+def test_online_design_review_is_distinct_from_pixel_derivative_and_needs_solved_equation():
+    graph, bindings, solution = _example()
+    for row in bindings['bindings']:
+        row.update(source='source_design_review', evidence={
+            'verified':True,'evidence_class':'source_design_review',
+            'independent_source_tangent_measurement':False})
+    for row in bindings['constraints'][1:]:
+        row.update(evidence_class='source_design_review')
+    result=_fillet_tangent_contract(graph,bindings,solution)
+    assert result['source_verified_joints']==0
+    assert result['design_reviewed_joints']==2
+    assert result['satisfied_design_reviewed_joints']==2
+    assert result['all_line_arc_joints_certified']
+    solution['constraints'][1]['passed']=False
+    result=_fillet_tangent_contract(graph,bindings,solution)
+    assert result['satisfied_design_reviewed_joints']==1
+    assert not result['all_line_arc_joints_certified']

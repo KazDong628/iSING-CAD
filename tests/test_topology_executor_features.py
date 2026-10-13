@@ -134,6 +134,25 @@ def test_source_split_finds_multiple_primitives_without_model_coordinates():
         _split_source_chain(np.array([[0., 0.], [20., 0.], [40., 0.]]), .5)
 
 
+def test_source_split_can_expose_curvature_change_even_when_one_arc_fits_tolerance():
+    from contour_agent.vectorize import _arc
+    a=np.linspace(np.deg2rad(-120),np.deg2rad(-90),200)
+    b=np.linspace(np.deg2rad(-90),np.deg2rad(-45),61)
+    source=np.vstack([np.array([0,100])+100*np.c_[np.cos(a),np.sin(a)],
+        (np.array([0,20])+20*np.c_[np.cos(b),np.sin(b)])[1:]])
+    assert _arc(source,3.) is not None
+    pieces=_split_source_chain(source,3.)
+    assert [p['type'] for p in pieces]==['ARC','ARC']
+    assert pieces[0]['end']==pieces[1]['start']
+    evidence=pieces[0]['source_feature_split_evidence']
+    assert evidence['arclength_weighted_squared_max_residual_ratio']<=.25
+    assert not evidence['publication_approved'] and not evidence['ground_truth_used']
+    # A genuinely single circular arc must not gain manufactured objects.
+    single=np.array([0,100])+100*np.c_[np.cos(a),np.sin(a)]
+    with pytest.raises(ValueError,match='no_source_feature_requires_split'):
+        _split_source_chain(single,3.)
+
+
 def test_stable_lineage_survives_display_id_rotation_and_failed_sibling_edit(tmp_path):
     path, graph, baseline, candidate, bundle = _fixture(tmp_path, split_top=True)
     transform, _, determinant = _affines(graph, baseline)

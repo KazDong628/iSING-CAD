@@ -494,16 +494,20 @@ def test_api_geometry_and_dimension_update_flags_require_accepted_published_choi
     assert saved["parameterization"]["dimensions_updated_by_api"] is expected_dimensions
 
 
-def test_fresh_radius_evidence_reaches_topology_search_before_numerical_binding(tmp_path,monkeypatch):
+@pytest.mark.parametrize('radius_text,needs_retry',[('R40',True),('R',False)])
+def test_fresh_radius_evidence_reaches_topology_search_before_numerical_binding(tmp_path,monkeypatch,radius_text,needs_retry):
     from types import SimpleNamespace
+    # Load the real subclass before replacing its base class constructor;
+    # otherwise this isolated test depends on another test's import order.
+    import contour_agent.angle_target_provider
     import contour_agent.parametric_pipeline as pipeline
     image,baseline,output=prepared(tmp_path)
     graph=supported_graph(image,baseline)
     events=[]
-    document={"records":[]}
+    document={"records":[{"text":radius_text}]}
     monkeypatch.setattr("contour_agent.topology.build_topology",lambda *a,**k:graph)
     def inventory(*args,**kwargs):
-        return {"all_candidates":[],"radius_binding_coverage":{"unresolved":[{"record_id":"radius-new"}]}}
+        return {"all_candidates":[],"radius_binding_coverage":{"unresolved":[{"record_id":"r000"}]}}
     monkeypatch.setattr("contour_agent.constraint_binding.build_binding_candidates",inventory)
     monkeypatch.setattr("contour_agent.radius_target_provider.RadiusTargetProvider",lambda s:object())
     def localize(image,doc,*args,record_ids=None,**kwargs):
@@ -513,7 +517,7 @@ def test_fresh_radius_evidence_reaches_topology_search_before_numerical_binding(
         return result,{"proposals":[],"network_requests":1}
     monkeypatch.setattr("contour_agent.radius_target_provider.locate_radius_targets",localize)
     def plan(image,doc,*args,**kwargs):
-        assert doc.get("new_source_evidence") is True
+        assert bool(doc.get("new_source_evidence")) is needs_retry
         events.append("topology-search")
         return graph,{"selected_candidate_id":"source","selection_source":"source",
             "local_evaluation":{},"selected_preflight_artifact":None}
@@ -525,5 +529,8 @@ def test_fresh_radius_evidence_reaches_topology_search_before_numerical_binding(
     monkeypatch.setattr("contour_agent.parametric_solver.solve_parametric",lambda *a,**k:{"accepted":False,"status":"no_constraints"})
     _,stage=pipeline.refine_parametric(image,document,baseline,output,use_api=True,
         editor_provider=SimpleNamespace(settings=object()))
-    assert events==["initial-localization","focused-retry","topology-search","numerical-binding"]
+    assert events==["initial-localization",*(["focused-retry"] if needs_retry else []),"topology-search","numerical-binding"]
+    if not needs_retry:
+        assert stage['radius_obligation_retry_selection']['text_review_required']==[
+            {'record_id':'r000','reason':'source_radius_text_requires_review'}]
     assert stage["topology_exported"]

@@ -914,6 +914,22 @@ class AgentService:
         return self.store.get(job_id)
 
     def _automatic(self, job_id):
+        from .execution_control import execution_scope
+        import time
+        revision=self.store.get(job_id).get('solve_revision',0)
+        last_poll=[-float('inf'),False]
+        def cancelled():
+            if time.monotonic()-last_poll[0] < .1:return last_poll[1]
+            last_poll[0]=time.monotonic()
+            try:
+                current=self.store.get(job_id)
+                last_poll[1]=(current.get('status')=='cancelled' or current.get('solve_revision',0)!=revision)
+            except KeyError:last_poll[1]=True
+            return last_poll[1]
+        with execution_scope(cancelled=cancelled):
+            return self._automatic_work(job_id)
+
+    def _automatic_work(self, job_id):
         job=self.store.get(job_id)
         if job.get("status") == "cancelled":
             return
@@ -975,6 +991,10 @@ class AgentService:
             providers=self._provider_bundle(job)
             document,ocr_review=review_source_ocr(image_path,document,result,output,
                 provider=providers.get("source_ocr_review"),use_api=job["use_api"],raw_ocr_path=ocr_path,progress=progress)
+            from .source_ocr_retry import retry_withheld_source_ocr
+            document,ocr_retry=retry_withheld_source_ocr(image_path,document,output,
+                provider=providers.get('source_ocr_review'),use_api=job['use_api'],progress=progress)
+            ocr_review['isolated_withheld_retry']=ocr_retry
             job["source_ocr_review"]=ocr_review
             self._publish_automatic_artifacts(job,output)
             if not self._persist_if_active(job):return

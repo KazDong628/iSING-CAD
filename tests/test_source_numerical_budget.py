@@ -128,6 +128,41 @@ def test_new_fixed_measurement_restores_feasibility_before_source_objective():
     assert not proof['publication_approved'] and not proof['thresholds_changed']
 
 
+def test_fresh_topology_can_certify_known_equations_before_expensive_objective(monkeypatch):
+    from contour_agent import parametric_solver as module
+    graph,constraints,observation=source_first_inputs()
+    original=deepcopy((graph,constraints,observation))
+    observation['feasibility_first_initialization']=True
+    def interrupted(*args,**kwargs):
+        raise module._NumericalBudgetExhausted('bounded image optimization ended')
+    monkeypatch.setattr(module,'minimize',interrupted)
+    result=solve_parametric(graph,constraints,source_observation=observation)
+    assert result['accepted'] and result['strict_measurement_contract']['satisfied']
+    assert result['constraints'][0]['actual']==pytest.approx(10.5,abs=1e-7)
+    proof=result['diagnostics']['same_problem_feasibility_projection']
+    assert proof['initialization_source']=='fresh_topology' and proof['feasible_checkpoint_found']
+    assert proof['all_known_equations_preserved'] and not proof['thresholds_changed']
+    assert not result['diagnostics']['optimality_proven']
+    assert (graph,constraints)==original[:2]
+
+
+def test_fresh_projection_flag_does_not_certify_an_unchanged_infeasible_point(monkeypatch):
+    from contour_agent import parametric_solver as module
+    from types import SimpleNamespace
+    graph,constraints,observation=source_first_inputs()
+    observation['feasibility_first_initialization']=True
+    def no_projection(fun,starting,**kwargs):
+        fun(starting)
+        return SimpleNamespace(x=starting,success=True)
+    def interrupted(*args,**kwargs):raise module._NumericalBudgetExhausted('bounded end')
+    monkeypatch.setattr(module,'least_squares',no_projection)
+    monkeypatch.setattr(module,'minimize',interrupted)
+    result=solve_parametric(graph,constraints,source_observation=observation)
+    assert not result['accepted']
+    assert result['entities']==graph['entities']
+    assert result['diagnostics']['infeasibility_proven'] is False
+
+
 def test_valid_search_iterate_survives_later_invalid_iterate_and_interruption(monkeypatch):
     from contour_agent import parametric_solver as module
     graph, constraints, observation = source_first_inputs()

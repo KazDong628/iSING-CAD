@@ -1,0 +1,19 @@
+{
+  "authority": "explicit_user_request",
+  "mode": "axis_line",
+  "region_id": "044_tread",
+  "source_image_sha256": "e503da5a63a8f67386a8caae341d719623ce0559cb7fc46fc7b5659bf4f5aa98",
+  "entity_ids": [
+    "g000",
+    "g001"
+  ],
+  "deferred_record_ids": [
+    "r007",
+    "r017",
+    "r028"
+  ],
+  "axis": "vertical",
+  "max_endpoint_adjustment_mm": 10.0,
+  "user_request": "044 tread R6/R16/R13 may be omitted for now; use one vertical or horizontal LINE.",
+  "source_annotation_sha256": "b95d7f89270b14ceacb7fb260ede5bc1ea1a69f657f3b849bd7826a9bd6124c3"
+}

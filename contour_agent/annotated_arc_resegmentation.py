@@ -220,6 +220,64 @@ def _refined_partitions(points, rows, tolerance, landmarks, *, objectives=("mini
     return choices
 
 
+def _unlabelled_bridge_partitions(points, rows, tolerance, landmarks):
+    """Keep both annotated R constants around one unknown LINE or ARC.
+
+    A two-label chain need not contain only two objects. This bounded fallback
+    applies when no exact two-ARC explanation passes the unchanged source
+    tolerance. A resolved straight run remains a LINE; only a curved run
+    proposes an ARC. Fitted attributes are INITIAL VALUES, never dimensions.
+    """
+    from .vectorize import _arc,_line
+    if len(rows)!=2:return []
+    cuts=[i for i in landmarks if rows[0]['source_index']+3<=i<=rows[1]['source_index']-3]
+    if len(cuts)>96:cuts=[cuts[i] for i in np.unique(np.linspace(0,len(cuts)-1,96).astype(int))]
+    first=[];last=[]
+    for cut in cuts:
+        left=_fixed_arc(points[:cut+1],rows[0],tolerance)
+        right=_fixed_arc(points[cut:],rows[1],tolerance)
+        if left is not None:first.append((cut,left))
+        if right is not None:last.append((cut,right))
+    # Preserve cuts nearest the unresolved middle interval, rather than
+    # spending the search on numerous indistinguishable short outer prefixes.
+    first=sorted(first,key=lambda row:row[0],reverse=True)[:16]
+    last=sorted(last,key=lambda row:row[0])[:16]
+    proposals=[]
+    for a,left in first:
+        for b,right in last:
+            if b-a<3:continue
+            middle=points[a:b+1]
+            if np.linalg.norm(middle[-1]-middle[0])<max(8.,4*tolerance):continue
+            bridge=_line(middle,max(.5,.5*tolerance))
+            if bridge is None:bridge=_arc(middle,tolerance)
+            if bridge is None:continue
+            # A free bridge may not swallow either verified annotation tip.
+            if not rows[0]['source_index']<a<b<rows[1]['source_index']:continue
+            error=float(bridge['fit_error_px'])
+            bridge.update(parameter_source='unlabelled_source_bridge_initial_guess',dimension_bound=False)
+            proposals.append(dict(entities=[copy.deepcopy(left[2]),bridge,copy.deepcopy(right[2])],
+                schema_version='source-multi-radius-partition-v1',
+                record_ids=[row['record_id'] for row in rows],cut_source_indices=[0,a,b,len(points)-1],
+                source_endpoints_fixed=True,source_points_moved=False,
+                radius_enforcement='annotated_constants_unknown_bridge_free',
+                unlabelled_bridge_type=bridge['type'],
+                unlabelled_bridge_count=1,unknown_attributes_require_joint_solve=True,
+                maximum_bidirectional_error_px=max(left[0],right[0],error),source_tolerance_px=tolerance,
+                ground_truth_used=False,whole_contour_validation_required=True,
+                binding_verification_recheck_required=True))
+    # Dense certification checks the free circle too, not just its vertices.
+    proposals.sort(key=lambda row:row['maximum_bidirectional_error_px'])
+    result=[]
+    for proposal in proposals[:6]:
+        samples=_sample_entities(proposal['entities'],max_step_px=max(.05,min(.5,tolerance/4)))[0]
+        dense=_dense_path(points,max(.05,min(.5,tolerance/4)))
+        distance=max(float(cKDTree(dense).query(samples)[0].max()),
+                     float(cKDTree(samples).query(dense)[0].max()))
+        if distance<=tolerance:
+            proposal['maximum_bidirectional_error_px']=distance;result.append(proposal)
+    return result
+
+
 def _refine_two_arc_joint(points, rows, tolerance, landmarks):
     """Retain the public diagnostic entry point for one shared-joint minimax."""
     if len(rows)!=2:return None
@@ -299,6 +357,8 @@ def resegment_annotated_arcs(points, annotations, tolerance, *, source_entity_co
             "whole_contour_validation_required":True,"binding_verification_recheck_required":True})
     if not proposals or candidate_scorer is not None:
         proposals.extend(_refined_partitions(points,rows,tolerance,landmarks))
+    if not proposals:
+        proposals.extend(_unlabelled_bridge_partitions(points,rows,tolerance,landmarks))
     if not proposals:
         raise ValueError("source_does_not_support_exact_annotated_arc_partition")
     if candidate_scorer is None:

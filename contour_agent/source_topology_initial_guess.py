@@ -142,7 +142,7 @@ def required_constraints_preserved(parent_graph, graph, required, current):
     def remap(value,key=None):
         if isinstance(value,list):return [remap(item,key) for item in value]
         if isinstance(value,dict):return {name:remap(item,name) for name,item in value.items()}
-        if key in {"entity_id","entities"}:return entity_mapping.get(value,"unmapped")
+        if key in {"entity_id","other_entity_id","entities"}:return entity_mapping.get(value,"unmapped")
         if key in {"node_id","nodes"}:return node_mapping.get(value,"unmapped")
         return value
     def trusted_source(row):
@@ -158,12 +158,13 @@ def required_constraints_preserved(parent_graph, graph, required, current):
                 targets=[];break
             targets.append(same_type[0])
         semantic=("kind","record_id","value","reference_axis","angle_mode","source_station_relation",
-                  "required","enforcement","nominal_source","tolerance","source_dimension_semantics")
+                  "required","enforcement","nominal_source","tolerance","source_dimension_semantics","source_tolerance")
         def same_objects(fresh):
             # Typed anchors, not this membership list, define the signed
             # measurement order. Traversal renumbering may reorder the list
             # while preserving both anchors and their direction exactly.
-            if row.get("kind") in {"distance", "distance_x", "distance_y"} and row.get("anchors"):
+            if (row.get("kind") in {"distance", "distance_x", "distance_y"} and row.get("anchors")
+                    or row.get('kind')=='radial_gap'):
                 members=fresh.get("entities") or []
                 return len(members)==len(targets) and set(members)==set(targets)
             return fresh.get("entities")==targets

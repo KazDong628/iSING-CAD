@@ -174,18 +174,33 @@ def source_arrow_label_attachment(gray, record, observation, *, text_points=None
         return result
     unit /= magnitude
     low, high = box.min(axis=0), box.max(axis=0)
-    ray = _label_ray_entry(tip, -unit, low-2., high+2., float(max(gray.shape))*2)
+    attachment_anchor=tip
+    source_path=observation.get('source_leader_path_px')
+    path_length=0.
+    if source_path is not None:
+        from .source_leader_paths import segment_ink
+        try: path=np.asarray(source_path,float)
+        except (TypeError,ValueError):return result
+        if path.shape!=(3,2) or not np.isfinite(path).all():return result
+        length=float(np.linalg.norm(path[1]-path[0]))
+        if length<6.:return result
+        if not all(segment_ink(gray,a,b,max(12.,float(np.linalg.norm(high-low))))['verified']
+                   for a,b in zip(path[:-1],path[1:])):return result
+        attachment_anchor=path[0];unit=(path[1]-path[0])/length
+        path_length=float(np.linalg.norm(np.diff(path,axis=0),axis=1).sum())
+        result['method']='source_glyph_polyline_shaft_adjacency_v1'
+    ray = _label_ray_entry(attachment_anchor, -unit, low-2., high+2., float(max(gray.shape))*2)
     result.update(directed_ray_reaches_text=ray is not None,
                   arrow_tip_inside_text_box=bool(np.all(tip >= low) and np.all(tip <= high)),
-                  label_to_tip_gap_px=ray,
+                  label_to_tip_gap_px=None if ray is None else ray+path_length,
                   full_source_shaft_verified=(observation.get("shaft_evidence") or {}).get("verified") is True)
     points = _source_text_pixels(gray, record) if text_points is None else text_points
     if points is None:
         result["reason"] = "source_text_ink_unavailable"
         return result
     normal = np.array([-unit[1], unit[0]])
-    distances = np.abs((points-tip)@normal)
-    behind = (points-tip)@(-unit)
+    distances = np.abs((points-attachment_anchor)@normal)
+    behind = (points-attachment_anchor)@(-unit)
     scale = max(12., float(min(high-low)))
     cost = float(np.median(distances))/scale
     result.update(checked=True, source_text_sample_count=len(points),
@@ -990,6 +1005,11 @@ def localize_source_arrow_candidates(gray, record, proposal, boundary_points, ba
                 "initial": initial, "maximum_hypotheses": 64, "maximum_expansions": 1,
                 "performed": True, "source_verification_thresholds_changed": False,
                 "nominal_used_to_rank": False, "ground_truth_used": False}
+        from .source_leader_paths import elbow_hypotheses
+        elbow_audit={}
+        bent=elbow_hypotheses(gray,record,proposal,audit=elbow_audit)
+        receipt['single_elbow_search']=elbow_audit
+        hypotheses=[*hypotheses,*bent]
         if cache_key is not None:hypothesis_cache[cache_key]=(deepcopy(hypotheses),deepcopy(receipt))
     else:
         hypotheses,cached_receipt=deepcopy(cached)

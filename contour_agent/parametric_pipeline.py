@@ -381,6 +381,8 @@ def _topology_source_validation(image_path, baseline, graph):
     before=evidence.get("baseline_stroke_support") or {}
     after=evidence.get("proposal_stroke_support") or {}
     reasons=[]
+    if (graph.get('source_line_preservation') or {}).get('passed') is False:
+        reasons.append('source_finite_line_support_lost')
     if graph.get("source_sha256")!=hashlib.sha256(Path(image_path).read_bytes()).hexdigest():reasons.append("source_hash_mismatch")
     if graph.get("ground_truth_used") is not False:reasons.append("source_provenance_not_declared")
     if graph.get("units")!=baseline["coordinate_system"]["units"]:reasons.append("units_mismatch")
@@ -693,7 +695,10 @@ def _source_binding_locks(graph, bindings, solution, feedback):
             continue
         if row.get("kind")=="radius":
             if record_id not in verified_radii:continue
-        elif not _strict_source_nominal(row):
+        elif not (_strict_source_nominal(row) or
+                  (row.get('source_tolerance') or {}).get('policy')=='source_tolerance_interval'
+                  and row.get('required') is True and row.get('nominal_source')=='source_ocr'
+                  and row.get('source') in {'ocr_api_binding','ocr_local_binding'}):
             continue
         targets=[entities.get(entity_id,{}) for entity_id in row.get("entities",[])]
         # Production source graphs carry stable IDs. Legacy/adaptor graphs
@@ -707,6 +712,8 @@ def _source_binding_locks(graph, bindings, solution, feedback):
             "target_stable_ids":stable_ids if complete else [],
             "target_lineage_available":complete,
             "fresh_binding_and_solve_verified":True})
+        if row.get('source_tolerance') is not None:
+            locks[-1]['source_tolerance']=copy.deepcopy(row['source_tolerance'])
     return locks
 
 
@@ -722,7 +729,7 @@ def _source_locked_constraint_regression(before, after):
     current=after.get("source_binding_locks") or []
     ancestry=after.get("entity_ancestry") or {}
     failures=[]
-    semantic_keys=("record_id","kind","value","angle_mode","reference_axis","strict_source_nominal")
+    semantic_keys=("record_id","kind","value","angle_mode","reference_axis","strict_source_nominal","source_tolerance")
     for old in previous:
         semantic=[row for row in current if row.get("fresh_binding_and_solve_verified") is True
                   and all(row.get(key)==old.get(key) for key in semantic_keys)]
@@ -1159,6 +1166,7 @@ def _solver_source_observation(baseline, graph):
         if not mask_is_hard(baseline):
             observation["mask_representation_budget_diagnostic"] = observation.pop("boundary_error_budget")
             observation["mask_role"] = "initial_topology_and_soft_localization"
+            observation['feasibility_first_initialization']=True
             observation["reference_thresholds_changed"] = False
             observation["optimization_budget"]={"max_wall_seconds":120.,"max_objective_evaluations":30000}
     return observation
@@ -2902,6 +2910,9 @@ def _constraint_signature(row):
         identity["anchors"]=row["anchors"]
     if row.get("source_station_relation") is not None:
         identity["source_station_relation"]=row["source_station_relation"]
+    if row.get('source_tolerance') is not None:
+        from .dimension_policy import _validated_tolerance_metadata
+        identity['source_tolerance']=_validated_tolerance_metadata(row['source_tolerance'])
     return _canonical_sha256(identity)
 
 
@@ -2958,6 +2969,14 @@ def _fillet_tangent_contract(graph, bindings, solution):
         and row["evidence"].get("evidence_class") == "source_bound_design_construction"
         and row["evidence"].get("independent_source_tangent_measurement") is False
     }
+    design_reviewed = {
+        row.get("relation_id") for row in bindings.get("bindings", [])
+        if row.get("accepted") is True and row.get("source") == "source_design_review"
+        and isinstance(row.get("evidence"), dict)
+        and row["evidence"].get("verified") is True
+        and row["evidence"].get("evidence_class") == "source_design_review"
+        and row["evidence"].get("independent_source_tangent_measurement") is False
+    }
     solver_accepted = solution.get("accepted") is True
     satisfied = {row.get("id") for row in solution.get("constraints", [])
                  if solver_accepted and row.get("passed") is True}
@@ -2965,16 +2984,18 @@ def _fillet_tangent_contract(graph, bindings, solution):
     tangent_relations = {}
     for row in bound:
         relation = row.get("id", "")[1:]
-        if row.get("kind") != "tangent" or relation not in independently_verified | design_constructed:
+        if row.get("kind") != "tangent" or relation not in independently_verified | design_constructed | design_reviewed:
             continue
         design = relation in design_constructed
         if design and (row.get("evidence_class") != "source_bound_design_construction" or
                        row.get("independent_source_tangent_measurement") is not False):
             continue
+        if relation in design_reviewed and row.get('evidence_class')!='source_design_review':
+            continue
         eids = row.get("entities") or []
         nodes = row.get("nodes") or []
         if len(eids) == 2 and len(set(eids)) == 2 and len(nodes) == 1:
-            tangent_relations[(frozenset(eids), nodes[0])] = (row["id"], design)
+            tangent_relations[(frozenset(eids), nodes[0])] = (row["id"], design, relation in design_reviewed)
     diagnostics = []
     seen = set()
     for radius in bound:
@@ -3003,16 +3024,16 @@ def _fillet_tangent_contract(graph, bindings, solution):
             neighbor = neighbors[0]
             if neighbor.get("type") != "LINE":
                 continue
-            relation_id, design = tangent_relations.get(
-                (frozenset((entity["id"], neighbor["id"])), node), (None, False))
-            prefix = "design_constructed" if design else "source_verified"
+            relation_id, design, reviewed = tangent_relations.get(
+                (frozenset((entity["id"], neighbor["id"])), node), (None, False, False))
+            prefix = "design_reviewed" if reviewed else "design_constructed" if design else "source_verified"
             status = (prefix + "_and_satisfied" if relation_id in satisfied else
                       prefix + "_but_unsatisfied" if relation_id in failed else
                       prefix + "_without_solver_receipt" if relation_id else
                       "source_tangency_unverified")
             joints.append({"node_id": node, "line_entity_id": neighbor["id"],
                            "relation_id": relation_id, "status": status,
-                           "evidence_class": "source_bound_design_construction" if design else
+                           "evidence_class": "source_design_review" if reviewed else "source_bound_design_construction" if design else
                                              "independent_source_tangent_measurement" if relation_id else None})
         diagnostics.append({"record_id": record_id, "arc_entity_id": entity["id"],
                             "status": "review_line_arc_joints", "line_joints": joints})
@@ -3022,6 +3043,8 @@ def _fillet_tangent_contract(graph, bindings, solution):
     passed = statuses.count("source_verified_and_satisfied")
     constructed = sum(value.startswith("design_constructed_") for value in statuses)
     construction_passed = statuses.count("design_constructed_and_satisfied")
+    reviewed = sum(value.startswith("design_reviewed_") for value in statuses)
+    review_passed = statuses.count("design_reviewed_and_satisfied")
     ambiguous = sum(joint.get("status") == "ambiguous_incidence"
                     for item in diagnostics for joint in item["line_joints"])
     return {"schema_version": "source-fillet-tangent-contract-v1", "ground_truth_used": False,
@@ -3031,11 +3054,12 @@ def _fillet_tangent_contract(graph, bindings, solution):
             "source_verified_joints": certified, "satisfied_source_verified_joints": passed,
             "design_constructed_joints": constructed,
             "satisfied_design_constructed_joints": construction_passed,
+            "design_reviewed_joints": reviewed, "satisfied_design_reviewed_joints": review_passed,
             "unverified_joints": statuses.count("source_tangency_unverified"),
             "ambiguous_incidence_joints": ambiguous,
             "all_source_verified_joints_satisfied": certified > 0 and certified == passed,
             "all_design_constructed_joints_satisfied": constructed > 0 and constructed == construction_passed,
-            "all_line_arc_joints_certified": bool(statuses) and not ambiguous and passed + construction_passed == len(statuses),
+            "all_line_arc_joints_certified": bool(statuses) and not ambiguous and passed + construction_passed + review_passed == len(statuses),
             "scope": "Diagnostic coverage only; unknown joints are not accepted tangencies or solver failures.",
             "fillets": diagnostics}
 
@@ -3398,6 +3422,19 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
             stage["post_solve_source_completion"]=receipt
             completion_graph=original_graph
             any_completion_accepted=receipt['accepted']
+            # A failed derivative observation at a fitted vertex must not
+            # starve a source-supported design contact. Review unknown joints
+            # separately, then move their contacts in the SAME enlarged solve.
+            from .source_joint_completion import complete_source_joints
+            from .joint_review_provider import JointReviewProvider
+            joint_settings=getattr(provider,'settings',None) if use_api else None
+            joint_provider=JointReviewProvider(joint_settings) if joint_settings is not None else None
+            checkpoint('source_joint_completion','从原图独立复核圆角与接点关系，固定已知标注并联合求解切点和圆心。')
+            bound,sol,inventory,joints=complete_source_joints(image_path,document,baseline,
+                original_graph,bound,sol,inventory,output/'source-joint-completion',
+                provider=joint_provider,use_api=use_api)
+            stage['post_solve_source_joint_completion']=joints
+            any_completion_accepted=any_completion_accepted or joints['accepted']
             if frozen_topology is None or allow_frozen_topology_repair:
                 from .source_topology_completion import complete_source_topology
                 checkpoint('source_topology_completion','依据未满足标注修复对象类型与局部拓扑；保留既有约束并重新联合求解。')
@@ -3528,10 +3565,13 @@ def refine_parametric(image_path, document, baseline, output_dir, *, provider=No
             initial_inventory=build_binding_candidates(image_path,document,baseline,graph,retry_dir/"before")
             supported={row["record_id"] for row in initial_inventory.get("all_candidates",[])
                 if row.get("kind")=="radius" and row.get("local_reliable") is True}
-            unresolved=[row["record_id"] for row in initial_inventory.get("radius_binding_coverage",{}).get("unresolved",[])
-                if row["record_id"] not in supported]
+            from .radius_target_provider import radius_retry_selection
+            unresolved,retry_selection=radius_retry_selection(document,
+                initial_inventory.get('radius_binding_coverage',{}),supported_record_ids=supported,
+                prior_attempts=(stage.get('radius_target_provider') or {}).get('attempts',()))
+            stage['radius_obligation_retry_selection']=retry_selection
             if unresolved:
-                checkpoint("unresolved_radius_source_retry","重读初始对象图中尚未核实的半径引线，先参与拓扑修正再绑定求解；最多两次请求。")
+                checkpoint("unresolved_radius_source_retry","重读初始对象图中尚未核实且仍有请求预算的半径引线；未知记录继续保留，随后执行拓扑与求解。")
                 document,retry_receipt=locate_radius_targets(image_path,document,baseline,retry_dir,
                     RadiusTargetProvider(editor_provider.settings),progress=checkpoint,record_ids=unresolved[:12])
                 stage["radius_obligation_retry"]={key:value for key,value in retry_receipt.items() if key!="proposals"}

@@ -12,6 +12,8 @@ FIELDS = ("kind", "nominal", "upper_deviation", "lower_deviation")
 
 
 def analyze_dimensions(document, model, *, provider=None, use_api=False):
+    from .annotation_semantics import source_annotation_inventory
+    annotation_inventory=source_annotation_inventory(document)
     records = canonical_records(document)
     scale = model.get("scale") or {}
     bindings = {}
@@ -66,6 +68,7 @@ def analyze_dimensions(document, model, *, provider=None, use_api=False):
     agreed = sum(row["provider_agrees"] is True for row in decisions)
     conflicts = sum(row["provider_agrees"] is False for row in decisions)
     return {"status": "completed", "provider": receipt, "decisions": decisions,
+            "source_annotation_inventory":annotation_inventory,
             "counts": {"ocr_records": len(records), "recognized_dimensions": len(decisions),
                        "bound_source_records": sum(bool(row["bindings"]) for row in decisions),
                        "api_selected": len(selected) if use_api else 0, "api_agreed": agreed, "api_conflicts": conflicts,

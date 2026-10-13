@@ -701,6 +701,7 @@ def _split_source_chain(points, tolerance, *, maximum_pieces=4):
             primitive = _line(part, tolerance) or _arc(part, tolerance)
             if primitive is not None:
                 edges[first, last] = primitive
+    arclength=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(points,axis=0),axis=1))]
     best = {(0, 0): (0., [])}
     for count in range(1, maximum_pieces + 1):
         for last in landmarks[1:]:
@@ -709,14 +710,50 @@ def _split_source_chain(points, tolerance, *, maximum_pieces=4):
                 previous = best.get((count - 1, first))
                 primitive = edges.get((first, last))
                 if previous is not None and primitive is not None:
-                    cost = previous[0] + primitive["fit_error_px"] ** 2 * (last - first)
+                    cost = previous[0] + primitive["fit_error_px"] ** 2 * (arclength[last]-arclength[first])
                     choices.append((cost, [*previous[1], copy.deepcopy(primitive)]))
             if choices:
                 best[count, last] = min(choices, key=lambda row: row[0])
         solution = best.get((count, len(points) - 1))
         if solution:
             if count == 1:
-                raise ValueError("no_source_feature_requires_split")
+                # A small Hausdorff residual alone cannot prove that an ARC
+                # contains no resolved curvature transition. Keep a bounded
+                # two-ARC alternative when it substantially explains the
+                # immutable source better; it remains a proposal requiring
+                # fresh annotation binding, solving and source validation.
+                if solution[1][0]['type']!='ARC':
+                    raise ValueError("no_source_feature_requires_split")
+                floor=max(.5,.5*tolerance)
+                original_error=float(solution[1][0]['fit_error_px'])
+                alternatives=[]
+                if original_error>=floor:
+                    for cut in landmarks[1:-1]:
+                        spans=np.array([arclength[cut],arclength[-1]-arclength[cut]])
+                        if min(spans)<max(8.,4*tolerance):continue
+                        parts=[points[:cut+1],points[cut:]]
+                        # The greedy LINE-or-ARC edge table would hide a real
+                        # curved part whenever its chord happens to pass the
+                        # loose fitting threshold. Compare ARC hypotheses
+                        # explicitly, requiring curvature resolved above the
+                        # same observation floor on BOTH sides.
+                        if any(_line(part,floor) is not None for part in parts):continue
+                        arcs=[_arc(part,tolerance) for part in parts]
+                        if any(arc is None for arc in arcs):continue
+                        cost=sum(arc['fit_error_px']**2*span for arc,span in zip(arcs,spans))
+                        ratio=cost/max(solution[0],1e-20)
+                        if ratio<=.25:alternatives.append((cost,arcs,spans,ratio))
+                if not alternatives:
+                    raise ValueError("no_source_feature_requires_split")
+                _,pieces,spans,ratio=min(alternatives,key=lambda row:row[0])
+                evidence=dict(method='resolved_two_arc_source_residual_alternative',
+                    original_maximum_residual_px=original_error,
+                    arclength_weighted_squared_max_residual_ratio=float(ratio),
+                    minimum_source_span_px=float(min(spans)),
+                    numeric_attributes_are_initial_guesses=True,dimension_binding_verified=False,
+                    ground_truth_used=False,publication_approved=False)
+                for primitive in pieces:primitive['source_feature_split_evidence']=copy.deepcopy(evidence)
+                return pieces
             return solution[1]
     raise ValueError("source_features_exceed_bounded_replacement_budget")
 
@@ -1015,7 +1052,7 @@ def _annotated_curved_fillet(points, radius, tolerance, binding):
 def _annotated_existing_line_fillet(points, radius, tolerance, binding, selected):
     """Preserve existing LINE supports; a fillet cannot rotate or replace them.
 
-    Only a two-line junction, one short unbound connector, or one already
+    Only a two-line junction, one local unbound connector, or one already
     source-bound radius ARC between those same finite supports is eligible.
     A three-piece edit may redistribute only its existing middle domain.
     Source residuals and the directed target still have to justify the exact R.
@@ -1065,7 +1102,7 @@ def _annotated_existing_line_fillet(points, radius, tolerance, binding, selected
         length = math.dist(connector["start"], connector["end"])
         if (connector.get("radius_binding") or connector.get("dimension_bound")
                 or connector.get("constraint_ids") or length <= 1e-8
-                or length > 2*radius or min(ul, vl) <= 1.5*length):
+                or min(ul, vl) <= 1.5*length):
             raise ValueError("fillet_connector_is_not_a_short_unbound_corner")
     u, v = u/ul, v/vl
     turn = math.atan2(float(u[0]*v[1]-u[1]*v[0]), float(u@v))
@@ -1077,6 +1114,26 @@ def _annotated_existing_line_fillet(points, radius, tolerance, binding, selected
         raise ValueError(failure) from error
     distance = radius*math.tan(abs(turn)/2)
     retained = lengths-distance
+    # A fitted connector is an initialization interval, not the tangent
+    # chord of the annotated circle. It can include a little of both LINE
+    # supports and therefore exceed 2R, especially at an obtuse turn. The
+    # angle-derived contacts below must instead lie on the finite supports
+    # or inside this connector's finite projection and source-distance band.
+    # Those contact checks, resolved source curvature, directed arrow and
+    # bidirectional path residuals all remain mandatory before a candidate
+    # can reach fresh binding and the joint solve.
+    connector_geometry = None
+    if len(selected) == 3 and not middle_arc:
+        connector_geometry = {
+            "method": "angle_derived_tangent_contacts_and_finite_source_domain",
+            "support_turn_deg": math.degrees(turn),
+            "tangent_setback_px": float(distance),
+            "nominal_tangent_chord_px": float(2*radius*math.sin(abs(turn)/2)),
+            "connector_length_px": float(length),
+            "virtual_corner_to_connector_endpoints_px": (lengths-[ul, vl]).tolist(),
+            "connector_length_is_not_circle_diameter": True,
+            "source_tolerance_px": float(tolerance),
+        }
     # Both original outer endpoints and LINE directions stay fixed. A
     # tangent may redistribute one unbound short connector, but never reach
     # outside its finite local domain or consume an outer support LINE.
@@ -1133,6 +1190,8 @@ def _annotated_existing_line_fillet(points, radius, tolerance, binding, selected
         bend = float(_primitive_distance(corner_source, selected[1]).max())
         if bend <= max(.5, tolerance*.25):
             raise ValueError("fillet_connector_has_no_resolved_source_curvature")
+        connector_geometry.update(resolved_source_curvature_px=bend,
+            minimum_resolved_source_curvature_px=max(.5, tolerance*.25))
     sampled = _sample_entities(candidate, max_step_px=max(.25, min(1., tolerance/2)))[0]
     forward = float(cKDTree(sampled).query(points, workers=1)[0].max())
     reverse = float(_source_polyline_distance(sampled, points).max())
@@ -1151,6 +1210,7 @@ def _annotated_existing_line_fillet(points, radius, tolerance, binding, selected
         source_refinement={"outer_endpoints_fixed": True, "support_directions_fixed": True,
                            "support_types_fixed": True, "radius_exact": True,
                            "source_path_and_arrow_verified": True,
+                           "requires_fresh_binding_and_joint_solve": True,
                            "ground_truth_used": False,
                            "original_finite_line_supports_px": [
                                [selected[0]["start"], selected[0]["end"]],
@@ -1159,6 +1219,8 @@ def _annotated_existing_line_fillet(points, radius, tolerance, binding, selected
                            "constructed_contact_points_px": [first.tolist(), last.tolist()],
                            "maximum_source_error_px": float(distances.min(axis=0).max()),
                            "maximum_reverse_error_px": reverse})
+    if connector_geometry is not None:
+        candidate[1]["source_refinement"]["connector_corner_geometry"] = connector_geometry
     if redistribution:
         if middle_arc:
             candidate[1]["source_refinement"]["replaced_arc_domain_redistribution"] = redistribution
@@ -1403,6 +1465,8 @@ def _apply_one(graph, baseline, operation, inventory, *, candidate_scorer=None, 
         "replacement_types": [row["type"] for row in replacements],
         "net_entity_reduction": len(indices) - len(replacements),
         "replacement_fit_error_px": max(float(row.get("fit_error_px", 0.)) for row in replacements),
+        "source_feature_split_evidence":next((row['source_feature_split_evidence'] for row in replacements
+            if row.get('source_feature_split_evidence')),None),
         "annotation_guided": bool(angle_evidence) or bool(radius_binding) or bool(radius_targets and len(radius_targets)>=2),
         "resegmentation_applied": (action == "restore_annotated_line_support" or
                                    any(bool(row.get("source_partition_evidence")) for row in replacements)),
@@ -1624,6 +1688,8 @@ def execute_topology_edits(image_path, document, baseline, base_candidate, bundl
             {"name": "multimodal_local_topology_edit", "description": strategy_description},
         )
         candidate_graph["baseline_modified"] = True
+        if (candidate_graph.get('source_line_preservation') or {}).get('passed') is False:
+            raise ValueError('edit_would_discard_verified_original_ink_line')
         candidate_graph["source_evidence"].update(topology_edit=execution)
         counts = {"total": len(source_entities),
                   "LINE": sum(item["type"] == "LINE" for item in source_entities),

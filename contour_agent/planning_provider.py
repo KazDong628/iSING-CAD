@@ -150,6 +150,8 @@ def evaluate_candidates(candidates, *, max_candidates=5):
         validation = graph.get("validation") if isinstance(graph.get("validation"), dict) else {}
         if (graph.get("angle_line_preservation") or {}).get("passed") is False:
             reasons.append("source_annotated_line_support_lost")
+        if (graph.get("source_line_preservation") or {}).get("passed") is False:
+            reasons.append("source_finite_line_support_lost")
         for key in ("closed", "connected", "simple", "ordered_entity_cycle"):
             if validation.get(key) is not True:
                 reasons.append(f"{key}_validation_failed")

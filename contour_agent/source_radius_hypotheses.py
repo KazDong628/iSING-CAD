@@ -705,11 +705,27 @@ def merge_carried_bindings(original_inventory, fresh_inventory, fresh, carry):
             original_relation = next(item for item in original_inventory.get('relations', [])
                 if item.get('type') == retained['kind'] and
                 set(item.get('entities', [])) == set(retained.get('entities', [])) and
+                set(item.get('nodes', [])) == set(retained.get('nodes', [])) and
                 item.get('local_reliable') is True and (item.get('evidence') or {}).get('verified') is True)
             relation_id = f'carried_relation_{index:03d}'
             retained['id'] = 'k' + relation_id
             decision.update(constraint_id=retained['id'], relation_id=relation_id,
                 prior_relation_id=original_relation['id'], evidence=copy.deepcopy(original_relation['evidence']))
+            if original_relation.get('source') in {'source_design_review','source_bound_design_fillet'}:
+                decision['source']=original_relation['source']
+            # Detector confidence/required flags and None versus zero are
+            # evidence metadata, not different G1 equations. A reobserved
+            # optional equation cannot duplicate or weaken a carried hard G1.
+            if retained['kind']=='tangent':
+                duplicates=[c for c in fresh['constraints'] if c.get('kind')=='tangent'
+                    and set(c.get('entities',[]))==set(retained.get('entities',[]))
+                    and set(c.get('nodes',[]))==set(retained.get('nodes',[]))]
+                duplicate_ids={c['id'] for c in duplicates}
+                fresh['constraints']=[c for c in fresh['constraints'] if c['id'] not in duplicate_ids]
+                for binding in fresh.get('bindings',[]):
+                    if binding.get('constraint_id') in duplicate_ids or 'k'+str(binding.get('relation_id')) in duplicate_ids:
+                        binding.update(active_constraint_id=retained['id'],
+                            equation_status='consolidated_with_carried_known_obligation')
             carried_relation=copy.deepcopy(original_relation)
             carried_relation.update(id=relation_id,admission_method='carried_source_binding_certificate',
                                     current_API_reconfirmed=False,fresh_detector_reconfirmed=False)

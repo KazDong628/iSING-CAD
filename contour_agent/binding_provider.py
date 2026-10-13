@@ -27,9 +27,11 @@ Use only IDs in the supplied inventory. At most one candidate per record. Select
 PROMPT += "\nEach candidate's admitted_by_original_source_checks reports independent source admission, not a fitted-numeric match. An evidence.source_joint_radius_conflict_resolution identifies a neighboring ARC already uniquely owned by an incompatible source radius; examine those source record IDs together. Do not select a candidate marked inadmissible merely because its fitted outline looks close. Abstain if source glyphs contradict the admitted candidate; admission hints alone never certify final geometry."
 PROMPT += "\nA source_station_relation is an explicit half-section drawing construction: the shared free axis is eliminated using an independently source-owned reference diameter. For a diameter, D = reference_D + 2 * signed(anchor2-anchor1); for an axis-to-station length, L = reference_D/2 + signed(anchor2-anchor1). Select the primary annotation only when the source supports these stations and semantics. This does not independently certify the reference diameter or absolute axis placement."
 PROMPT += "\nA common_curve_center anchor refers to two independently source-owned radius shafts whose observed finite tails terminate at the same point. Binding a dimension to it imposes both ARC center equalities as well as the dimension; no observed pixel coordinate is fixed. Check the actual common termination and dimension extension, and abstain if it is only a crossing of continuing lines."
+PROMPT += "\nA curve_center anchor may also be supported by one uniquely owned radius shaft whose finite tail ends at an explicit dimension extension, with both dimension arrows observed. Inspect that source radius leader and dimension together: the location is the circle center only when the source supports that meaning, not just an infinite-line crossing or a nearby fitted center. Binding fixes the source dimension to the unknown circle center; it never fixes a measured pixel coordinate."
 PROMPT += "\nlocked_known_constraints are previously independently source-verified equations retained on the same source image, OCR and object identities. They are not fitted-value suggestions or new candidate IDs. Inspect fresh candidates independently; report source glyph contradictions if present. Absence from fresh candidates or your selections is recorded separately and does not alone revoke an established source certificate. Newly proposed radii still require normal independent candidate selection and source checks."
 PROMPT += "\nWhen binding_priority is radius_and_angle_first, inspect every supplied radius and single-line angle obligation before the other dimensions. The mask and approximate geometry are initial guesses. A source-backed angle requires a finite LINE and a source-backed radius requires an ARC; report unsupported or ambiguous candidates by abstaining rather than transferring an angle to an ARC or a radius to a LINE. Their numerical attributes will be fixed to the source nominal during the subsequent joint solve; do not reject a correctly associated candidate solely because its current fitted value differs."
 PROMPT += "\nThe SOURCE GLYPH ATLAS contains enlarged original pixels from each supplied record's OCR box, labeled only by record ID. Inspect that record's own glyph tile when transcribing observed_text; do not substitute a similar nearby radius from the full drawing or a different record's tile. The atlas does not assert the OCR value or geometric ownership: use the full drawing and paired topology panels to determine the candidate, and abstain if the glyph itself is unreadable."
+PROMPT += "\nA section_curve_intersection is the finite contour crossing at a source-defined station. Its station may be a reference offset from the theoretical intersection of two LINE supports. A reference offset defines where to measure; it is not an additional contour distance. Inspect the finite extension termination, not an incidental crossing, and do not replace a section by a nearest vertex or extremum. A independently observed curve_extremum is a different measurement location. A source_tolerance_interval preserves the source minimum and maximum, never its midpoint as an equality. A radial_gap requires two finite ARC contacts on the same radial dimension shaft plus independently verified common-center semantics; it measures the absolute radius difference. The exact radius annotations remain fixed at their nominal values."
 
 
 MAX_BINDING_PAGES = 4
@@ -93,7 +95,10 @@ _SOURCE_LINE = {key: _SCALAR for key in ("lo", "hi", "cross", "thickness", "cove
     "method", "observed_gap_px", "maximum_gap_px", "nominal_used")}
 _SOURCE_LINE["observed_segments"] = ({key: _SCALAR for key in ("lo", "hi", "cross", "thickness")}, 2)
 _ANCHOR = {"type": _SCALAR, "node_id": _SCALAR, "entities": _IDENTIFIERS,
-           "entity_id": _SCALAR, "other_entity_id": _SCALAR, "axis": _SCALAR, "sense": _SCALAR}
+           "entity_id": _SCALAR, "other_entity_id": _SCALAR, "axis": _SCALAR, "sense": _SCALAR,
+           "branch": _SCALAR,
+           "station": {**{key:_SCALAR for key in ('type','axis','direction','source_record_id',
+                                                 'source_offset','reference')},'entities':_IDENTIFIERS}}
 _STATION_RELATION = {**{key: _SCALAR for key in ("type", "axis", "direction", "primary_kind", "reference_record_id")},
     "reference_dimension": {key: _SCALAR for key in ("kind", "nominal", "lower_deviation", "upper_deviation")}}
 _STATION = {**{key: _SCALAR for key in ("observed_station_px", "representative_node", "support_kind",
@@ -112,6 +117,16 @@ _STATION["construction"].update({
     "source_arrow_ids": _IDENTIFIERS,
     "owner_record_id": _SCALAR,
     "unique_arrow_target": _SCALAR,
+    "dimension_record_id": _SCALAR,
+    "dimension_station_endpoint": _SCALAR,
+    "source_section_semantics_verified": _SCALAR,
+    "reference_record_id": _SCALAR,
+    "dimension_endpoint": _SCALAR,
+    "measurement_axis": _SCALAR,
+    "arrow_pair_verified": _SCALAR,
+    "section_termination_gap_px": _SCALAR,
+    "nominal_used_for_station_ownership": _SCALAR,
+    "reference_offset_is_station_definition_not_independent_equation": _SCALAR,
     "other_arc_concentricity_not_implicitly_asserted": _SCALAR,
     "tail_support": ({key: _SCALAR for key in ("record_id", "verified",
         "full_tail_supported_fraction", "maximum_unobserved_run_px",
@@ -137,6 +152,17 @@ _SOURCE_EVIDENCE.update({key: _SCALAR for key in ("reference_record_id", "source
     "observed_signed_span_px", "expected_signed_span_px", "source_span_tolerance_px", "source_reference_selection",
     "reference_diameter_is_dependency_not_solved_record", "absolute_axis_position_verified",
     "coordinates_locked", "nominal_used_for_station_ownership")})
+_SOURCE_EVIDENCE.update({key:_SCALAR for key in ('verified','arrow_pair_verified',
+    'contour_contacts_verified','common_center_semantics_verified','same_radial_half_ray',
+    'nominal_used_for_ownership','fitted_radius_difference_used_as_dimension','center_to_shaft_gap_px')})
+_SOURCE_EVIDENCE.update(source_supported_entities=_IDENTIFIERS,
+    required_center_equalities=(_SCALAR,2),radial_alignments=_POINT,
+    finite_contact_owners=(({key:_SCALAR for key in ('entity_id','entity_type','contact_gap_px')},2),2),
+    source_oblique_dimension={'record_id':_SCALAR,'endpoints_source_px':_SEGMENT,'direction_px':_POINT,
+        'arrow_pair_verified':_SCALAR,'evidence':{**{key:_SCALAR for key in ('verified','method',
+        'same_source_shaft','arrow_directions_opposed','label_association_unique','contact_pixel_tapers_verified',
+        'requires_contact_tip_recheck')},'endpoint_arrows':(_ARROW,2)}},
+    source_common_center=_STATION['construction'])
 _RELATION_EVIDENCE = {**{key: _SCALAR for key in ("method", "verified", "passed", "reason", "status",
     "observed_station_px", "span_px", "proposal_band_px", "support_kind", "shared_node",
     "boundary_observation", "observed_deviation_degrees", "mask_observed_deviation_degrees", "tolerance_degrees")},
@@ -232,7 +258,7 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
              "truncated_collection_items": 0, "invalid_or_depth_limited_values": 0}
     record_rows = [{"id": row["id"], "text": _source_summary(str(row.get("text", "")), _SCALAR, audit),
                    "parsed": _source_summary(row.get("parsed"), {key: _SCALAR for key in
-                       ("kind", "nominal", "upper_deviation", "lower_deviation", "symbol", "unit")}, audit),
+                       ("kind", "nominal", "upper_deviation", "lower_deviation", "symbol", "unit", "reference")}, audit),
                    "box": _source_summary(row.get("box"), (_POINT, 8), audit),
                    "source_text_evidence": _source_summary(row.get("source_text_evidence"), _SOURCE_TEXT, audit),
                    "source_text_admission": _source_summary(row.get("source_text_admission"),
@@ -245,7 +271,7 @@ def bounded_inventory(inventory, *, record_limit=24, candidate_limit=48, relatio
         for key in ("occluded_leader_hypotheses", "ambiguous_crossing_leaders_requiring_review"):
             if evidence.get(key):
                 source[key+"_summary"] = _source_path_review_summary(evidence[key], audit)
-        candidate_rows.append({**{key: row.get(key) for key in ("id", "record_id", "kind", "entities", "nodes", "reference_axis")},
+        candidate_rows.append({**{key: row.get(key) for key in ("id", "record_id", "kind", "entities", "nodes", "reference_axis", "measurement_policy")},
                                "admitted_by_original_source_checks": row.get("local_reliable") is True,
                                "evidence": source})
         if row.get("anchors"):

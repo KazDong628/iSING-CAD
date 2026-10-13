@@ -599,6 +599,12 @@ def _to_graph(source_entities, source_to_design, orientation_det, base_graph, ca
     }
     from .unchanged_source_obligations import attach_unchanged_parent
     attach_unchanged_parent(graph,base_graph)
+    inherited_lines = base_graph.get('source_line_preservation')
+    if isinstance(inherited_lines, dict):
+        from .source_line_inventory import line_preservation
+        graph['source_line_preservation'] = line_preservation(
+            inherited_lines.get('witnesses', []), source_entities,
+            float(base_graph.get('source_grid_pitch_px') or 1.))
     return graph
 
 
@@ -714,6 +720,8 @@ def generate_topology_candidates(image_path, document, baseline_model, base_grap
          *(base_graph.get("radius_source_segment_hypotheses") or [])])
     inventory_summary["boundary_observation_source"] = observation_source
     stroke = _StrokeEvidence(gray, records, grid)
+    from .source_line_inventory import source_line_witnesses, line_preservation
+    required_source_lines = source_line_witnesses(gray, base_source_entities, ring, grid, stroke)
     parent_hash = _json_hash(base_graph)
     candidates = []
     failures = []
@@ -763,6 +771,7 @@ def generate_topology_candidates(image_path, document, baseline_model, base_grap
                 "lost_record_ids":sorted(required_angle_ids-supported_angle_ids),
                 "basis":"independently_observed_source_angle_arrows_and_finite_straight_support",
                 "ground_truth_used":False}
+            graph["source_line_preservation"] = line_preservation(required_source_lines, source_entities, grid)
             counts = {"total": len(source_entities),
                       "LINE": sum(e["type"] == "LINE" for e in source_entities),
                       "ARC": sum(e["type"] == "ARC" for e in source_entities)}

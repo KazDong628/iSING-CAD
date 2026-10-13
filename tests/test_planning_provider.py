@@ -82,6 +82,14 @@ def test_local_evaluator_makes_annotation_primary_and_rejects_hard_invalidity():
     assert result["ground_truth_used"] is False
 
 
+def test_planner_rejects_line_loss_even_with_perfect_overlay_and_annotation_scores():
+    row = candidate('lost-line', support=1., annotation=1., unsupported=0)
+    row['graph']['source_line_preservation'] = {'passed': False}
+    result = evaluate_candidates([row])
+    assert not result['admissible_candidate_ids']
+    assert 'source_finite_line_support_lost' in result['evaluated'][0]['rejection_reasons']
+
+
 def test_local_evaluator_bounds_online_set_to_five_and_sends_no_geometry():
     rows = [candidate(f"topo-{i}", annotation=.1*i, unsupported=0) for i in range(7)]
     result = evaluate_candidates(rows)

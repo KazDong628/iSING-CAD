@@ -31,6 +31,7 @@ def reconstruction_contract(entities, stage, validation):
             joint_constraints[(frozenset(ids), nodes[0])] = row.get("id")
     checks = {row.get("constraint_id", row.get("id")): row for row in strict.get("checks", [])}
     joints = []
+    from .relation_contract import _geometry, _joint_check
     for index, left in enumerate(entities):
         right = entities[(index + 1) % len(entities)]
         node = left.get("end_node")
@@ -41,17 +42,27 @@ def reconstruction_contract(entities, stage, validation):
         connected = bool(node and node == right.get("start_node"))
         passed = bool(connected and (checks.get(constraint_id, {}).get("passed") is True
                                      if explicit_tangent else axis_corner))
+        measured = None
+        if connected:
+            try:
+                measured = _joint_check(_geometry(left), _geometry(right), node)
+            except (ValueError, TypeError, KeyError, ArithmeticError):
+                pass
         joints.append({"node_id": node, "entities": [left.get("id"), right.get("id")],
                        "types": [left.get("type"), right.get("type")], "constraint_id": constraint_id,
                        "relationship": "source_admitted_tangent" if explicit_tangent else
                                        "sourced_line_directions" if axis_corner else "unresolved",
-                       "passed": passed, "tangency_assumed_from_fitted_shape": False})
+                       "passed": passed, "tangency_assumed_from_fitted_shape": False,
+                       "current_geometry_diagnostic": measured,
+                       "current_geometry_is_design_evidence": False})
     unknown = [row for row in joints if row["relationship"] == "unresolved"]
     shape_dof = diagnostics.get("remaining_shape_dof")
     fully_determined = isinstance(shape_dof, (int, float)) and shape_dof == 0 and stage.get("underconstrained") is False
     native = bool(strict.get("passed") is True and strict.get("dxf_readback_performed") is True)
     relation_coverage = bool(joints and all(row["passed"] for row in joints) and native)
     reasons = []
+    unresolved_features=counts.get('unresolved_profile_annotation_records',0)
+    if unresolved_features:reasons.append('source_annotation_semantic_families_unresolved')
     if not dimension_coverage: reasons.append("recognized_annotation_attributes_unresolved")
     if not radii.get("satisfied"): reasons.append("annotated_radii_unresolved")
     if not relation_coverage: reasons.append("source_relationship_coverage_incomplete")
@@ -64,6 +75,7 @@ def reconstruction_contract(entities, stage, validation):
             "status": "source_obligations_satisfied" if not reasons else "unresolved_source_obligations",
             "reasons": reasons, "recognized_dimensions": recognized, "bound_source_records": bound,
             "unbound_dimensions": unbound, "all_recognized_attributes_covered": dimension_coverage,
+            "unresolved_profile_annotation_records":unresolved_features,
             "all_join_relationships_certified": relation_coverage,
             "strict_native_relation_subset_satisfied": native, "joints": joints,
             "unresolved_joint_count": len(unknown), "remaining_shape_dof": shape_dof,

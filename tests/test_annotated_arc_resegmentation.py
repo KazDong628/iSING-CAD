@@ -50,6 +50,43 @@ def test_source_target_order_controls_partition_not_incoming_record_order():
     assert [e["radius"] for e in result["entities"]]==[40.,15.]
 
 
+def test_two_radius_labels_can_enclose_one_unlabelled_transition_arc():
+    points,all_annotations=source_chain((40.,8.,30.),(.55,-.7,-.7))
+    annotations=[all_annotations[0],all_annotations[2]]
+    original=points.copy();before=copy.deepcopy(annotations)
+    result=resegment_annotated_arcs(points,annotations,.15,source_entity_count=2)
+    assert len(result['entities'])==3
+    left,bridge,right=result['entities']
+    assert left['radius']==40. and right['radius']==30.
+    assert left['radius_binding']['record_id']=='r0' and right['radius_binding']['record_id']=='r2'
+    assert bridge['type']=='ARC' and not bridge.get('radius_binding')
+    assert bridge['parameter_source']=='unlabelled_source_bridge_initial_guess'
+    assert result['unknown_attributes_require_joint_solve']
+    assert result['maximum_bidirectional_error_px']<=.15
+    assert np.array_equal(original,points) and annotations==before
+
+
+def test_two_radius_labels_do_not_turn_their_straight_connector_into_an_arc():
+    points,labels=source_chain((40.,),(.55,))
+    heading=.55
+    start=points[-1];end=start+20*np.array([math.cos(heading),math.sin(heading)])
+    bridge=np.linspace(start,end,101)
+    suffix,other=source_chain((15.,),(-1.1,))
+    rotation=np.array([[math.cos(heading),-math.sin(heading)],
+                       [math.sin(heading),math.cos(heading)]])
+    suffix=suffix@rotation.T+end
+    other[0]['target_source_px']=(np.asarray(other[0]['target_source_px'])@rotation.T+end).tolist()
+    other[0]['record_id']='r1'
+    source=np.vstack([points,bridge[1:],suffix[1:]])
+    result=resegment_annotated_arcs(source,[labels[0],other[0]],.15,source_entity_count=3)
+    assert [e['type'] for e in result['entities']]==['ARC','LINE','ARC']
+    assert result['entities'][0]['radius']==40. and result['entities'][-1]['radius']==15.
+    assert result['unlabelled_bridge_type']=='LINE'
+    assert result['unknown_attributes_require_joint_solve']
+    assert not result['entities'][1].get('radius_binding')
+    assert result['maximum_bidirectional_error_px']<=.15
+
+
 @pytest.mark.parametrize("change",["unverified","outside_target","wrong_radius","duplicate_target","too_many_primitives"])
 def test_unverified_or_infeasible_source_partition_is_rejected(change):
     points,annotations=source_chain();count=3

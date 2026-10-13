@@ -9,6 +9,7 @@ from PIL import Image
 import pytest
 
 from contour_agent.config import Settings
+from contour_agent.ocr import canonical_records
 from contour_agent.radius_target_provider import RadiusTargetProvider, validate_radius_target_response, locate_radius_targets
 from contour_agent import topology_candidates
 from contour_agent.vision_provider import _InspectionError
@@ -313,6 +314,51 @@ def test_complete_local_verification_stops_without_second_network_call(monkeypat
     _, receipt = locate_radius_targets("source.png", document(1), {}, tmp_path, provider)
     assert provider.count == receipt["attempt_count"] == receipt["network_requests"] == 1
     assert not (tmp_path/"radius-targets-attempt-02.json").exists()
+
+
+def test_new_localization_cannot_overwrite_reverified_prior_source_hint(monkeypatch,tmp_path):
+    original=document(1);old=proposal('r000');original['records'][0]['source_arrow_proposals']=[old]
+    class Provider:
+        def locate(self,*a,**kw):
+            return dict(status='succeeded',schema_success=True,http_success=True,network_requests=1,
+                proposals=[{**old,'tip_px':[160,140]}],unknown_record_ids=[])
+    monkeypatch.setattr('contour_agent.radius_target_provider._local_radius_inventory',
+        lambda *a:dict(status='completed',verified_record_ids=['r000']))
+    enriched,receipt=locate_radius_targets('source.png',original,{},tmp_path,Provider())
+    assert enriched['records'][0]['source_arrow_proposals']==[old]
+    assert receipt['initial_source_reverified_record_ids']==['r000']
+    assert original['records'][0]['source_arrow_proposals']==[old]
+
+
+def test_radius_pages_cover_later_records_before_retry_and_keep_failed_page(monkeypatch, tmp_path):
+    class Provider:
+        settings = Settings(api_timeout=20.)
+        requested = []
+
+        def locate(self, image, doc, *, record_ids=None):
+            self.requested.append(list(record_ids))
+            failed = len(self.requested) == 1
+            return {'status': 'failed' if failed else 'succeeded', 'http_success': not failed,
+                    'schema_success': not failed, 'network_requests': 1,
+                    'proposals': [] if failed else [proposal(rid) for rid in record_ids],
+                    'unknown_record_ids': record_ids if failed else []}
+
+    def local(image, doc, baseline):
+        return {'status': 'completed', 'verified_record_ids':
+                [row['id'] for row in canonical_records(doc) if row.get('source_arrow_proposals')]}
+
+    monkeypatch.setattr('contour_agent.radius_target_provider._local_radius_inventory', local)
+    provider = Provider()
+    _, receipt = locate_radius_targets('source.png', document(13), {}, tmp_path, provider)
+    assert provider.requested[:3] == [[f'r{i:03d}' for i in range(6)],
+                                      [f'r{i:03d}' for i in range(6, 12)], ['r012']]
+    assert provider.requested[3] == provider.requested[0]
+    assert receipt['attempt_count'] == receipt['attempt_limit'] == 4
+    assert not receipt['not_requested_record_ids']
+    assert not receipt['http_success'] and receipt['any_http_success']
+    assert receipt['all_arrows_locally_verified']
+    assert receipt['total_request_budget_seconds'] == 80.
+    assert (tmp_path/'radius-targets-progress.json').is_file()
 
 
 def test_provider_interruption_is_not_converted_to_ordinary_failure(monkeypatch, tmp_path):

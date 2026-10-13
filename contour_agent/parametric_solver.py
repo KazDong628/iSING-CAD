@@ -22,6 +22,7 @@ from scipy.optimize import OptimizeResult, least_squares, minimize
 from scipy.linalg import qr
 from scipy.sparse import lil_matrix
 from scipy.spatial import cKDTree
+from .execution_control import execution_checkpoint
 from .topology import _primitive_distance
 from .vectorize import _sample_entities, _line_entities, assess_fit_quality
 from .relation_contract import (STRICT_TANGENT_CERT_TOLERANCE_DEG,
@@ -39,8 +40,8 @@ MAX_ENTITIES = 256
 MAX_CONSTRAINTS = 1024
 SOURCE_CURVE_PRIOR_WEIGHT = .3
 SOURCE_BUDGET_SEARCH_ROUNDS = 24
-_KINDS = {"radius", "distance_x", "distance_y", "distance", "angle", "horizontal", "vertical", "tangent"}
-_DIMENSIONAL = {"radius", "distance_x", "distance_y", "distance"}
+_KINDS = {"radius", "distance_x", "distance_y", "distance", "radial_gap", "angle", "horizontal", "vertical", "tangent"}
+_DIMENSIONAL = {"radius", "distance_x", "distance_y", "distance", "radial_gap"}
 _SOURCES = {"ocr_local_binding", "ocr_api_binding", "source_geometry"}
 
 
@@ -85,7 +86,7 @@ def _measurement_anchor_point(anchor, nodes, entities, *, allow_ill_conditioned=
     initial and final checks always reject ill-conditioned intersections.
     """
     if anchor["type"]=="node":return np.asarray(nodes[anchor["node_id"]],float)
-    if anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center"}:
+    if anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center","section_curve_intersection"}:
         return derived_anchor_point(anchor,entities,allow_infeasible=allow_ill_conditioned)
     first,second=(entities[eid] for eid in anchor["entities"])
     a=np.asarray(first["start"],float);b=np.asarray(second["start"],float)
@@ -127,13 +128,13 @@ def _validate_measurement_anchors(row, node_map, entity_map):
                     raise ValueError("Measurement intersection references unknown or non-LINE support")
             anchor["entities"]=sorted(eids);supports.update(eids)
             identities.append(("line_intersection",*anchor["entities"]))
-        elif anchor.get("type") in {"support_level","curve_extremum","curve_center","common_curve_center"}:
+        elif anchor.get("type") in {"support_level","curve_extremum","curve_center","common_curve_center","section_curve_intersection"}:
             identity,references=validate_derived_anchor(anchor,entity_map,
                 "x" if row["kind"]=="distance_x" else "y" if row["kind"]=="distance_y" else None)
             supports.update(references);identities.append(identity)
         else:raise ValueError("Unsupported measurement anchor type")
         _measurement_anchor_point(anchor,node_map,entity_map,
-            allow_ill_conditioned=anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center"})
+            allow_ill_conditioned=anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center","section_curve_intersection"})
     if identities[0]==identities[1]:raise ValueError("Measurement anchors must be distinct")
     if set(row["entities"])!=supports:raise ValueError("Measurement entities must equal its intersection support union")
     row["entities"]=sorted(supports)
@@ -219,7 +220,13 @@ def _validate_inputs(graph, constraints):
         if row.get("source_tolerance") is not None:
             from .dimension_policy import tolerance_interval_check
             audit=tolerance_interval_check(row["source_tolerance"],value)
-            if kind not in {"distance","distance_x","distance_y","angle"} or abs(value)!=audit["construction_target"]:
+            if kind not in {"distance","distance_x","distance_y","radial_gap","angle"}:
+                raise ValueError("Source tolerance is only valid for supported dimensional measurements")
+            if _interval_measurement(row):
+                if (kind == "angle" or abs(value) != row['source_tolerance']['nominal'] or
+                        row.get('enforcement') != 'source_tolerance_interval'):
+                    raise ValueError("Source interval keeps its nominal and declares inequality enforcement")
+            elif abs(value)!=audit["construction_target"]:
                 raise ValueError("Source tolerance must keep its declared exact construction target")
         record=row.get("record_id")
         if source!="source_geometry":
@@ -230,7 +237,11 @@ def _validate_inputs(graph, constraints):
                 raise ValueError("Physical dimensions require an mm graph, OCR binding source and record_id/value")
             if kind=="radius" and (len(eids)!=1 or entity_map[eids[0]]["type"]!="ARC" or nids):
                 raise ValueError("Radius binds exactly one ARC and no nodes")
-            if kind!="radius" and anchor_identities is None and len(nids)!=2:raise ValueError("Distances require two ordered nodes")
+            if kind == "radial_gap":
+                if (len(eids) != 2 or nids or anchor_identities is not None or
+                        any(entity_map[e]['type'] != 'ARC' for e in eids) or value <= 0):
+                    raise ValueError("Radial gap needs two distinct ARCs and no node/anchor literals")
+            elif kind!="radius" and anchor_identities is None and len(nids)!=2:raise ValueError("Distances require two ordered nodes")
             if kind in {"radius","distance"} and value<=0:raise ValueError("Radius/distance must be positive")
         elif kind in {"horizontal","vertical"}:
             if value not in (None,0.):raise ValueError("Horizontal/vertical relation value must be null or zero")
@@ -277,13 +288,14 @@ def _validate_inputs(graph, constraints):
         if kind in {"horizontal","vertical","distance"}:canonical_nodes=tuple(sorted(canonical_nodes))
         if kind in {"distance_x","distance_y"} and canonical_nodes[0]>canonical_nodes[1]:
             canonical_nodes=canonical_nodes[::-1];canonical_value=-canonical_value
-        if kind=="tangent":canonical_entities=tuple(sorted(canonical_entities))
+        if kind in {"tangent","radial_gap"}:canonical_entities=tuple(sorted(canonical_entities))
         if kind=="angle" and row["angle_mode"]=="unsigned":
             canonical_entities=tuple(sorted(canonical_entities))
             if len(canonical_nodes)==3 and canonical_nodes[0]>canonical_nodes[2]:canonical_nodes=canonical_nodes[::-1]
         if kind!="angle" and row.get("reference_axis") is not None:
             raise ValueError("reference_axis is only valid for an annotated angle")
-        signature=(kind,canonical_entities,canonical_nodes,canonical_value,row.get("angle_mode"),row.get("reference_axis"))
+        interval_signature=(row['source_tolerance']['minimum'],row['source_tolerance']['maximum']) if _interval_measurement(row) else None
+        signature=(kind,canonical_entities,canonical_nodes,canonical_value,row.get("angle_mode"),row.get("reference_axis"),interval_signature)
         if signature in semantic:raise ValueError("Duplicate equivalent constraint")
         semantic.add(signature);prepared.append(row)
     return nodes,entities,prepared
@@ -307,6 +319,7 @@ def _angle(first,second,signed):
 def _constraint_value(row,nodes,entities,*,allow_ill_conditioned=False):
     kind=row["kind"];nids=row["nodes"];eids=row["entities"]
     if kind=="radius":return entities[eids[0]]["radius"]
+    if kind=='radial_gap':return abs(float(entities[eids[0]]['radius'])-float(entities[eids[1]]['radius']))
     if kind.startswith("distance"):
         points=([_measurement_anchor_point(anchor,nodes,entities,allow_ill_conditioned=allow_ill_conditioned)
                  for anchor in row["anchors"]] if "anchors" in row else [nodes[node_id] for node_id in nids])
@@ -338,10 +351,38 @@ def _constraint_value(row,nodes,entities,*,allow_ill_conditioned=False):
 
 
 def _constraint_residual(row,actual):
+    if _interval_measurement(row):
+        metadata=row['source_tolerance'];measured=_interval_measurement_value(row,actual)
+        return measured-min(max(measured,metadata['minimum']),metadata['maximum'])
     residual=actual-(row["value"] or 0.)
     if row["kind"]=="tangent" or row["kind"]=="angle" and row.get("angle_mode")=="signed":
         residual=(residual+180)%360-180
     return residual
+
+
+def _interval_measurement(row):
+    return (row.get('source_tolerance') or {}).get('policy') == 'source_tolerance_interval'
+
+
+def _interval_measurement_value(row, actual):
+    # A projected span retains its source direction, even inside a tolerance.
+    return math.copysign(1.,row['value'])*actual if row['kind'] in {'distance_x','distance_y'} else actual
+
+
+def _radial_center_equalities(row, entities):
+    if row.get('kind') != 'radial_gap':return np.empty(0)
+    first, second=(entities[e] for e in row['entities'])
+    return np.asarray(first['center'],float)-np.asarray(second['center'],float)
+
+
+def _radial_arc_overlap(row, entities):
+    intervals=[]
+    for eid in row['entities']:
+        entity=entities[eid];point=entity['end'] if entity.get('clockwise') else entity['start']
+        center=entity['center'];angle=math.atan2(point[1]-center[1],point[0]-center[0])%(2*math.pi)
+        intervals.append((angle,angle+_sweep(entity)))
+    (a,b),(c,d)=intervals
+    return max(0.,max(min(b,d+shift)-max(a,c+shift) for shift in (-2*math.pi,0.,2*math.pi)))
 
 
 def _strict_source_nominal(row):
@@ -361,8 +402,8 @@ def _strict_source_nominal(row):
 
 
 def _strict_measurement_row(row):
-    return (row.get("kind") in {"distance","distance_x","distance_y"} and
-            ("anchors" in row or _strict_source_nominal(row)))
+    return (row.get("kind") in {"distance","distance_x","distance_y","radial_gap"} and
+            ("anchors" in row or row['kind']=='radial_gap' or _interval_measurement(row) or _strict_source_nominal(row)))
 
 
 def _strict_general_angle_rows(constraints):
@@ -399,6 +440,13 @@ def _strict_measurement_contract(nodes,entities,constraints,baseline_entities=No
         try:
             actual=_constraint_value(row,nodes,indexed)
             residual=_constraint_residual(row,actual)
+            if row['kind']=='radial_gap':
+                centers=_radial_center_equalities(row,indexed)
+                conditions.append({'radial_gap_entities':row['entities'],'common_center_residual_mm':centers.tolist()})
+                if np.max(np.abs(centers))>STRICT_MEASUREMENT_CERT_TOLERANCE_MM:
+                    reason='radial_gap_centers_do_not_coincide'
+                if _radial_arc_overlap(row,indexed)<=1e-9:
+                    reason='radial_gap_has_no_common_finite_arc_section'
             for anchor in row.get("anchors",[]):
                 points.append(_measurement_anchor_point(anchor,nodes,indexed).tolist())
                 if anchor["type"]=="line_intersection":
@@ -408,7 +456,7 @@ def _strict_measurement_contract(nodes,entities,constraints,baseline_entities=No
                     conditions.append({"entities":anchor["entities"],"normalized_cross":condition,
                         "initial_branch_preserved":preserved})
                     if not preserved:reason="intersection_support_orientation_branch_changed"
-                elif anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center"}:
+                elif anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center","section_curve_intersection"}:
                     equality=derived_anchor_equalities(anchor,indexed)
                     domain=derived_anchor_domain_conditions(anchor,indexed)
                     conditions.append({"anchor":copy.deepcopy(anchor),"support_equalities_mm":list(equality),
@@ -441,7 +489,7 @@ def native_measurement_checks(entities,constraints,*,dxf_document=None):
     try:
         if not isinstance(entities,list) or not isinstance(constraints,list):
             raise ValueError("entities_and_constraints_must_be_lists")
-        selected=[row for row in constraints if row.get("kind") in {"distance","distance_x","distance_y"}]
+        selected=[row for row in constraints if row.get("kind") in {"distance","distance_x","distance_y","radial_gap"}]
         audit["required_count"]=len(selected)
         model=[_geometry(entity) for entity in entities]
         values=[model]
@@ -1152,6 +1200,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
     dimensions, annotation bindings, reference accuracy or engineering approval.
     Invalid input/schema raises ValueError before any optimization or output.
     """
+    execution_checkpoint("solve.begin")
     if type(source_warm_start) is not bool:
         raise ValueError("source_warm_start must be boolean")
     nodes,baseline,prepared=_validate_inputs(graph,constraints)
@@ -1256,6 +1305,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
 
     strict_angle_by_id={spec["row"]["id"]:spec for spec in strict_angles}
     def constraint_residuals(vector):
+        execution_checkpoint("solve.constraints")
         nmap,decoded=decode(vector);emap={entity["id"]:entity for entity in decoded}
         residuals=[]
         for row in prepared:
@@ -1426,6 +1476,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                              if row["kind"]=="tangent" or row["id"] in strict_angle_by_id or _strict_measurement_row(row) or
                              row in strict_general_angles]
     def objective_residuals(reduced):
+        execution_checkpoint("solve.objective")
         # Shared, pure evaluation also permits final certification of a saved
         # feasible point after the bounded search has ended. It never starts
         # another optimization or changes the objective/acceptance equations.
@@ -1521,18 +1572,44 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
             optimizer_constraints=[{"type":"ineq","fun":chord_feasibility,"jac":chord_jacobian}] if exact_radii else []
             equality_functions=[];equality_jacobians=[];equality_ids=[]
             if strict_measurements:
+                exact_measurements=[row for row in strict_measurements if not _interval_measurement(row)]
+                interval_measurements=[row for row in strict_measurements if _interval_measurement(row)]
                 def measurement_equalities(reduced):
                     nmap,decoded=decode(expand(reduced));emap={entity["id"]:entity for entity in decoded}
                     return np.array([_constraint_residual(row,_constraint_value(
-                        row,nmap,emap,allow_ill_conditioned=True))/scale for row in strict_measurements])
+                        row,nmap,emap,allow_ill_conditioned=True))/scale for row in exact_measurements])
                 def measurement_jacobian(reduced):
                     return _finite_difference_jacobian(measurement_equalities,reduced)
-                equality_functions.append(measurement_equalities)
-                equality_jacobians.append(measurement_jacobian)
-                equality_ids.extend(row["id"] for row in strict_measurements)
+                if exact_measurements:
+                    equality_functions.append(measurement_equalities)
+                    equality_jacobians.append(measurement_jacobian)
+                    equality_ids.extend(row["id"] for row in exact_measurements)
+                if interval_measurements:
+                    def measurement_intervals(reduced):
+                        nmap,decoded=decode(expand(reduced));emap={entity['id']:entity for entity in decoded}
+                        conditions=[]
+                        for row in interval_measurements:
+                            actual=_interval_measurement_value(row,_constraint_value(row,nmap,emap,allow_ill_conditioned=True))
+                            metadata=row['source_tolerance']
+                            conditions.extend([(actual-metadata['minimum'])/scale,(metadata['maximum']-actual)/scale])
+                        return np.asarray(conditions)
+                    optimizer_constraints.append({'type':'ineq','fun':measurement_intervals,
+                        'jac':lambda value:_finite_difference_jacobian(measurement_intervals,value)})
+                radial_terms=[row for row in strict_measurements if row['kind']=='radial_gap']
+                if radial_terms:
+                    def radial_common_centers(reduced):
+                        _,decoded=decode(expand(reduced));emap={entity['id']:entity for entity in decoded}
+                        return np.asarray([v/scale for row in radial_terms for v in _radial_center_equalities(row,emap)])
+                    equality_functions.append(radial_common_centers)
+                    equality_jacobians.append(lambda value:_finite_difference_jacobian(radial_common_centers,value))
+                    equality_ids.extend('radial_common_center_'+row['id']+'_'+str(k) for row in radial_terms for k in range(2))
+                    def radial_overlap_domain(reduced):
+                        _,decoded=decode(expand(reduced));emap={entity['id']:entity for entity in decoded}
+                        return np.asarray([_radial_arc_overlap(row,emap)-1e-9 for row in radial_terms])
+                    optimizer_constraints.append({'type':'ineq','fun':radial_overlap_domain})
                 derived_terms={json.dumps(anchor,sort_keys=True):anchor
                     for row in strict_measurements for anchor in row.get("anchors",[])
-                    if anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center"}}
+                    if anchor["type"] in {"support_level","curve_extremum","curve_center","common_curve_center","section_curve_intersection"}}
                 level_terms=[anchor for anchor in derived_terms.values()
                              if anchor["type"] in {"support_level","common_curve_center"}]
                 if level_terms:
@@ -2020,7 +2097,9 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                         # states, not grounds to erase a previously valid point.
                         return
                 safe_retain_numerical_checkpoint(starting[active])
-                if (seed_entities is not None and numerical_budget.diagnostics['enabled']
+                if ((seed_entities is not None or
+                        (source_observation or {}).get('feasibility_first_initialization') is True)
+                        and numerical_budget.diagnostics['enabled']
                         and equality_functions and numerical_checkpoint is None):
                     # Restore feasibility before optimizing image agreement.
                     # A near-correct old solve otherwise spends its whole clock
@@ -2055,6 +2134,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                     starting[active]=best_projection
                     result['diagnostics']['same_problem_feasibility_projection']={
                         'method':'bounded_all_known_equations_before_ink_objective',
+                        'initialization_source':'provided_seed' if seed_entities is not None else 'fresh_topology',
                         'elapsed_seconds':time.monotonic()-projection_started,
                         'maximum_subbudget_seconds':projection_limit,
                         'local_initial_value_regularizer_weight':1e-6,
@@ -2062,6 +2142,26 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                         'feasible_checkpoint_found':numerical_checkpoint is not None,
                         'all_known_equations_preserved':True,'publication_approved':False,
                         'original_domain_recentered':False,'thresholds_changed':False}
+                if (numerical_checkpoint is not None and equality_functions and
+                        (source_observation or {}).get('feasibility_first_initialization') is True
+                        and ink_prior is not None):
+                    # SLSQP can stall inside very narrow dependent-equation
+                    # guards. Improve the feasible initial point in the full
+                    # equality null space, reprojecting ALL original rows and
+                    # certifying every retained step before normal optimization.
+                    from .feasible_refinement import refine_feasible_point
+                    def certify_refinement(value):
+                        previous_cost=numerical_checkpoint_cost
+                        safe_retain_numerical_checkpoint(value)
+                        return numerical_checkpoint_cost < previous_cost
+                    _,refinement=refine_feasible_point(numerical_checkpoint,
+                        objective,all_equalities,all_equality_jacobians,
+                        lambda value:_finite_difference_jacobian(objective,value),
+                        [row['fun'] for row in optimizer_constraints if row['type']=='ineq'],
+                        lower[active],upper[active],certify_refinement,
+                        seconds=min(25.,.25*numerical_budget.seconds),guard=numerical_budget.guard)
+                    starting[active]=numerical_checkpoint
+                    result['diagnostics']['same_problem_feasible_image_refinement']=refinement
                 try:
                     fit=minimize(scalar_objective,starting[active],method="SLSQP",
                                  jac=scalar_gradient,
@@ -2123,6 +2223,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
             checks.append({**row,"actual":float(actual),"signed_residual":float(residual),"absolute_residual":float(abs(residual)),
                            "tolerance":tolerance,"residual_unit":"mm" if row["kind"] in _DIMENSIONAL else "degree",
                            "enforcement":"exact" if row["kind"]=="radius" else
+                                         "source_tolerance_interval" if _interval_measurement(row) else
                                          "normalized_tangent_cross_equality" if strict_tangent else
                                          "derived_measurement_anchor_equality" if strict_measurement and "anchors" in row else
                                          "source_nominal_equality" if strict_measurement else
@@ -2143,6 +2244,13 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
         moved_safely=max(displacement,shape_displacement)<=movement_limit
         if hasattr(fitted_jacobian,"toarray"):fitted_jacobian=fitted_jacobian.toarray()
         jacobian=np.zeros((len(prepared),count));jacobian[:,active]=fitted_jacobian
+        # An active inequality is not a dimension equality. The clamp's
+        # one-sided derivative must not falsely remove shape freedoms.
+        interval_count=0
+        for index,row in enumerate(prepared):
+            if _interval_measurement(row):
+                jacobian[index,:]=0.
+                interval_count+=1
         # Support levels are relations of the measurement graph, not free
         # station coordinates. Include their independent equations in the
         # shape-DOF audit; exclude all soft priors and domain inequalities.
@@ -2154,6 +2262,12 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                 return np.array([value/LINEAR_TOLERANCE_MM for anchor in support_levels.values()
                                  for value in derived_anchor_equalities(anchor,emap)])
             jacobian=np.vstack([jacobian,_finite_difference_jacobian(support_level_rank_rows,solved_vector)])
+        radial_terms=[row for row in strict_measurements if row['kind']=='radial_gap']
+        if radial_terms:
+            def radial_center_rank_rows(vector):
+                _,decoded=decode(vector);emap={entity['id']:entity for entity in decoded}
+                return np.asarray([v/LINEAR_TOLERANCE_MM for row in radial_terms for v in _radial_center_equalities(row,emap)])
+            jacobian=np.vstack([jacobian,_finite_difference_jacobian(radial_center_rank_rows,solved_vector)])
         singular=np.linalg.svd(jacobian,compute_uv=False);rank_tolerance=max(float(singular[0])*1e-6,1e-8) if len(singular) else 1e-8
         rank=int(np.count_nonzero(singular>rank_tolerance));remaining=count-rank
         gauges=[]
@@ -2238,6 +2352,7 @@ def solve_parametric(graph,constraints,*,output_dir=None,source_observation=None
                                      cost=float(fit.cost),optimality=float(fit.optimality),constraint_rank=rank,rank_tolerance=rank_tolerance,
                                      optimality_measure="feasibility_movement_gradient_inf_norm_not_RMS_optimality_or_KKT" if source_budget.enabled and not source_budget.diagnostics.get("RMS_refinement_accepted") else "objective_gradient_inf_norm_not_KKT" if exact_radii or strict_angles or strict_general_angles or strict_tangents or strict_measurements or raw_prior is not None else "least_squares_first_order_optimality",
                                      singular_values=singular.tolist(),remaining_dof=remaining,rigid_gauge_dof=int(gauge_dof),remaining_shape_dof=shape_dof,
+                                     tolerance_inequality_count=interval_count,intervals_counted_as_shape_equalities=False,
                                      numerical_remaining_shape_dof=numerical_shape_dof,
                                      rank_excludes_soft_prior=True,independent_dimension_record_count=len(dimensional_checks),
                                      optimizer_active_variable_count=len(active),inactive_variables_at_soft_prior_minimum=count-len(active),

@@ -131,3 +131,20 @@ def test_failed_source_iterate_refines_unknowns_without_unbinding_knowns(tmp_pat
     assert calls.count('recover')==1
     assert result[3]['rounds'][0]['fixed_annotation_recovery']['source_gate_passed']
     assert result[3]['rounds'][0]['all_known_constraints_preserved']
+
+
+def test_no_new_binding_still_refines_nonconverged_known_subset(tmp_path, monkeypatch):
+    graph, bindings, solution, inventory, calls, options = setup_completion(tmp_path, monkeypatch, growth=False)
+    solution['diagnostics']['optimizer_converged'] = False
+    solution['underconstrained'] = True
+    def refine(image, document, baseline, original, known, current, output, **kwargs):
+        calls.append('polish')
+        assert original is graph and current is solution and known is bindings
+        assert kwargs['budget_seconds'] == 90.
+        return current, {'accepted': True, 'ground_truth_used': False}
+    monkeypatch.setattr('contour_agent.source_subset_refinement.refine_source_subset', refine)
+    result = complete_source_constraints('image', {}, {}, graph, bindings, solution, inventory,
+        tmp_path/'completion', max_rounds=1, **options)
+    assert result[3]['accepted']
+    assert result[3]['reason'] == 'known_equations_preserved_unknown_attributes_refined'
+    assert calls == ['source', 'binding', 'certificate', 'polish']

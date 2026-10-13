@@ -6,6 +6,7 @@ This module reads source pixels and topology only; nominal dimensions never
 select a support, an intersection, or a dimension endpoint.
 """
 from __future__ import annotations
+from .execution_control import execution_checkpoint
 
 import math
 import re
@@ -19,11 +20,13 @@ from .structural_evidence import axis_stroke_evidence, source_ink
 
 DERIVED_ANCHOR_LINEAR_TOLERANCE = 1e-7
 DERIVED_ANCHOR_ANGLE_TOLERANCE = 1e-9
-_DERIVED_TYPES = {"support_level", "curve_extremum", "curve_center", "common_curve_center"}
+_DERIVED_TYPES = {"support_level", "curve_extremum", "curve_center", "common_curve_center", "section_curve_intersection"}
 
 
 def anchor_entity_ids(anchor):
     """Exact support union of a typed measurement location."""
+    if anchor.get('type')=='section_curve_intersection':
+        return [anchor['entity_id'],*anchor['station']['entities']]
     if anchor.get("type") == "common_curve_center":
         return [anchor["entity_id"], anchor["other_entity_id"]]
     return anchor.get("entities", []) or ([anchor["entity_id"]] if "entity_id" in anchor else [])
@@ -71,6 +74,9 @@ def validate_derived_anchor(anchor, entities, measurement_axis):
     and its final certificate. No coordinate literal, free station, or numeric
     fitting target is allowed in these anchor schemas.
     """
+    if isinstance(anchor,dict) and anchor.get('type')=='section_curve_intersection':
+        from .section_measurements import validate_section_anchor
+        return validate_section_anchor(anchor,entities,measurement_axis)
     if not isinstance(anchor, dict) or anchor.get("type") not in _DERIVED_TYPES:
         raise ValueError("Unsupported derived measurement anchor type")
     keys = {"type", "entity_id", "axis"}
@@ -104,6 +110,9 @@ def validate_derived_anchor(anchor, entities, measurement_axis):
 
 def derived_anchor_equalities(anchor, entities):
     """Additional geometry equations required to give a level its meaning."""
+    if anchor.get('type')=='section_curve_intersection':
+        from .section_measurements import section_anchor_equalities
+        return section_anchor_equalities(anchor,entities)
     entity = _derived_entity(anchor, entities)
     if anchor.get("axis") not in {"x", "y"}:
         raise ValueError("Derived measurement anchor requires a valid axis")
@@ -124,6 +133,9 @@ def derived_anchor_domain_conditions(anchor, entities):
     without accepting the opposite part of the circle. Endpoint extrema are
     valid, while an extremum of the full circle outside this arc is not.
     """
+    if anchor.get('type')=='section_curve_intersection':
+        from .section_measurements import section_anchor_domain_conditions
+        return section_anchor_domain_conditions(anchor,entities)
     entity = _derived_entity(anchor, entities)
     if anchor["type"] == "support_level":
         start, end = np.asarray(entity["start"], float), np.asarray(entity["end"], float)
@@ -141,6 +153,9 @@ def derived_anchor_domain_conditions(anchor, entities):
 
 def derived_anchor_point(anchor, entities, *, allow_infeasible=False):
     """Recompute from current unknowns; only the requested axis is measurable."""
+    if anchor.get('type')=='section_curve_intersection':
+        from .section_measurements import section_anchor_point
+        return section_anchor_point(anchor,entities,allow_infeasible=allow_infeasible)
     if anchor.get("type") not in _DERIVED_TYPES:
         raise ValueError("Unsupported derived measurement anchor type")
     entity = _derived_entity(anchor, entities)
@@ -270,6 +285,7 @@ def source_derived_locations(gray, records, graph, transform, band, axis):
     axis_index = 0 if axis == "x" else 1
     result = []
     for entity in graph.get("entities") or []:
+        execution_checkpoint("source_evidence")
         entity_map = {entity["id"]: entity}
         if entity.get("type") == "LINE":
             anchor = {"type": "support_level", "entity_id": entity["id"], "axis": axis}
@@ -315,7 +331,7 @@ def source_derived_locations(gray, records, graph, transform, band, axis):
     return result
 
 
-def source_curve_center_locations(gray, graph, radius_observations, axis, *, records=()):
+def source_curve_center_locations(gray, graph, radius_observations, axis, *, records=(), dimension_witnesses=()):
     """Observe source centers, also remeasuring long shafts when needed.
 
     Short arrow-local directions are not reliable remote center coordinates.
@@ -327,6 +343,7 @@ def source_curve_center_locations(gray, graph, radius_observations, axis, *, rec
     result = _curve_centers_from_rays(gray, graph, radius_observations, axis)
     refined = []
     for row in radius_observations:
+        execution_checkpoint("source_evidence")
         if (row.get("arrowhead_verified") is not True or
                 (row.get("shaft_evidence") or {}).get("verified") is not True or
                 (row.get("source_arrow_ownership") or {}).get("status") != "globally_unique_source_claim"):
@@ -340,13 +357,126 @@ def source_curve_center_locations(gray, graph, radius_observations, axis, *, rec
         updated["source_long_shaft_remeasurement"] = track["evidence"]
         refined.append(updated)
     extra = _curve_centers_from_rays(gray, graph, refined, axis, records=records)
+    extra.extend(_curve_centers_at_dimension_extensions(
+        gray, graph, refined, axis, dimension_witnesses, records=records))
     # Preserve conflicting observations as alternatives. Deduplicate only the
     # same source-owned ARC center at the same observed position.
     for location in extra:
+        if location['anchor']['type'] == 'curve_center' and any(
+                old['anchor']['type'] == 'common_curve_center' and
+                location['anchor']['entity_id'] in anchor_entity_ids(old['anchor']) and
+                np.linalg.norm(np.asarray(old['source_px'])-location['source_px']) <= 4.
+                for old in result):
+            # The same station's stronger two-owner proof must not compete
+            # with two weaker copies that silently drop concentricity.
+            continue
         same = [old for old in result if old["anchor"] == location["anchor"] and
                 np.linalg.norm(np.asarray(old["source_px"])-location["source_px"]) <= 2.]
         if not same:
             result.append(location)
+    return result
+
+
+def _curve_centers_at_dimension_extensions(gray, graph, observations, axis, witnesses, *, records=()):
+    """A single owned radius shaft may end at an explicit dimension station.
+
+    Requiring TWO radius leaders misses ordinary single-circle center heights.
+    Conversely an infinite ray/extension crossing is not a center. Observe a
+    continuous finite tail ending there, opposing dimension arrows and a finite
+    extension to the dimension shaft. Pixels select symbolic ownership only;
+    neither the nominal nor the predicted center selects or fixes this point.
+    Final source-image API association and joint solving remain mandatory.
+    """
+    k = 0 if axis == 'x' else 1
+    entities = {e['id']: e for e in graph.get('entities', [])}
+    _, ink = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    distance = cv2.distanceTransform((1-ink).astype(np.uint8), cv2.DIST_L2, 3)
+    height, width = gray.shape
+    result = []
+    for row in observations:
+        execution_checkpoint("source_evidence")
+        targets = row.get('target_candidates') or []
+        if (row.get('arrowhead_verified') is not True or
+                (row.get('shaft_evidence') or {}).get('verified') is not True or
+                (row.get('source_long_shaft_remeasurement') or {}).get('verified') is not True or
+                (row.get('source_arrow_ownership') or {}).get('status') != 'globally_unique_source_claim' or
+                len(targets) != 1 or entities.get(targets[0].get('entity_id'), {}).get('type') != 'ARC'):
+            continue
+        origin = np.asarray(row['source_ray_origin_px'], float)
+        backward = -np.asarray(row['source_ray_direction_px'], float)
+        backward /= np.linalg.norm(backward)
+        if abs(backward[k]) < .15:
+            continue
+        for witness in witnesses:
+            execution_checkpoint("source_evidence")
+            line = witness.get('line') or {}
+            proof = witness.get('binding_evidence') or {}
+            if (witness.get('axis') != axis or proof.get('verified') is not True or
+                    proof.get('ambiguous') or witness.get('axis_association', {}).get('ambiguous')):
+                continue
+            for end, extension in (line.get('extension_stations') or {}).items():
+                if end not in {'lo', 'hi'}:
+                    continue
+                travel = (float(line[end])-origin[k])/backward[k]
+                center = origin+travel*backward
+                if (travel < 120. or travel > 2048. or
+                        not (2 <= center[0] < width-2 and 2 <= center[1] < height-2) or
+                        abs(float(extension['cross'])-center[k]) > 2. or
+                        not extension['lo']-2 <= center[1-k] <= extension['hi']+2 or
+                        not extension['lo']-2 <= line['cross'] <= extension['hi']+2):
+                    continue
+                # Remeasure the entire tail through the label. The label's own
+                # pixels are an occlusion, never evidence of a continuous line.
+                samples = origin+np.arange(24., travel+1)[:, None]*backward
+                pixels = np.rint(samples).astype(int)
+                if (pixels < 0).any() or (pixels[:, 0] >= width).any() or (pixels[:, 1] >= height).any():
+                    continue
+                visible = np.ones(len(samples), bool)
+                for record in records:
+                    execution_checkpoint("source_evidence")
+                    if record.get('id') != row['record_id']:
+                        continue
+                    box = np.asarray(record.get('box'), float)
+                    if box.ndim == 2 and box.shape[1] == 2 and np.isfinite(box).all():
+                        visible &= ~np.all((samples >= box.min(axis=0)-3.) &
+                                           (samples <= box.max(axis=0)+3.), axis=1)
+                if visible.mean() < .65 or visible.sum() < 64:
+                    continue
+                supported = distance[pixels[:, 1], pixels[:, 0]] <= 2.
+                longest = current = 0
+                for observed, occupied in zip(visible, supported):
+                    current = 0 if not observed or occupied else current+1
+                    longest = max(longest, current)
+                fraction = float(supported[visible].mean())
+                # Ignore the crossing's immediate stroke width, then require
+                # the radial shaft to STOP, not continue past the station.
+                beyond = np.rint(center+np.arange(12., 42.)[:, None]*backward).astype(int)
+                if ((beyond < 0).any() or (beyond[:, 0] >= width).any() or
+                        (beyond[:, 1] >= height).any()):
+                    continue
+                continuation = float(np.mean(distance[beyond[:, 1], beyond[:, 0]] <= 2.))
+                if fraction < .9 or longest > 12. or continuation > .25:
+                    continue
+                identifier = targets[0]['entity_id']
+                anchor = {'type': 'curve_center', 'entity_id': identifier, 'axis': axis}
+                point = derived_anchor_point(anchor, entities, allow_infeasible=True)
+                result.append({'id': 'center_'+identifier+'_'+witness['record_id']+'_'+axis,
+                    'x': float(point[0]), 'y': float(point[1]), 'source_px': center.tolist(),
+                    'anchor': anchor, 'evidence': {
+                        'method': 'source_owned_radius_finite_tail_at_dimension_extension_v1',
+                        'verified': True, 'center_semantics_verified': True,
+                        'observed_source_center_px': center.tolist(),
+                        'source_radius_record_ids': [row['record_id']],
+                        'dimension_record_id': witness['record_id'],
+                        'source_arrow_ids': [row['source_arrow_ownership']['physical_arrow_id']],
+                        'owner_record_id': row['record_id'], 'unique_arrow_target': identifier,
+                        'source_supported_entities': [identifier], 'measurement_axis': axis,
+                        'tail_support': [{'record_id': row['record_id'], 'verified': True,
+                            'full_tail_supported_fraction': fraction, 'maximum_unobserved_run_px': longest,
+                            'beyond_center_continuation_fraction': continuation, 'tail_extension_px': travel}],
+                        'dimension_extension': dict(extension), 'dimension_station_endpoint': end,
+                        'nominal_used': False, 'coordinates_locked': False,
+                        'other_arc_concentricity_not_implicitly_asserted': True}})
     return result
 
 
@@ -389,6 +519,7 @@ def _curve_centers_from_rays(gray, graph, radius_observations, axis, *, records=
         occupied = distance[pixels[:, 1], pixels[:, 0]] <= 2.
         visible = np.ones(len(samples), bool)
         for record in records:
+            execution_checkpoint("source_evidence")
             if record.get("id") != row["record_id"]:
                 continue
             box = np.asarray(record.get("box"), float)
